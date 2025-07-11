@@ -60,6 +60,11 @@
 #include "devlink.h"
 #include "en/devlink.h"
 
+/*rx-zcopy*/
+static int rx_zcopy_head_size = 90;
+module_param(rx_zcopy_head_size, int, 0644);
+MODULE_PARM_DESC(rx_zcopy_head_size, "RX Zcopy head size");
+
 static struct sk_buff *
 mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 				struct mlx5_cqe64 *cqe, u16 cqe_bcnt, u32 head_offset,
@@ -2346,6 +2351,12 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 			stats->hds_nodata_packets++;
 			stats->hds_nodata_bytes += head_size;
 		}
+	}
+
+	/*syeon*/
+	if (head_size == rx_zcopy_head_size) {
+		u8 * th_off = (*skb)->data + 14 + 20 +12;
+		*th_off = (*th_off & 0x0F) | (8 << 4);
 	}
 
 	mlx5e_shampo_complete_rx_cqe(rq, cqe, cqe_bcnt, *skb);
