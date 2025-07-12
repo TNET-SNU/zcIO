@@ -296,6 +296,11 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 		bio_release_pages(bio, false);
 		bio_put(bio);
 	}
+	
+	/* rx-zcopy */
+	if (bio->bi_mm) {
+		mmdrop(bio->bi_mm);
+	}
 }
 
 static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
@@ -321,6 +326,13 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	bio->bi_write_hint = file_inode(iocb->ki_filp)->i_write_hint;
 	bio->bi_end_io = blkdev_bio_end_io_async;
 	bio->bi_ioprio = iocb->ki_ioprio;
+
+	/* rx-zcopy */
+	struct mm_struct * mm = current->mm;
+	if (mm){
+		mmgrab(mm);
+	}
+	bio->bi_mm = mm;
 
 	if (iov_iter_is_bvec(iter)) {
 		/*
