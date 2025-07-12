@@ -2353,8 +2353,13 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 		}
 	}
 
+<<<<<<< HEAD
 	/*syeon*/
 	if (head_size == rx_zcopy_head_size) {
+=======
+	/*rx-zcopy*/
+	if (head_size == 90) {
+>>>>>>> d743b521bef7 (Store user address to page->private)
 		u8 * th_off = (*skb)->data + 14 + 20 +12;
 		*th_off = (*th_off & 0x0F) | (8 << 4);
 	}

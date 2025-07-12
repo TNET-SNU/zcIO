@@ -1543,6 +1543,17 @@ static ssize_t iov_iter_extract_kvec_pages(struct iov_iter *i,
 	return size;
 }
 
+/* rx-zcopy*/
+static bool set_user_address_page(struct page **page, unsigned long addr, int page_count)
+{
+	for (int i = 0; i < page_count; i++) {
+		if (!page[i]) continue;
+		page[i]->private = (unsigned long)addr + i * PAGE_SIZE;
+		pr_info("[syeon] set_user_address_page: %d pages(%d- %px) set with user address starting at %lx\n", page_count, i, page[i], page[i]->private);
+	}
+	return true;
+}
+
 /*
  * Extract a list of contiguous pages from a user iterator and get a pin on
  * each of them.  This should only be used if the iterator is user-backed
@@ -1584,6 +1595,12 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
 	if (unlikely(res <= 0))
 		return res;
 	maxsize = min_t(size_t, maxsize, res * PAGE_SIZE - offset);
+	/* rx-zcopy*/
+	if (i->data_source == ITER_DEST && offset != 0){
+		pr_info("[syeon] user address page offset is not zero, offset = %zu\n", offset);
+	}
+	set_user_address_page(*pages, addr, res);
+
 	iov_iter_advance(i, maxsize);
 	return maxsize;
 }
