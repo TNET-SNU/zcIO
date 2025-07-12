@@ -270,6 +270,7 @@ struct bio {
 
 	/* rx-zcopy */
 	struct mm_struct	*bi_mm;		/* mm for page pinning */
+	struct bio_vec	 *old_bi_io_vec;
 
 	/*
 	 * We can inline a number of vecs at the end of the bio, to avoid

@@ -1042,7 +1042,12 @@ __always_inline bool free_pages_prepare(struct page *page,
 	bool compound = PageCompound(page);
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
-
+	
+	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
+		//pr_info("[syeon] ***** is_pp_page : %px\n", page);
+		//pr_info("[syeon] ***** pp_ref_count : %ld\n", atomic_long_read(&page->pp_ref_count));
+		return false;
+	}
 	trace_mm_page_free(page, order);
 	kmsan_free_page(page, order);
 

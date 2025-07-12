@@ -24,6 +24,9 @@
 #include "nvme.h"
 #include "fabrics.h"
 
+/* rx-zcopy */
+#include <linux/rmap.h>
+
 struct nvme_tcp_queue;
 
 /* Define the socket priority to use for connections were it is desirable
@@ -803,6 +806,255 @@ static inline void nvme_tcp_end_request(struct request *rq, u16 status)
 		nvme_complete_rq(rq);
 }
 
+/* rx-zcopy */
+struct my_work{
+	struct work_struct work;
+	struct mm_struct *mm;
+	unsigned long user_addr;
+	struct page* page;
+};
+
+static inline int page_mapcount(struct page *page)
+{
+    return atomic_read(&page->_mapcount);
+}
+
+/* rx-zcopy */
+static pte_t my_page_table_update(struct work_struct *work)
+{
+	struct my_work *w = container_of(work, struct my_work, work);
+	struct mm_struct *mm;
+	unsigned long user_addr;
+	struct page *new_page, *old_page;
+	pte_t *ptep;
+	spinlock_t *ptl;
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+	pte_t old_pte, new_pte;
+	struct vm_area_struct *vma;
+	old_pte = __pte(0);
+
+	if (!w){
+		pr_err("my_page_table_update : work container invalid\n");
+		return __pte(0);
+	}
+
+	mm       = w->mm;
+    user_addr     = w->user_addr;
+    new_page = w->page;
+	
+	//pr_info("[syeon] new page: %px,  user page: %lx\n", w->page, w->user_addr);
+	
+	if (!mm || !new_page || !user_addr) {
+        pr_err("my_page_table_update: missing parameters\n");
+        goto out;
+    }
+
+	if (!IS_ALIGNED(user_addr, PAGE_SIZE)) {
+ 	   pr_err("user_addr %lx not page aligned\n", user_addr);
+  	   goto out;
+	}
+
+	down_write(&mm->mmap_lock);
+
+	vma = find_vma(mm, user_addr);
+	if (!vma || user_addr < vma->vm_start || user_addr >= vma->vm_end) {
+		pr_err("[syeon] No VMA found for user address %lx\n", user_addr);
+		up_write(&mm->mmap_lock);
+		goto out;
+	}
+
+	if (vma->vm_file != NULL || (vma->vm_flags & VM_PFNMAP)) {
+ 	    pr_err("Cannot use vm_insert_page on non-anonymous VMA\n");
+  		up_write(&mm->mmap_lock);
+		goto out;
+	}
+
+	// get paget table entry pointer
+	pgd = pgd_offset(mm, user_addr);
+	p4d = p4d_offset(pgd, user_addr);
+	pud = pud_offset(p4d, user_addr);
+	pmd = pmd_offset(pud, user_addr);
+
+	if (pgd_none(*pgd) || pgd_bad(*pgd) ||
+			p4d_none(*p4d) || p4d_bad(*p4d) ||
+			pud_none(*pud) || pud_bad(*pud) ||
+			pmd_none(*pmd) || pmd_bad(*pmd)) {
+		pr_err("invalid page-table at %lx\n", user_addr);
+		up_write(&mm->mmap_lock);
+		goto out;
+	}
+
+	ptep = pte_offset_map_lock(mm, pmd, user_addr, &ptl);
+	if (!ptep) {
+		pr_err("[syeon] Failed to map PTE for user address %lx\n", user_addr);
+		up_write(&mm->mmap_lock);
+		goto out;
+	}
+
+	// clear old pte
+	old_pte = ptep_get_and_clear(mm, user_addr, ptep);
+	flush_tlb_page(vma, user_addr); 
+	if (pte_present(old_pte)) {
+		old_page = pte_page(old_pte);
+		//pr_info("[syeon before] old page %p mapcount = %d\n", old_page, page_mapcount(old_page));	
+		folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
+		//pr_info("[syeon after] old page %p mapcount = %d\n", old_page, page_mapcount(old_page));	
+	}
+	
+	// set new pte
+	new_pte = mk_pte(new_page, vma->vm_page_prot);
+	flush_dcache_page(new_page);
+	set_pte_at(mm, user_addr, ptep, new_pte);
+	flush_tlb_page(vma, user_addr); 
+
+	//pr_info("[syeon before] new page %p mapcount = %d\n", new_page, page_mapcount(new_page));	
+	folio_add_file_rmap_ptes(page_folio(new_page), new_page, 1, vma);
+	//pr_info("[syeon after] new page %p mapcount = %d\n", new_page, page_mapcount(new_page));	
+	pte_unmap_unlock(ptep, ptl);
+	up_write(&mm->mmap_lock);
+
+    //pr_info("[syeon] Remapped %lx to page %px\n", user_addr, new_page);
+	goto out;
+
+out:
+	kfree(w);
+	return old_pte;
+}
+
+/* rx-zcopy */
+static bool map_skb_page_to_user(struct sk_buff *skb, struct nvme_tcp_request *req, size_t len, int frag_index, int bv_index, int page_idx)
+{
+	//pr_info("[3] [syeon] map_skb_page_to_user called - len: %zu, skb->frag index : %d , bv_index: %d, page_idx: %d\n", len, frag_index, bv_index, page_idx);
+	struct page * bv_page = nth_page(req->iter.bvec[bv_index].bv_page, page_idx);
+	pte_t old_pte;
+	
+	if (!bv_page){
+		//pr_info("[syeon] bv_page is NULL\n");
+		return false;
+	}
+
+	if (!bv_page->private){
+		//pr_info("[syeon] page->private is NULL\n");
+		return false;
+	}
+	
+	if (!req->curr_bio->bi_mm){
+		//pr_info("[syeon] req->curr_bio->bi_mm is NULL\n");
+		return false;
+	}
+
+	struct my_work *w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w) {
+		pr_err("[syeon] Failed to allocate memory for my_work\n");
+		return false;
+	}
+	
+	unsigned long base_user_addr =  (unsigned long)bv_page->private;
+	unsigned long user_addr = base_user_addr + page_idx * PAGE_SIZE;
+	
+	w->page = skb_frag_page(&skb_shinfo(skb)->frags[frag_index]);
+	w->mm = req->curr_bio->bi_mm;
+	w->user_addr =  user_addr;
+
+	old_pte = my_page_table_update(&w->work);
+	if (pte_none(old_pte) ) {
+		//pr_info("[syeon] old_pte is 0\n");
+		return false;
+	}
+	return true;	
+}
+
+/* rx-zcopy */
+static void store_original_bio_vec(struct nvme_tcp_request *req){
+	req->curr_bio->old_bi_io_vec = kmalloc_array(req->curr_bio->bi_vcnt, sizeof(struct bio_vec), GFP_KERNEL);
+
+	for(int i = 0 ; i < req->iter.nr_segs; i++){
+		struct bio_vec io_vec= req->curr_bio->bi_io_vec[i];
+		bvec_set_page(&req->curr_bio->old_bi_io_vec[i], io_vec.bv_page, io_vec.bv_len, io_vec.bv_offset);
+		//pr_info("[syeon] old bi_io_vec page [i]: %px, bv_len: %d, bv_offset: %d\n", req->curr_bio->old_bi_io_vec[i].bv_page, req->curr_bio->old_bi_io_vec[i].bv_len, req->curr_bio->old_bi_io_vec[i].bv_offset);
+	}
+}
+
+/* rx-zcopy */
+static int find_frag_index(struct sk_buff *skb, unsigned int offset)
+{
+	int i;
+	int frag_offset =  skb_headlen(skb);
+
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		
+		int len = skb_frag_size(frag);
+		if (offset >= frag_offset && offset < frag_offset + len)
+			return i;
+
+		frag_offset += len;
+	}
+
+	return -1; /* not found */
+}
+
+/* rx-zcopy */
+static bool do_zerocopy (struct sk_buff *skb, struct nvme_tcp_request *req, 
+		int recv_len, unsigned int offset){
+	unsigned int bv_index, npages, count_len, nr_segs;
+	int frag_size, frag_index;
+	const struct bio_vec *bvec;
+	struct page *bv_page;
+	skb_frag_t *frag;
+	unsigned long user_addr = 0;
+	bool result = false;
+	
+	frag_index = find_frag_index(skb, offset);
+	if (frag_index < 0 || frag_index > MAX_SKB_FRAGS)  {
+		pr_err("[syeon] find_frag_index failed - offset: %d\n", offset);
+		return false;
+	}
+	
+	//pr_info("[syeon] frag_index found: %d\n", frag_index);
+	
+	nr_segs = req->iter.nr_segs;
+	for (bv_index = 0; bv_index < nr_segs; bv_index++) {
+		bvec = &req->iter.bvec[bv_index];
+		npages = DIV_ROUND_UP(bvec->bv_len, PAGE_SIZE);
+
+		for (int page_idx = 0; page_idx < npages; page_idx++) {
+			bv_page = nth_page(bvec->bv_page, page_idx);
+
+			frag_size = skb_frag_size(&skb_shinfo(skb)->frags[frag_index]);
+			frag = &skb_shinfo(skb)->frags[frag_index];
+
+			if (bv_page && frag) {
+				user_addr = bv_page->private;
+				//pr_info("[1] bv page: %px, user_addr: %lx\n", bv_page, user_addr);
+				if (user_addr && access_ok((void __user*)user_addr, PAGE_SIZE)) {
+					//pr_info("[2] access ok - user_addr :%lx\n", user_addr);
+					result = map_skb_page_to_user(skb, req, frag_size, frag_index, bv_index, page_idx);
+					if (result == true) {
+						frag_index++;
+						count_len += frag_size;
+						//pr_info("[4]] [syeon] map_skb_page_to_user success - user_addr: %lx, size: %d / current_total: %d \n", user_addr, frag_size, count_len);
+					} else {
+						pr_info("[error] [syeon] map_skb_page_to_user failed\n");
+						break;
+					}
+				}
+			}
+		}
+	}
+	if (result == false){
+		//pr_info("[syeon] COPY IS CALLED ! OHNO\n");
+	}
+	else if (count_len != recv_len) {
+		//pr_info("[syeon] count_len (%d) is not equal to recv_len (%d)\n", count_len, recv_len);
+		result = false;
+	}
+	return result;
+}
+
 static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			      unsigned int *offset, size_t *len)
 {
@@ -810,7 +1062,11 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	struct request *rq =
 		nvme_cid_to_rq(nvme_tcp_tagset(queue), pdu->command_id);
 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
+	bool zcopy_result = false;
 
+	/* rx-zcopy */
+	store_original_bio_vec(req);
+	
 	while (true) {
 		int recv_len, ret;
 
@@ -842,9 +1098,17 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		if (queue->data_digest)
 			ret = skb_copy_and_hash_datagram_iter(skb, *offset,
 				&req->iter, recv_len, queue->rcv_hash);
-		else
-			ret = skb_copy_datagram_iter(skb, *offset,
-					&req->iter, recv_len);
+		else {
+			zcopy_result = do_zerocopy(skb, req, recv_len, *offset);
+			if (zcopy_result == true){
+				iov_iter_advance(&req->iter, recv_len);
+				ret = false;
+			}
+			else {
+				ret = skb_copy_datagram_iter(skb, *offset,
+						&req->iter, recv_len);
+			}
+		}
 		if (ret) {
 			dev_err(queue->ctrl->ctrl.device,
 				"queue %d failed to copy request %#x data",

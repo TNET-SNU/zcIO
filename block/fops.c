@@ -298,8 +298,17 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 	}
 	
 	/* rx-zcopy */
-	if (bio->bi_mm) {
+	if (bio->bi_mm && bio->bi_io_vec && bio->old_bi_io_vec) {
+		for (int i = 0 ; i < bio->bi_vcnt; i++){
+			unsigned int npages = DIV_ROUND_UP(bio->bi_io_vec[i].bv_len, PAGE_SIZE);
+			pr_info("[syeon] npages : %d, nr_segs : %d \n", npages, bio->bi_vcnt);
+			for (int j = 0 ; j < npages; j++){
+				dec_mm_counter(bio->bi_mm, MM_ANONPAGES);
+				inc_mm_counter(bio->bi_mm, MM_FILEPAGES);
+			}
+		}
 		mmdrop(bio->bi_mm);
+		kfree(bio->old_bi_io_vec);
 	}
 }
 
