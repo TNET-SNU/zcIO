@@ -297,12 +297,14 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 		bio_put(bio);
 	}
 	
-	/* rx-zcopy */
+	/* rx-zcopy: I/O 완료 후 zerocopy 정리 */
 	if (bio->bi_mm && bio->bi_io_vec && bio->old_bi_io_vec) {
+		/* 메모리 통계만 복원 - SKB fragment page는 나중에 해제 */
 		for (int i = 0 ; i < bio->bi_vcnt; i++){
 			unsigned int npages = DIV_ROUND_UP(bio->bi_io_vec[i].bv_len, PAGE_SIZE);
-			pr_info("[syeon] npages : %d, nr_segs : %d \n", npages, bio->bi_vcnt);
+			
 			for (int j = 0 ; j < npages; j++){
+				/* 메모리 통계 복원 */
 				dec_mm_counter(bio->bi_mm, MM_ANONPAGES);
 				inc_mm_counter(bio->bi_mm, MM_FILEPAGES);
 			}
