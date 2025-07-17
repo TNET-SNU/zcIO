@@ -297,8 +297,8 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 		bio_put(bio);
 	}
 	
-	/* rx-zcopy: I/O 완료 후 zerocopy 정리 */
-	if (bio->bi_mm && bio->bi_io_vec && bio->old_bi_io_vec) {
+	/* rx-zcopy: I/O 완료 후 zerocopy 정리 - zerocopy가 사용된 경우에만 */
+	if (bio->bi_zerocopy_used && bio->bi_mm && bio->bi_io_vec){ // && bio->old_bi_io_vec) {
 		/* 메모리 통계만 복원 - SKB fragment page는 나중에 해제 */
 		for (int i = 0 ; i < bio->bi_vcnt; i++){
 			unsigned int npages = DIV_ROUND_UP(bio->bi_io_vec[i].bv_len, PAGE_SIZE);
@@ -309,8 +309,11 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 				inc_mm_counter(bio->bi_mm, MM_FILEPAGES);
 			}
 		}
+		//kfree(bio->old_bi_io_vec);
+	}
+	if (bio->bi_mm)
+	{
 		mmdrop(bio->bi_mm);
-		kfree(bio->old_bi_io_vec);
 	}
 }
 
@@ -342,8 +345,8 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	struct mm_struct * mm = current->mm;
 	if (mm){
 		mmgrab(mm);
+		bio->bi_mm = mm;
 	}
-	bio->bi_mm = mm;
 
 	if (iov_iter_is_bvec(iter)) {
 		/*
