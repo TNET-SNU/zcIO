@@ -60,6 +60,10 @@
 #include "shuffle.h"
 #include "page_reporting.h"
 
+/*rx-zcopy*/
+#include <net/page_pool/helpers.h>
+#include <net/page_pool/types.h>
+
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
 typedef int __bitwise fpi_t;
 
@@ -1044,8 +1048,8 @@ __always_inline bool free_pages_prepare(struct page *page,
 	VM_BUG_ON_PAGE(PageTail(page), page);
 	
 	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
-		//pr_info("[syeon] ***** is_pp_page : %px\n", page);
-		//pr_info("[syeon] ***** pp_ref_count : %ld\n", atomic_long_read(&page->pp_ref_count));
+		pr_info("[syeon] ***** is_pp_page : %px\n", page);
+		pr_info("[syeon] ***** pp_ref_count : %ld\n", atomic_long_read(&page->pp_ref_count));
 		return false;
 	}
 	trace_mm_page_free(page, order);
@@ -2605,6 +2609,11 @@ static void free_unref_page_commit(struct zone *zone, struct per_cpu_pages *pcp,
 	}
 }
 
+static inline bool is_page_pool(struct page *page)
+{
+    // 보통 page->pp, page->pp_magic 등으로 pool page 여부 판단
+    return page && page->pp && ((page->pp_magic & ~0x3UL) == PP_SIGNATURE);
+}
 /*
  * Free a pcp page
  */
@@ -2616,6 +2625,21 @@ void free_unref_page(struct page *page, unsigned int order)
 	unsigned long pfn = page_to_pfn(page);
 	int migratetype;
 
+
+	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
+		pr_info("put_page: %p is page pool\n", page);
+		pr_info("[**3. refcount = %d**]\n", atomic_read(&page->_refcount));
+		if (page_pool_napi_local(page->pp)) {
+			pr_info("put_page: %p is page pool napi local\n", page);
+			page_pool_recycle_direct(page->pp, page);
+		}
+		else {
+			pr_info("put_page: %p is page pool napi not local\n", page);
+			page_pool_put_unrefed_page(page->pp, page, 0, true);
+		}
+		return ;
+	}
+
 	if (!pcp_allowed_order(order)) {
 		__free_pages_ok(page, order, FPI_NONE);
 		return;
@@ -2623,7 +2647,7 @@ void free_unref_page(struct page *page, unsigned int order)
 
 	if (!free_pages_prepare(page, order))
 		return;
-
+	
 	/*
 	 * We only track unmovable, reclaimable and movable on pcp lists.
 	 * Place ISOLATE pages on the isolated list because they are being

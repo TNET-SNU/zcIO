@@ -29,9 +29,9 @@
 
 /* rx-zcopy: 배치 처리를 위한 구조체 */
 struct page_remap_batch {
-	struct page *old_pages[6];    /* 기존 페이지들 */
-	struct page *new_pages[6];    /* 새로운 페이지들 */
-	unsigned long user_addrs[6];  /* 사용자 주소들 */
+	struct page *old_pages[16];    /* 기존 페이지들 */
+	struct page *new_pages[16];    /* 새로운 페이지들 */
+	unsigned long user_addrs[16];  /* 사용자 주소들 */
 	int count;                    /* 배치 크기 */
 	struct mm_struct *mm;         /* 메모리 디스크립터 */
 };
@@ -75,7 +75,7 @@ MODULE_PARM_DESC(enable_zerocopy, "Enable zero-copy receive (default true)");
 
 /* 성능을 위해 컴파일 타임 상수로 정의 */
 #define ZEROCOPY_MIN_SIZE 4096    /* 4KB 이상에서 zerocopy - 사용자 요구사항 */
-#define ZEROCOPY_BATCH_SIZE 6     /* 최적 배치 크기 - mmap_lock 시간 vs 처리량 균형 */
+#define ZEROCOPY_BATCH_SIZE 16     /* 최적 배치 크기 - mmap_lock 시간 vs 처리량 균형 */
 #define ZEROCOPY_LARGE_IO_SIZE 32768  /* 32KB 이상 큰 I/O에서 배치 크기 축소 기준 */
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
@@ -918,13 +918,19 @@ static int batch_remap_pages(struct page_remap_batch *batch)
 			old_page = pte_page(old_pte);
 			batch->old_pages[i] = old_page;
 			folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
+			if (PageAnon(old_page))
+				dec_mm_counter(mm, MM_ANONPAGES);
+			else if (old_page->mapping)
+				dec_mm_counter(mm, MM_FILEPAGES);
 		}
 
 		/* 새 페이지 매핑 - SKB fragment page 보호 */
-		get_page(new_page);  /* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
+		//get_page(new_page);  /* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
 		new_pte = mk_pte(new_page, vma->vm_page_prot);
 		set_pte_at(mm, user_addr, ptep, new_pte);
-		folio_add_file_rmap_ptes(page_folio(new_page), new_page, 1, vma);
+		//folio_add_file_rmap_ptes(page_folio(new_page), new_page, 1, vma);
+		folio_add_anon_rmap_ptes(page_folio(new_page), new_page, 1, vma, user_addr, RMAP_NONE);
+		inc_mm_counter(mm, MM_ANONPAGES);
 		
 		/* TLB 플러시는 배치로 처리 */
 		flush_tlb_page(vma, user_addr);
@@ -1125,7 +1131,7 @@ static inline bool do_zerocopy(struct sk_buff *skb, struct nvme_tcp_request *req
 	unsigned int bv_index, npages, count_len = 0, nr_segs;
 	int frag_size, frag_index;
 	const struct bio_vec *bvec;
-	struct page *bv_page;
+	struct page *bv_page, *frag_page;
 	skb_frag_t *frag;
 	unsigned long user_addr;
 	int max_frags = skb_shinfo(skb)->nr_frags;
@@ -1148,11 +1154,11 @@ static inline bool do_zerocopy(struct sk_buff *skb, struct nvme_tcp_request *req
 	}
 
 	/* 고도의 동시성에서는 더 작은 배치로 mmap_lock 경합 감소 */
-	if (unlikely(recv_len > ZEROCOPY_LARGE_IO_SIZE)) {  /* 32KB 이상의 큰 I/O면 배치 축소 */
+	/*if (unlikely(recv_len > ZEROCOPY_LARGE_IO_SIZE)) {  
 		batch_limit = 3;
 		pr_info_ratelimited("[zerocopy] LARGE_IO: recv_len=%d, batch_limit=%d\n", 
 			recv_len, batch_limit);
-	}
+	}*/
 
 	/* 배치 초기화 */
 	batch.count = 0;
@@ -1172,14 +1178,19 @@ static inline bool do_zerocopy(struct sk_buff *skb, struct nvme_tcp_request *req
 				goto process_batch;
 
 			frag = &skb_shinfo(skb)->frags[frag_index];
+			frag_page = skb_frag_page(frag);
 			frag_size = skb_frag_size(frag);
 			user_addr = (unsigned long)bv_page->private;
 			
 			if (unlikely(!user_addr || !access_ok((void __user*)user_addr, PAGE_SIZE)))
 				goto process_batch;
+			
+			// save skb frag page to original page->private
+			bv_page->private = (unsigned long)frag_page;
+			pr_info("[USER ADDR] %px - [ORIGINAL PAGE] %px - [SKB FRAG PAGE] %px\n", (void __user*)user_addr, bv_page, frag_page);
 
 			/* 배치에 추가 */
-			batch.new_pages[batch.count] = skb_frag_page(frag);
+			batch.new_pages[batch.count] = frag_page;
 			batch.user_addrs[batch.count] = user_addr;
 			batch.old_pages[batch.count] = NULL;
 			batch.count++;
@@ -1198,6 +1209,10 @@ process_batch:
 			success_count, batch.count, 
 			(count_len == recv_len) ? "YES" : "NO",
 			final_result ? "SUCCESS" : "FAIL");
+
+		if (final_result) {
+			req->curr_bio->bi_zerocopy_used = true;
+		}
 		return final_result;
 	}
 	
@@ -1214,9 +1229,13 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
 	bool zcopy_result = false;
 
-	/* rx-zcopy */
-	store_original_bio_vec(req);
-	
+	int page_count = 0;
+	//pr_info("[syeon] nvme_tcp_recv_data called - bio->bi_vcnt: %d ", req->curr_bio->bi_vcnt);
+	for (int i = 0; i < req->curr_bio->bi_vcnt; i++){
+		page_count += DIV_ROUND_UP(req->curr_bio->bi_io_vec[i].bv_len, PAGE_SIZE);
+	}
+//	pr_info("  page_count: %d\n", page_count);
+	req->curr_bio->bi_zerocopy_used = false;
 	while (true) {
 		int recv_len, ret;
 

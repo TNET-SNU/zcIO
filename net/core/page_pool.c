@@ -328,7 +328,8 @@ struct page_pool *page_pool_create(const struct page_pool_params *params)
 }
 EXPORT_SYMBOL(page_pool_create);
 
-static void page_pool_return_page(struct page_pool *pool, netmem_ref netmem);
+/* rx-zcopy */
+void page_pool_return_page(struct page_pool *pool, netmem_ref netmem);
 
 static noinline netmem_ref page_pool_refill_alloc_cache(struct page_pool *pool)
 {
@@ -452,7 +453,8 @@ unmap_failed:
 	return false;
 }
 
-static void page_pool_set_pp_info(struct page_pool *pool, netmem_ref netmem)
+/* rx-zcopy */
+void page_pool_set_pp_info(struct page_pool *pool, netmem_ref netmem)
 {
 	struct page *page = netmem_to_page(netmem);
 
@@ -469,6 +471,7 @@ static void page_pool_set_pp_info(struct page_pool *pool, netmem_ref netmem)
 	if (pool->has_init_callback)
 		pool->slow.init_callback(netmem, pool->slow.init_arg);
 }
+EXPORT_SYMBOL_GPL(page_pool_set_pp_info);
 
 static void page_pool_clear_pp_info(netmem_ref netmem)
 {
@@ -653,6 +656,8 @@ void page_pool_return_page(struct page_pool *pool, netmem_ref netmem)
 	 * __page_cache_release() call).
 	 */
 }
+/*rx-zcopy*/
+EXPORT_SYMBOL_GPL(page_pool_return_page);
 
 static bool page_pool_recycle_in_ring(struct page_pool *pool, netmem_ref netmem)
 {
@@ -747,7 +752,7 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 	return 0;
 }
 
-static bool page_pool_napi_local(const struct page_pool *pool)
+bool page_pool_napi_local(const struct page_pool *pool)
 {
 	const struct napi_struct *napi;
 	u32 cpuid;

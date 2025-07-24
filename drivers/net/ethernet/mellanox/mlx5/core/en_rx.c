@@ -302,7 +302,10 @@ static void mlx5e_page_release_fragmented(struct mlx5e_rq *rq,
 {
 	u16 drain_count = MLX5E_PAGECNT_BIAS_MAX - frag_page->frags;
 	struct page *page = frag_page->page;
-
+	if (page->private == 127) {
+		pr_info("[syeon] page->private == 127\n");
+		return ;
+	}
 	if (page_pool_unref_page(page, drain_count) == 0)
 		page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
 }

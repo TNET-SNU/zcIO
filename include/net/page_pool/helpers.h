@@ -58,6 +58,9 @@
 #include <net/net_debug.h>
 #include <net/netmem.h>
 
+/*rx-zcopy*/
+#include <linux/netdevice.h>
+
 #ifdef CONFIG_PAGE_POOL_STATS
 /* Deprecated driver-facing API, use netlink instead */
 int page_pool_ethtool_stats_get_count(void);
@@ -479,4 +482,8 @@ static inline void page_pool_nid_changed(struct page_pool *pool, int new_nid)
 		page_pool_update_nid(pool, new_nid);
 }
 
+/*rx-zcopy*/
+bool page_pool_napi_local(const struct page_pool *pool);
+void page_pool_return_page(struct page_pool *pool, netmem_ref netmem);
+void page_pool_set_pp_info(struct page_pool *pool, netmem_ref netmem);
 #endif /* _NET_PAGE_POOL_HELPERS_H */
