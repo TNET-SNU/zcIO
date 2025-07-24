@@ -2625,19 +2625,17 @@ void free_unref_page(struct page *page, unsigned int order)
 	unsigned long pfn = page_to_pfn(page);
 	int migratetype;
 
-
+	/* rx-zcopy */
 	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
-		pr_info("put_page: %p is page pool\n", page);
-		pr_info("[**3. refcount = %d**]\n", atomic_read(&page->_refcount));
 		if (page_pool_napi_local(page->pp)) {
-			pr_info("put_page: %p is page pool napi local\n", page);
+			pr_info("[O NAPI] put_page: %p\n", page);
 			page_pool_recycle_direct(page->pp, page);
 		}
 		else {
-			pr_info("put_page: %p is page pool napi not local\n", page);
+			pr_info("[X NAPI] put_page: %p\n", page);
 			page_pool_put_unrefed_page(page->pp, page, 0, true);
 		}
-		return ;
+		return;
 	}
 
 	if (!pcp_allowed_order(order)) {

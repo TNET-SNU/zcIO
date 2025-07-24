@@ -1179,6 +1179,7 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 			   fi.offset / PAGE_SIZE + 1;
 		do {
 			bio_release_page(bio, page++);
+			pr_info("[syeon] bio_release_page: %p\n", page);
 		} while (--nr_pages != 0);
 	}
 }

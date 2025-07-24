@@ -316,6 +316,8 @@ static void transfer_skb_page_ownership(struct bio *bio)
 					
 					/* SKB fragment page의 page pool 소유권 제거 */
 						//netmem_ref nm = page_to_netmem(cur_skb_page);
+
+						// This is for mlx5e_page_release_fragmented - prevent page from being released in advance before app is done with it
 						cur_skb_page->private = 127;
 						//page_pool_return_page(pool, nm);
 					

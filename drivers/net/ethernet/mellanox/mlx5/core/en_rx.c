@@ -303,7 +303,7 @@ static void mlx5e_page_release_fragmented(struct mlx5e_rq *rq,
 	u16 drain_count = MLX5E_PAGECNT_BIAS_MAX - frag_page->frags;
 	struct page *page = frag_page->page;
 	if (page->private == 127) {
-		pr_info("[syeon] page->private == 127\n");
+		pr_info("[syeon] page->private is 127. page: %p -- can't release stil using in app\n", page);
 		return ;
 	}
 	if (page_pool_unref_page(page, drain_count) == 0)
