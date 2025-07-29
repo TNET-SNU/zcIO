@@ -272,6 +272,8 @@ struct bio {
 	struct mm_struct	*bi_mm;		/* mm for page pinning */
 	struct bio_vec	 *old_bi_io_vec;
 	bool bi_zerocopy_used;
+	int anon_count;
+	int file_count;
 	
 	/*
 	 * We can inline a number of vecs at the end of the bio, to avoid

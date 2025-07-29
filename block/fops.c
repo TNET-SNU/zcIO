@@ -282,23 +282,29 @@ static inline bool is_pp_page(struct page *page)
 	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
 }
 
+
 /* rx-zcopy: 페이지 소유권 이전 (bio->bi_io_vec이 SKB fragment page로 업데이트된 상태) */
 static void transfer_skb_page_ownership(struct bio *bio)
 {
 	struct page *orig_page, *cur_skb_page, *bvec_page;
 	struct page_pool *pool;
-	pr_info("transfer_skb_page_ownership start\n");
+	//pr_info("transfer_skb_page_ownership start\n");
 	
 	for (int i = 0; i < bio->bi_vcnt; i++) {
 		unsigned int npages = DIV_ROUND_UP(bio->bi_io_vec[i].bv_len, PAGE_SIZE);
 		for (int j = 0; j < npages; j++) {
-			pr_info("[syeon] npages : %d\n", npages);
+		//	pr_info("[syeon] npages : %d\n", npages);
 			bvec_page = bio->bi_io_vec[i].bv_page;
 			bvec_page = nth_page(bvec_page, j);
 			if (bvec_page && bvec_page->private) {
+				if (is_pp_page(bvec_page )){
+					pr_info("[syeon] bvec_page is pp page\n");
+					pr_info("[syeon] bvec_page : %px\n", bvec_page);
+					bvec_page->private = 127;
+				}
 			    cur_skb_page = (struct page*)bvec_page -> private;
-				pr_info("[ORIGINAL PAGE] %px - [SKB FRAG PAGE] %px\n", bvec_page, cur_skb_page);
-				pr_info("  **REFCOUNT-before** bv_page ref count : %u, cur_skb_page ref count: %u\n", page_count(bvec_page), page_count(cur_skb_page));
+			//	pr_info("[ORIGINAL PAGE] %px - [SKB FRAG PAGE] %px\n", bvec_page, cur_skb_page);
+			//	pr_info("  **REFCOUNT-before** bv_page ref count : %u, cur_skb_page ref count: %u\n", page_count(bvec_page), page_count(cur_skb_page));
 			
 				/* SKB fragment page가 page pool에서 온 페이지인지 확인 */
 				if (cur_skb_page && is_pp_page(cur_skb_page)) {
@@ -307,12 +313,12 @@ static void transfer_skb_page_ownership(struct bio *bio)
 					/* 선택사항: 원본 페이지를 page pool에 반환하여 재활용 */
 					if (cur_skb_page->pp) {
 
-						pool = cur_skb_page->pp;
+						//pool = cur_skb_page->pp;
 					/*	get_page(bvec_page);
 						page_pool_set_pp_info(pool, page_to_netmem(bvec_page));
 						page_pool_recycle_direct(pool, bvec_page);
 						*/
-						pr_info("[REFCOUNT-after] bv_page: %u, cur_skb_page: %u\n", page_count(bvec_page), page_count(cur_skb_page));
+						//pr_info("[REFCOUNT-after] bv_page: %u, cur_skb_page: %u\n", page_count(bvec_page), page_count(cur_skb_page));
 					
 					/* SKB fragment page의 page pool 소유권 제거 */
 						//netmem_ref nm = page_to_netmem(cur_skb_page);
@@ -321,13 +327,13 @@ static void transfer_skb_page_ownership(struct bio *bio)
 						cur_skb_page->private = 127;
 						//page_pool_return_page(pool, nm);
 					
-					pr_info("[REFCOUNT-after] bv_page: %u, cur_skb_page: %u\n", page_count(bvec_page), page_count(cur_skb_page));
+					//pr_info("[REFCOUNT-after] bv_page: %u, cur_skb_page: %u\n", page_count(bvec_page), page_count(cur_skb_page));
 					}
 				}
 			}
 		}
 	}
-	pr_info("transfer_skb_page_ownership end\n");
+	//pr_info("transfer_skb_page_ownership end\n");
 }
 
 static void blkdev_bio_end_io_async(struct bio *bio)
@@ -351,6 +357,12 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 			transfer_skb_page_ownership(bio);
 		}
 	}
+
+	if (bio->bi_zerocopy_used){
+		pr_info("[syeon] bio->bi_zerocopy_used\n");
+	}
+
+
 	if (dio->flags & DIO_SHOULD_DIRTY) {
 		bio_check_pages_dirty(bio);
 	} else {
@@ -359,18 +371,41 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 	}
 	
 	/* rx-zcopy: I/O 완료 후 zerocopy 정리 - zerocopy가 사용된 경우에만 */
-	if (bio->bi_mm && bio->bi_io_vec){
-		/* 메모리 통계만 복원 - SKB fragment page는 나중에 해제 */
-		for (int i = 0 ; i < bio->bi_vcnt; i++){
-			unsigned int npages = DIV_ROUND_UP(bio->bi_io_vec[i].bv_len, PAGE_SIZE);
-			
-			for (int j = 0 ; j < npages; j++){
-				/* 메모리 통계 복원 */
-				dec_mm_counter(bio->bi_mm, MM_ANONPAGES);
-				inc_mm_counter(bio->bi_mm, MM_FILEPAGES);
-			}
+/*	if (bio->bi_mm && bio->bi_io_vec && bio->bi_zerocopy_used){
+		pr_info("[syeon] bio->bi_mm->mm_counters[0] : %d, bio->bi_mm->mm_counters[1] : %d\n", bio->anon_count, bio->file_count);
+		for (int i = 0 ; i< bio->anon_count; i++){
+			inc_mm_counter(bio->bi_mm, MM_ANONPAGES);
 		}
-	}
+		for (int i = 0 ; i< bio->file_count; i++){
+			inc_mm_counter(bio->bi_mm, MM_FILEPAGES);
+		}
+		int total_mm_counters = bio->anon_count + bio->file_count;
+		for (int i = 0 ; i < total_mm_counters; i++){
+			dec_mm_counter(bio->bi_mm, MM_ANONPAGES);
+		}
+		bio->anon_count = 0;
+		bio->file_count= 0;
+	}*/
+		/* 메모리 통계만 복원 - SKB fragment page는 나중에 해제 */
+		//for (int i = 0 ; i < bio->bi_vcnt; i++){
+			//unsigned int npages = DIV_ROUND_UP(bio->bi_io_vec[i].bv_len, PAGE_SIZE);
+			
+			//for (int j = 0 ; j < npages; j++){
+				//struct page *bvec_page = nth_page(bio->bi_io_vec[i].bv_page, j);
+				/* 메모리 통계 복원 */
+			//	if (PageAnon(bvec_page)){
+				//	pr_info("[syeon] PageAnon actually used : %p\n", bvec_page);
+					//inc_mm_counter(bio->bi_mm, MM_ANONPAGES);
+				//}
+				//else{
+				//	inc_mm_counter(bio->bi_mm, MM_FILEPAGES);
+				//}
+				//inc_mm_counter(bio->bi_mm, MM_FILEPAGES);
+			//}
+		//}
+//	}
+
+	
 	if (bio->bi_mm)
 	{
 		mmdrop(bio->bi_mm);
@@ -404,6 +439,8 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	/* rx-zcopy */
 	struct mm_struct * mm = current->mm;
 	if (mm){
+		mm->anon_count =0;
+		mm->file_count =0;
 		mmgrab(mm);
 		bio->bi_mm = mm;
 	}

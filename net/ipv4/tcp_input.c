@@ -4829,6 +4829,20 @@ static void tcp_sack_remove(struct tcp_sock *tp)
 	tp->rx_opt.num_sacks = num_sacks;
 }
 
+static bool is_nvme_tcp_recv_pdu(struct sk_buff *skb)
+{
+    if (!skb || !skb->data)
+        return false;
+
+    // NVMe-TCP PDU header magic은 0x0 or 0x1, type field 확인 (offset 0)
+    u8 pdu_type = skb->data[0];
+    if (pdu_type == 0x07){
+        return true;
+	}
+
+    return false;
+}
+
 /**
  * tcp_try_coalesce - try to merge skb to prior one
  * @sk: socket
@@ -4857,7 +4871,10 @@ static bool tcp_try_coalesce(struct sock *sk,
 
 	if (!tcp_skb_can_collapse_rx(to, from))
 		return false;
-
+	if (is_nvme_tcp_recv_pdu(from)){
+		pr_info("skb linear data is pdu header dont merge\n");
+	//	return false;
+	}
 	if (!skb_try_coalesce(to, from, fragstolen, &delta))
 		return false;
 

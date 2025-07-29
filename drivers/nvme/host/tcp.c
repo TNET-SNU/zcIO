@@ -840,8 +840,13 @@ static inline int page_mapcount(struct page *page)
     return atomic_read(&page->_mapcount);
 }
 
+static inline bool is_pp_page(struct page *page)
+{
+	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
+}
+
 /* rx-zcopy: 고성능 배치 페이지 매핑 함수 */
-static int batch_remap_pages(struct page_remap_batch *batch)
+static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 {
 	struct mm_struct *mm = batch->mm;
 	int success_count = 0;
@@ -913,23 +918,52 @@ static int batch_remap_pages(struct page_remap_batch *batch)
 
 		/* 원자적 페이지 교체 */
 		old_pte = ptep_get_and_clear(mm, user_addr, ptep);
-		
+
 		if (likely(pte_present(old_pte))) {
 			old_page = pte_page(old_pte);
+			bool pp_page = is_pp_page(old_page);
 			batch->old_pages[i] = old_page;
-			folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
-			if (PageAnon(old_page))
+
+			//folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
+			if (pp_page){
+				pr_info("[syeon] old_page is pp_page\n");
+			//	put_page(old_page);
+			}
+			else {
+				pr_info("[syeon] old_page is not pp_page\n");
 				dec_mm_counter(mm, MM_ANONPAGES);
-			else if (old_page->mapping)
-				dec_mm_counter(mm, MM_FILEPAGES);
+				inc_mm_counter(mm, MM_FILEPAGES);
+				folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
+
+			}
+			/*else{
+				if (PageAnon(old_page)){
+					pr_info("[zerocopy] removing anon page pfn=%lx\n",page_to_pfn(old_page));
+					folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
+				}
+				else if (old_page->mapping){
+					pr_info("[zerocopy] removing file page pfn=%lx\n",page_to_pfn(old_page));
+				}
+				else {
+					pr_info("[zerocopy] removing other page pfn=%lx\n",page_to_pfn(old_page));
+				}
+			}*/
+		}
+		else if (!pte_none(old_pte)){
+			pr_info("[syeon] old_pte is not none\n");
 		}
 
 		/* 새 페이지 매핑 - SKB fragment page 보호 */
-		//get_page(new_page);  /* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
+		int refcount = page_count(new_page);
+	//	get_page(new_page);  /* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
 		new_pte = mk_pte(new_page, vma->vm_page_prot);
+		if (pte_dirty(old_pte)) {
+			pr_info("[syeon] old_pte is dirty\n");
+ 		   new_pte = pte_mkdirty(new_pte);
+		}
 		set_pte_at(mm, user_addr, ptep, new_pte);
-		folio_add_anon_rmap_ptes(page_folio(new_page), new_page, 1, vma, user_addr, RMAP_NONE);
-		inc_mm_counter(mm, MM_ANONPAGES);
+	//	folio_add_anon_rmap_ptes(page_folio(new_page), new_page, 1, vma, user_addr, RMAP_NONE);
+		//inc_mm_counter(mm, MM_ANONPAGES);
 		
 		/* TLB 플러시는 배치로 처리 */
 		flush_tlb_page(vma, user_addr);
@@ -1044,7 +1078,7 @@ static inline bool do_zerocopy(struct sk_buff *skb, struct nvme_tcp_request *req
 process_batch:
 	/* 배치 처리 - 고성능 경로 */
 	if (likely(batch.count > 0)) {
-		success_count = batch_remap_pages(&batch);
+		success_count = batch_remap_pages(&batch, req->curr_bio);
 		bool final_result = likely(success_count == batch.count && count_len == recv_len);
 		pr_info_ratelimited("[zerocopy] batch_result: success=%d/%d len_match=%s final=%s\n", 
 			success_count, batch.count, 
@@ -1059,6 +1093,60 @@ process_batch:
 	
 	pr_info_ratelimited("[zerocopy] FAIL: batch.count=0\n");
 	return false;
+}
+
+void replace_bio_with_skb_frag_pages(struct bio *bio, struct sk_buff *skb)
+{
+	struct bio_vec new_bvecs[MAX_SKB_FRAGS];  // assumption: enough frags
+	int new_bvec_i = 0;
+	int frag_idx = 0;
+
+	for (int i = 0; i < bio->bi_vcnt; i++) {
+		struct bio_vec *bv = &bio->bi_io_vec[i];
+		struct page *start_page = bv->bv_page;
+		unsigned int offset = bv->bv_offset;
+		unsigned int len = bv->bv_len;
+
+		unsigned int page_off = offset_in_page(offset);
+		unsigned int total_bytes = page_off + len;
+		unsigned int npages = DIV_ROUND_UP(total_bytes, PAGE_SIZE);
+
+		for (int j = 0; j < npages; j++) {
+			if (frag_idx >= skb_shinfo(skb)->nr_frags) {
+				pr_warn("Not enough skb frags for bio\n");
+				return;
+			}
+
+			struct page *old_page = nth_page(start_page, j);
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_idx];
+			struct page *skb_page = skb_frag_page(frag);
+			unsigned int skb_offset = skb_frag_off(frag);
+			unsigned int skb_len = skb_frag_size(frag);
+
+			new_bvecs[new_bvec_i].bv_page   = skb_page;
+			new_bvecs[new_bvec_i].bv_offset = skb_offset;
+			new_bvecs[new_bvec_i].bv_len    = skb_len;
+			new_bvec_i++;
+
+			get_page(skb_page);
+			if (old_page != skb_page)
+				put_page(old_page);
+
+			frag_idx++;
+		}
+	}
+
+	// bio_vec 전체 교체
+	memcpy(bio->bi_io_vec, new_bvecs, sizeof(struct bio_vec) * new_bvec_i);
+	bio->bi_vcnt = new_bvec_i;
+
+	// bi_size 재계산
+	bio->bi_iter.bi_size = 0;
+	for (int i = 0; i < bio->bi_vcnt; i++){
+		bio->bi_iter.bi_size += bio->bi_io_vec[i].bv_len;
+		// print bv page 
+		pr_info("[syeon] bv page: %px\n", bio->bi_io_vec[i].bv_page);
+	}
 }
 
 static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
@@ -1077,6 +1165,8 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	}
 //	pr_info("  page_count: %d\n", page_count);
 	req->curr_bio->bi_zerocopy_used = false;
+	req->curr_bio->anon_count = 0;
+	req->curr_bio->file_count = 0;
 	while (true) {
 		int recv_len, ret;
 
@@ -1134,6 +1224,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		queue->data_remaining -= recv_len;
 	}
 
+	// print mm_counters
 	if (!queue->data_remaining) {
 		if (queue->data_digest) {
 			nvme_tcp_ddgst_final(queue->rcv_hash, &queue->exp_ddgst);
@@ -1147,7 +1238,8 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			nvme_tcp_init_recv_ctx(queue);
 		}
 	}
-
+	//if (zcopy_result)
+		//replace_bio_with_skb_frag_pages(req->curr_bio, skb);
 	return 0;
 }
 
