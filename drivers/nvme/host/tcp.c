@@ -26,6 +26,7 @@
 
 /* rx-zcopy */
 #include <linux/rmap.h>
+#include <net/page_pool/helpers.h>
 
 /* rx-zcopy: 배치 처리를 위한 구조체 */
 struct page_remap_batch {
@@ -925,22 +926,30 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 			batch->old_pages[i] = old_page;
 			
 			// control mm counter
-			if (old_page && PageAnon(old_page))
+			if (old_page && PageAnon(old_page)){
+				pr_info("[syeon] old_page is anon page dec anon mm counter\n");
 				dec_mm_counter(mm, MM_ANONPAGES);
+				folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
+			}
 
-			if (new_page && is_pp_page(new_page) && (!old_page || !is_pp_page(old_page)))
+			if (new_page && is_pp_page(new_page) && (!old_page || !is_pp_page(old_page))){
+				pr_info("[syeon] new_page is pp_page inc file mm counter\n");
 				inc_mm_counter(mm, MM_FILEPAGES);
+			}
 
 			//folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
 			if (pp_page){
-				pr_info("[syeon] old_page is pp_page\n");
-			//	put_page(old_page);
+				put_page(old_page);
+				if(old_page->pp){
+					pr_info("[syeon] old_page is pp_page\n");
+					page_pool_put_page(old_page->pp, old_page, 0, false);
+				}
 			}
 			else {
 				pr_info("[syeon] old_page is not pp_page\n");
 			// 	dec_mm_counter(mm, MM_ANONPAGES);  
 		// 		inc_mm_counter(mm, MM_FILEPAGES);
-				folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
+				//folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
 
 			}
 			/*else{
@@ -962,7 +971,7 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 
 		/* 새 페이지 매핑 - SKB fragment page 보호 */
 		int refcount = page_count(new_page);
-	//	get_page(new_page);  /* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
+		get_page(new_page);  /* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
 		new_pte = mk_pte(new_page, vma->vm_page_prot);
 		if (pte_dirty(old_pte)) {
 			pr_info("[syeon] old_pte is dirty\n");
