@@ -923,6 +923,13 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 			old_page = pte_page(old_pte);
 			bool pp_page = is_pp_page(old_page);
 			batch->old_pages[i] = old_page;
+			
+			// control mm counter
+			if (old_page && PageAnon(old_page))
+				dec_mm_counter(mm, MM_ANONPAGES);
+
+			if (new_page && is_pp_page(new_page) && (!old_page || !is_pp_page(old_page)))
+				inc_mm_counter(mm, MM_FILEPAGES);
 
 			//folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
 			if (pp_page){
@@ -931,8 +938,8 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 			}
 			else {
 				pr_info("[syeon] old_page is not pp_page\n");
-				dec_mm_counter(mm, MM_ANONPAGES);
-				inc_mm_counter(mm, MM_FILEPAGES);
+			// 	dec_mm_counter(mm, MM_ANONPAGES);  
+		// 		inc_mm_counter(mm, MM_FILEPAGES);
 				folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
 
 			}
