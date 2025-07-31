@@ -829,18 +829,6 @@ static inline void nvme_tcp_end_request(struct request *rq, u16 status)
 }
 
 /* rx-zcopy */
-struct my_work{
-	struct work_struct work;
-	struct mm_struct *mm;
-	unsigned long user_addr;
-	struct page* page;
-};
-
-static inline int page_mapcount(struct page *page)
-{
-    return atomic_read(&page->_mapcount);
-}
-
 static inline bool is_pp_page(struct page *page)
 {
 	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
@@ -927,17 +915,17 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 			
 			// control mm counter
 			if (old_page && PageAnon(old_page)){
-				pr_info("[syeon] old_page is anon page dec anon mm counter\n");
 				dec_mm_counter(mm, MM_ANONPAGES);
 				folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
 			}
 
+			// increment file mm counter
+			// when new_page is pp_page and old_page is not pp_page or old_page is NULL
+			// to keep the mm counter balance
 			if (new_page && is_pp_page(new_page) && (!old_page || !is_pp_page(old_page))){
-				pr_info("[syeon] new_page is pp_page inc file mm counter\n");
 				inc_mm_counter(mm, MM_FILEPAGES);
 			}
 
-			//folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
 			if (pp_page){
 				put_page(old_page);
 				if(old_page->pp){
@@ -945,43 +933,27 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 					page_pool_put_page(old_page->pp, old_page, 0, false);
 				}
 			}
-			else {
-				pr_info("[syeon] old_page is not pp_page\n");
-			// 	dec_mm_counter(mm, MM_ANONPAGES);  
-		// 		inc_mm_counter(mm, MM_FILEPAGES);
-				//folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
-
-			}
-			/*else{
-				if (PageAnon(old_page)){
-					pr_info("[zerocopy] removing anon page pfn=%lx\n",page_to_pfn(old_page));
-					folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
-				}
-				else if (old_page->mapping){
-					pr_info("[zerocopy] removing file page pfn=%lx\n",page_to_pfn(old_page));
-				}
-				else {
-					pr_info("[zerocopy] removing other page pfn=%lx\n",page_to_pfn(old_page));
-				}
-			}*/
-		}
-		else if (!pte_none(old_pte)){
-			pr_info("[syeon] old_pte is not none\n");
 		}
 
 		/* 새 페이지 매핑 - SKB fragment page 보호 */
-		int refcount = page_count(new_page);
-		get_page(new_page);  /* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
+		/* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
+		get_page(new_page);  
+		// block release of frag page since it is used in app. 127 is magic number for now. 
+		new_page->private = 127;
 		new_pte = mk_pte(new_page, vma->vm_page_prot);
 		if (pte_dirty(old_pte)) {
-			pr_info("[syeon] old_pte is dirty\n");
  		   new_pte = pte_mkdirty(new_pte);
 		}
 		set_pte_at(mm, user_addr, ptep, new_pte);
-	//	folio_add_anon_rmap_ptes(page_folio(new_page), new_page, 1, vma, user_addr, RMAP_NONE);
-		//inc_mm_counter(mm, MM_ANONPAGES);
-		
-		/* TLB 플러시는 배치로 처리 */
+		bool is_anon_vma = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
+		if (is_anon_vma) {
+			/* anon VMA: heap/stack 등 */
+			folio_add_anon_rmap_ptes(page_folio(new_page), new_page, 1, vma, user_addr, RMAP_NONE);
+		} else {
+			/* file-backed 이거나 PFNMAP */
+			folio_add_file_rmap_ptes(page_folio(new_page), new_page, 1, vma);
+		}
+
 		flush_tlb_page(vma, user_addr);
 		
 		pte_unmap_unlock(ptep, ptl);
@@ -989,12 +961,8 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 	}
 
 	up_write(&mm->mmap_lock);
-	pr_info_ratelimited("[zerocopy] batch_remap_pages DONE: success=%d/%d\n", 
-		success_count, batch->count);
 	return success_count;
 }
-
-
 
 /* rx-zcopy */
 static int find_frag_index(struct sk_buff *skb, unsigned int offset)
@@ -1029,7 +997,6 @@ static inline bool do_zerocopy(struct sk_buff *skb, struct nvme_tcp_request *req
 	int success_count;
 	int batch_limit = ZEROCOPY_BATCH_SIZE;
 	
-	//pr_info("[syeon] do_zerocopy called - recv_len: %d, offset: %d\n", recv_len, offset);
 	/* 빠른 실패 체크 */
 	if (unlikely(!req->curr_bio || !req->curr_bio->bi_mm)) {
 		pr_info_ratelimited("[zerocopy] FAIL: bio=%p mm=%p\n", 
@@ -1078,7 +1045,7 @@ static inline bool do_zerocopy(struct sk_buff *skb, struct nvme_tcp_request *req
 			
 			// save skb frag page to original page->private
 			bv_page->private = (unsigned long)frag_page;
-			pr_info("[USER ADDR] %px - [ORIGINAL PAGE] %px - [SKB FRAG PAGE] %px\n", (void __user*)user_addr, bv_page, frag_page);
+			//pr_info("[USER ADDR] %px - [ORIGINAL PAGE] %px - [SKB FRAG PAGE] %px\n", (void __user*)user_addr, bv_page, frag_page);
 
 			/* 배치에 추가 */
 			batch.new_pages[batch.count] = frag_page;
@@ -1096,74 +1063,15 @@ process_batch:
 	if (likely(batch.count > 0)) {
 		success_count = batch_remap_pages(&batch, req->curr_bio);
 		bool final_result = likely(success_count == batch.count && count_len == recv_len);
-		pr_info_ratelimited("[zerocopy] batch_result: success=%d/%d len_match=%s final=%s\n", 
-			success_count, batch.count, 
-			(count_len == recv_len) ? "YES" : "NO",
-			final_result ? "SUCCESS" : "FAIL");
-
 		if (final_result) {
 			req->curr_bio->bi_zerocopy_used = true;
 		}
 		return final_result;
 	}
 	
-	pr_info_ratelimited("[zerocopy] FAIL: batch.count=0\n");
 	return false;
 }
 
-void replace_bio_with_skb_frag_pages(struct bio *bio, struct sk_buff *skb)
-{
-	struct bio_vec new_bvecs[MAX_SKB_FRAGS];  // assumption: enough frags
-	int new_bvec_i = 0;
-	int frag_idx = 0;
-
-	for (int i = 0; i < bio->bi_vcnt; i++) {
-		struct bio_vec *bv = &bio->bi_io_vec[i];
-		struct page *start_page = bv->bv_page;
-		unsigned int offset = bv->bv_offset;
-		unsigned int len = bv->bv_len;
-
-		unsigned int page_off = offset_in_page(offset);
-		unsigned int total_bytes = page_off + len;
-		unsigned int npages = DIV_ROUND_UP(total_bytes, PAGE_SIZE);
-
-		for (int j = 0; j < npages; j++) {
-			if (frag_idx >= skb_shinfo(skb)->nr_frags) {
-				pr_warn("Not enough skb frags for bio\n");
-				return;
-			}
-
-			struct page *old_page = nth_page(start_page, j);
-			skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_idx];
-			struct page *skb_page = skb_frag_page(frag);
-			unsigned int skb_offset = skb_frag_off(frag);
-			unsigned int skb_len = skb_frag_size(frag);
-
-			new_bvecs[new_bvec_i].bv_page   = skb_page;
-			new_bvecs[new_bvec_i].bv_offset = skb_offset;
-			new_bvecs[new_bvec_i].bv_len    = skb_len;
-			new_bvec_i++;
-
-			get_page(skb_page);
-			if (old_page != skb_page)
-				put_page(old_page);
-
-			frag_idx++;
-		}
-	}
-
-	// bio_vec 전체 교체
-	memcpy(bio->bi_io_vec, new_bvecs, sizeof(struct bio_vec) * new_bvec_i);
-	bio->bi_vcnt = new_bvec_i;
-
-	// bi_size 재계산
-	bio->bi_iter.bi_size = 0;
-	for (int i = 0; i < bio->bi_vcnt; i++){
-		bio->bi_iter.bi_size += bio->bi_io_vec[i].bv_len;
-		// print bv page 
-		pr_info("[syeon] bv page: %px\n", bio->bi_io_vec[i].bv_page);
-	}
-}
 
 static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			      unsigned int *offset, size_t *len)
@@ -1174,15 +1082,12 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
 	bool zcopy_result = false;
 
-	int page_count = 0;
-	//pr_info("[syeon] nvme_tcp_recv_data called - bio->bi_vcnt: %d ", req->curr_bio->bi_vcnt);
-	for (int i = 0; i < req->curr_bio->bi_vcnt; i++){
-		page_count += DIV_ROUND_UP(req->curr_bio->bi_io_vec[i].bv_len, PAGE_SIZE);
-	}
-//	pr_info("  page_count: %d\n", page_count);
+	pr_info("**************************************\n");
+	// print skb pointer
+	pr_info("[[[[[   %px   ]]]]]\n", skb);
+	skb_dump(KERN_INFO, skb, false);
+
 	req->curr_bio->bi_zerocopy_used = false;
-	req->curr_bio->anon_count = 0;
-	req->curr_bio->file_count = 0;
 	while (true) {
 		int recv_len, ret;
 
@@ -1240,7 +1145,6 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		queue->data_remaining -= recv_len;
 	}
 
-	// print mm_counters
 	if (!queue->data_remaining) {
 		if (queue->data_digest) {
 			nvme_tcp_ddgst_final(queue->rcv_hash, &queue->exp_ddgst);
@@ -1254,8 +1158,6 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			nvme_tcp_init_recv_ctx(queue);
 		}
 	}
-	//if (zcopy_result)
-		//replace_bio_with_skb_frag_pages(req->curr_bio, skb);
 	return 0;
 }
 
