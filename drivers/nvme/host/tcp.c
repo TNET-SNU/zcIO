@@ -925,11 +925,19 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 			if (new_page && is_pp_page(new_page) && (!old_page || !is_pp_page(old_page))){
 				inc_mm_counter(mm, MM_FILEPAGES);
 			}
-
+			/* [PAGE MGMT] - check if old page is skb frag page and return it to page pool 
+			 * to prevent page leak, we need to return the page to page pool
+			 * but this only covers the case where remap is called.
+			 * if remap is not called, the page will be leaked.
+			 */
 			if (pp_page){
 				put_page(old_page);
 				if(old_page->pp){
 					pr_info("[syeon] old_page is pp_page\n");
+					if (old_page->private == 127){
+						pr_info("[syeon] old_page is pp_page and private is 127\n");
+						old_page->private = 0;
+					}
 					page_pool_put_page(old_page->pp, old_page, 0, false);
 				}
 			}
