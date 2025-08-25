@@ -27,6 +27,9 @@
 /* rx-zcopy */
 #include <linux/rmap.h>
 #include <net/page_pool/helpers.h>
+//#include "zcopy_mmap_driver.h"
+#include "zcopy_notifier.h"
+
 
 /* rx-zcopy: 배치 처리를 위한 구조체 */
 struct page_remap_batch {
@@ -870,82 +873,139 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 		pmd_t *pmd;
 		pte_t *ptep, old_pte, new_pte;
 		spinlock_t *ptl;
+		
 		struct page *old_page;
 
+		pr_info("[syeon] batch_remap_pages: i=%d, user_addr=%lx\n", i, user_addr);
 		/* 빠른 검증 */
 		if (unlikely(!IS_ALIGNED(user_addr, PAGE_SIZE)))
 			continue;
 
 		/* VMA 검색 - 캐시 친화적 */
 		vma = find_vma(mm, user_addr);
-		if (unlikely(!vma || user_addr < vma->vm_start || user_addr >= vma->vm_end))
+		if (unlikely(!vma || user_addr < vma->vm_start || user_addr >= vma->vm_end)){
+			pr_info("[syeon] batch_remap_pages: vma not found\n");
 			continue;
+		}
 
-		if (unlikely(vma->vm_file != NULL || (vma->vm_flags & VM_PFNMAP)))
+		//if (unlikely(vma->vm_file != NULL || (vma->vm_flags & VM_PFNMAP))){
+		if (unlikely(vma->vm_flags & VM_PFNMAP)){
+			pr_info("[syeon] batch_remap_pages: vma is not file-backed or PFNMAP\n");
 			continue;
+		}
 
 		/* 페이지 테이블 워크 - 최적화된 경로 */
+		pr_info("[syeon] batch_remap_pages: pgd_offset\n");
+
 		pgd = pgd_offset(mm, user_addr);
 		if (unlikely(pgd_none(*pgd) || pgd_bad(*pgd)))
+		{
+			pr_info("[syeon] batch_remap_pages: pgd is none or bad\n");
 			continue;
-			
+		}
+
 		p4d = p4d_offset(pgd, user_addr);
 		if (unlikely(p4d_none(*p4d) || p4d_bad(*p4d)))
+		{
+			pr_info("[syeon] batch_remap_pages: p4d is none or bad\n");
 			continue;
+		}
 			
 		pud = pud_offset(p4d, user_addr);
 		if (unlikely(pud_none(*pud) || pud_bad(*pud)))
+		{
+			pr_info("[syeon] batch_remap_pages: pud is none or bad\n");
 			continue;
+		}
 			
 		pmd = pmd_offset(pud, user_addr);
 		if (unlikely(pmd_none(*pmd) || pmd_bad(*pmd)))
+		{
+			pr_info("[syeon] batch_remap_pages: pmd is none or bad\n");
 			continue;
-
+		}
 		ptep = pte_offset_map_lock(mm, pmd, user_addr, &ptl);
 		if (unlikely(!ptep))
+		{
+			pr_info("[syeon] batch_remap_pages: ptep is none\n");
 			continue;
+		}
+		pr_info("[syeon] ===============\n");
 
-		/* 원자적 페이지 교체 */
-		old_pte = ptep_get_and_clear(mm, user_addr, ptep);
+		if (pte_present(*ptep)) {
+			pr_info("[syeon] batch_remap_pages: pte present\n");
+			old_pte = ptep_get_and_clear(mm, user_addr, ptep);
 
-		if (likely(pte_present(old_pte))) {
-			old_page = pte_page(old_pte);
-			bool pp_page = is_pp_page(old_page);
-			batch->old_pages[i] = old_page;
-			
-			// control mm counter
-			if (old_page && PageAnon(old_page)){
-				dec_mm_counter(mm, MM_ANONPAGES);
-				folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
-			}
-
-			// increment file mm counter
-			// when new_page is pp_page and old_page is not pp_page or old_page is NULL
-			// to keep the mm counter balance
-			if (new_page && is_pp_page(new_page) && (!old_page || !is_pp_page(old_page))){
-				inc_mm_counter(mm, MM_FILEPAGES);
-			}
-			/* [PAGE MGMT] - check if old page is skb frag page and return it to page pool 
-			 * to prevent page leak, we need to return the page to page pool
-			 * but this only covers the case where remap is called.
-			 * if remap is not called, the page will be leaked.
-			 */
-			if (pp_page){
-				put_page(old_page);
-				if(old_page->pp){
-					pr_info("[syeon] old_page is pp_page\n");
-					if (old_page->private == 127){
-						pr_info("[syeon] old_page is pp_page and private is 127\n");
-						old_page->private = 0;
-					}
-					page_pool_put_page(old_page->pp, old_page, 0, false);
+			if (likely(pte_present(old_pte))) {
+				old_page = pte_page(old_pte);
+				bool pp_page = is_pp_page(old_page);
+				batch->old_pages[i] = old_page;
+				
+				// control mm counter
+				if (old_page && PageAnon(old_page)){
+					pr_info("[syeon] old_page is anon page\n");
+					dec_mm_counter(mm, MM_ANONPAGES);
+					folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
 				}
+				else if (!is_pp_page(old_page)){
+					pr_info("[syeon] old_page is not anon & pp page\n");
+					dec_mm_counter(mm, MM_FILEPAGES);
+					// folio_remove_ptes(page_folio(old_page), old_page, 1, vma); 
+				}
+
+				// increment file mm counter
+				// when new_page is pp_page and old_page is not pp_page or old_page is NULL
+				// to keep the mm counter balance
+				if (new_page && is_pp_page(new_page) && (!old_page || !is_pp_page(old_page))){
+					pr_info("[syeon] new_page is pp_page\n");
+					inc_mm_counter(mm, MM_FILEPAGES);
+				}
+				pr_info("[syeon-before] put_page old_page : %px, refcount : %d\n", old_page, page_ref_count(old_page));
+				put_page(old_page);
+				pr_info("[syeon-after] put_page old_page : %px, refcount : %d\n", old_page, page_ref_count(old_page));
+				/* [PAGE MGMT] - check if old page is skb frag page and return it to page pool 
+				* to prevent page leak, we need to return the page to page pool
+				* but this only covers the case where remap is called.
+				* if remap is not called, the page will be leaked.
+				*/
+				/*	
+					if(old_page->pp){
+						pr_info("[syeon] old_page is pp_page\n");
+						if (old_page->private == 127){
+							pr_info("[syeon] old_page is pp_page and private is 127\n");
+						}
+						else {
+							pr_info("[syeon] old_page is pp_page and private is not 127\n");
+						}
+						old_page->private = 0;
+						page_pool_unref_page(old_page, 1);
+//						page_pool_put_page(old_page->pp, old_page, 0, false);
+					}
+					pr_info("[syeon] old_page refcount (after2): %d\n", page_ref_count(old_page));
+*/
+				
 			}
 		}
+/*
+		old_page = follow_page(vma, user_addr, 0);
+		if (old_page) {
+			bool pp_page = is_pp_page(old_page);
+			pr_info("[syeon] batch_remap_pages: old_page %px\n", old_page);
 
+			if (pp_page) {
+				pr_info("[syeon] batch_remap_pages: old_page is pp page\n");
+				put_page(old_page);
+				if (old_page->private == 127)
+					old_page->private = 0;
+				page_pool_put_page(old_page->pp, old_page, 0, false);
+			}
+		}
+*/
 		/* 새 페이지 매핑 - SKB fragment page 보호 */
 		/* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
-		get_page(new_page);  
+		pr_info("[syeon-before] get_page new_page %px, refcount %d\n", new_page, page_ref_count(new_page));
+		get_page(new_page); 
+		pr_info("[syeon-after] get_page new_page %px, refcount %d\n", new_page, page_ref_count(new_page));
 		// block release of frag page since it is used in app. 127 is magic number for now. 
 		new_page->private = 127;
 		new_pte = mk_pte(new_page, vma->vm_page_prot);
@@ -953,17 +1013,27 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
  		   new_pte = pte_mkdirty(new_pte);
 		}
 		set_pte_at(mm, user_addr, ptep, new_pte);
+		pr_info("[syeon] set_pte_at new_pte %px\n", new_pte);
+		/*if (remap_pfn_range(vma, user_addr & PAGE_MASK, page_to_pfn(new_page), PAGE_SIZE, vma->vm_page_prot)){
+			pr_info("[syeon] batch_remap_pages: remap_pfn_range failed\n");
+			put_page(new_page);
+			return 0;
+		}
+		*/
+		pr_info("[page remap] %px\n", new_page);
 		bool is_anon_vma = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
 		if (is_anon_vma) {
-			/* anon VMA: heap/stack 등 */
+			// anon VMA: heap/stack 등 
+			pr_info("[syeon] folio_add_anon_rmap_ptes\n");
 			folio_add_anon_rmap_ptes(page_folio(new_page), new_page, 1, vma, user_addr, RMAP_NONE);
 		} else {
-			/* file-backed 이거나 PFNMAP */
+			// file-backed 이거나 PFNMAP 
+			pr_info("[syeon] folio_add_file_rmap_ptes\n");
 			folio_add_file_rmap_ptes(page_folio(new_page), new_page, 1, vma);
 		}
 
 		flush_tlb_page(vma, user_addr);
-		
+		pr_info("final ref count of new page : %d\n", page_ref_count(new_page));
 		pte_unmap_unlock(ptep, ptl);
 		success_count++;
 	}
@@ -1053,7 +1123,7 @@ static inline bool do_zerocopy(struct sk_buff *skb, struct nvme_tcp_request *req
 			
 			// save skb frag page to original page->private
 			bv_page->private = (unsigned long)frag_page;
-			//pr_info("[USER ADDR] %px - [ORIGINAL PAGE] %px - [SKB FRAG PAGE] %px\n", (void __user*)user_addr, bv_page, frag_page);
+			pr_info("[USER ADDR] %px - [ORIGINAL PAGE] %px - [SKB FRAG PAGE] %px\n", (void __user*)user_addr, bv_page, frag_page);
 
 			/* 배치에 추가 */
 			batch.new_pages[batch.count] = frag_page;
@@ -1092,8 +1162,8 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 
 	pr_info("**************************************\n");
 	// print skb pointer
-	pr_info("[[[[[   %px   ]]]]]\n", skb);
-	skb_dump(KERN_INFO, skb, false);
+	//pr_info("[[[[[   %px   ]]]]]\n", skb);
+	//skb_dump(KERN_INFO, skb, false);
 
 	req->curr_bio->bi_zerocopy_used = false;
 	while (true) {
@@ -1137,6 +1207,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 				ret = 0;
 			}
 			else {
+				pr_info("[syeon] zcopy_result: false\n");
 				ret = skb_copy_datagram_iter(skb, *offset,
 						&req->iter, recv_len);
 			}

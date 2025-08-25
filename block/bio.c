@@ -1166,7 +1166,7 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 	struct folio_iter fi;
 
 	bio_for_each_folio_all(fi, bio) {
-		struct page *page;
+		struct page *page, *temp_page;
 		size_t nr_pages;
 
 		if (mark_dirty) {
@@ -1178,8 +1178,10 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 		nr_pages = (fi.offset + fi.length - 1) / PAGE_SIZE -
 			   fi.offset / PAGE_SIZE + 1;
 		do {
+			pr_info("[syeon] bio_release_page: %px, refcount : %d\n", page, page_ref_count(page));
+			temp_page = page;
 			bio_release_page(bio, page++);
-			//pr_info("[syeon] bio_release_page: %p\n", page);
+			pr_info("[syeon] bio_release_page: %px, refcount : %d\n", temp_page, page_ref_count(temp_page));
 		} while (--nr_pages != 0);
 	}
 }
@@ -1355,12 +1357,15 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 		iov_iter_advance(iter, bio->bi_iter.bi_size);
 		return 0;
 	}
-
+	pr_info("bio_iov_iter_get_pages 1\n");
 	if (iov_iter_extract_will_pin(iter))
 		bio_set_flag(bio, BIO_PAGE_PINNED);
+	pr_info("bio_iov_iter_get_pages 2\n");
 	do {
 		ret = __bio_iov_iter_get_pages(bio, iter);
+		pr_info("bio_iov_iter_get_pages 3\n");
 	} while (!ret && iov_iter_count(iter) && !bio_full(bio, 0));
+	pr_info("bio_iov_iter_get_pages 4\n");
 
 	return bio->bi_vcnt ? 0 : ret;
 }

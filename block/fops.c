@@ -176,6 +176,7 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 	loff_t pos = iocb->ki_pos;
 	int ret = 0;
 
+	pr_info("[syeon] __blkdev_direct_IO: \n");
 	if (iocb->ki_flags & IOCB_ALLOC_CACHE)
 		opf |= REQ_ALLOC_CACHE;
 	bio = bio_alloc_bioset(bdev, nr_pages, opf, GFP_KERNEL,
@@ -298,6 +299,7 @@ static void transfer_skb_page_ownership(struct bio *bio)
 			    cur_skb_page = (struct page*)bvec_page -> private;
 				/* SKB fragment page가 page pool에서 온 페이지인지 확인 */
 				if (cur_skb_page && cur_skb_page->pp && is_pp_page(cur_skb_page)) {
+					pr_info("[syeon] cur_skb_page pp_ref_count: %ld, page : %px	\n", page_ref_count(cur_skb_page), cur_skb_page);
 					cur_skb_page->private = 127;
 				}
 			}
@@ -322,9 +324,9 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 
 	iocb->ki_complete(iocb, ret);
 	/* rx-zcopy */
-	/*if (bio->bi_mm && bio->bi_io_vec && bio->bi_zerocopy_used){
+	if (bio->bi_mm && bio->bi_io_vec && bio->bi_zerocopy_used){
 			transfer_skb_page_ownership(bio);
-	}*/
+	}
 
 	if (dio->flags & DIO_SHOULD_DIRTY) {
 		bio_check_pages_dirty(bio);
@@ -368,6 +370,7 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	if (mm){
 		mmgrab(mm);
 		bio->bi_mm = mm;
+		pr_info("[syeon] __blkdev_direct_IO_async");
 	}
 
 	if (iov_iter_is_bvec(iter)) {
@@ -378,14 +381,21 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 		 * bio_iov_iter_get_pages() and set the bvec directly.
 		 */
 		bio_iov_bvec_set(bio, iter);
+		pr_info("iov_iter_is_bvec\n");
 	} else {
+		pr_info("iov_iter_is_not_bvec\n");
 		ret = bio_iov_iter_get_pages(bio, iter);
 		if (unlikely(ret)) {
+			pr_info("bio_iov_iter_get_pages failed\n");
 			bio_put(bio);
 			return ret;
 		}
 	}
 	dio->size = bio->bi_iter.bi_size;
+
+	// rx-zcopy
+	pr_info("size = %zu\n", bio->bi_iter.bi_size);
+	pr_info("sector = %llu\n", bio->bi_iter.bi_sector);
 
 	if (is_read) {
 		if (user_backed_iter(iter)) {

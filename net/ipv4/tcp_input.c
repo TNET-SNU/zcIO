@@ -4873,11 +4873,11 @@ static bool tcp_try_coalesce(struct sock *sk,
 		return false;
 	// if skb linear data is pdu header dont merge
 	if (is_nvme_tcp_recv_pdu(from)){
-		pr_info("[skb linear data is pdu header dont merge]\n");
-		pr_info("========== skb to: %px ==========\n", to);
-		skb_dump(KERN_INFO, to, false);
-		pr_info("========== skb from: %px ==========\n", from);
-		skb_dump(KERN_INFO, from, false);
+		//pr_info("[skb linear data is pdu header dont merge]\n");
+		//pr_info("========== skb to: %px ==========\n", to);
+		//skb_dump(KERN_INFO, to, false);
+		//pr_info("========== skb from: %px ==========\n", from);
+		//skb_dump(KERN_INFO, from, false);
 
 		return false;
 	}

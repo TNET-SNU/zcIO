@@ -1549,7 +1549,7 @@ static bool set_user_address_page(struct page **page, unsigned long addr, int pa
 	for (int i = 0; i < page_count; i++) {
 		if (!page[i]) continue;
 		page[i]->private = (unsigned long)addr + i * PAGE_SIZE;
-		//pr_info("[syeon] set_user_address_page: %d pages(%d- %px) set with user address starting at %lx\n", page_count, i, page[i], page[i]->private);
+		pr_info("[syeon] set_user_address_page: %d pages(%d- %px) set with user address starting at %lx\n", page_count, i, page[i], page[i]->private);
 	}
 	return true;
 }
