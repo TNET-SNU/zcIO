@@ -287,8 +287,7 @@ static inline bool is_pp_page(struct page *page)
 /* rx-zcopy: 페이지 소유권 이전 (bio->bi_io_vec이 SKB fragment page로 업데이트된 상태) */
 static void transfer_skb_page_ownership(struct bio *bio)
 {
-	struct page *orig_page, *cur_skb_page, *bvec_page;
-	struct page_pool *pool;
+	struct page *cur_skb_page, *bvec_page;
 	
 	for (int i = 0; i < bio->bi_vcnt; i++) {
 		unsigned int npages = DIV_ROUND_UP(bio->bi_io_vec[i].bv_len, PAGE_SIZE);
@@ -299,7 +298,7 @@ static void transfer_skb_page_ownership(struct bio *bio)
 			    cur_skb_page = (struct page*)bvec_page -> private;
 				/* SKB fragment page가 page pool에서 온 페이지인지 확인 */
 				if (cur_skb_page && cur_skb_page->pp && is_pp_page(cur_skb_page)) {
-					pr_info("[syeon] cur_skb_page pp_ref_count: %ld, page : %px	\n", page_ref_count(cur_skb_page), cur_skb_page);
+					//pr_info("[syeon] cur_skb_page pp_ref_count: %ld, page : %px	\n", page_ref_count(cur_skb_page), cur_skb_page);
 					cur_skb_page->private = 127;
 				}
 			}
@@ -392,10 +391,6 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 		}
 	}
 	dio->size = bio->bi_iter.bi_size;
-
-	// rx-zcopy
-	pr_info("size = %zu\n", bio->bi_iter.bi_size);
-	pr_info("sector = %llu\n", bio->bi_iter.bi_sector);
 
 	if (is_read) {
 		if (user_backed_iter(iter)) {

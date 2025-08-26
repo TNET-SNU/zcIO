@@ -27,8 +27,6 @@
 /* rx-zcopy */
 #include <linux/rmap.h>
 #include <net/page_pool/helpers.h>
-//#include "zcopy_mmap_driver.h"
-#include "zcopy_notifier.h"
 
 
 /* rx-zcopy: 배치 처리를 위한 구조체 */
@@ -938,7 +936,6 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 
 			if (likely(pte_present(old_pte))) {
 				old_page = pte_page(old_pte);
-				bool pp_page = is_pp_page(old_page);
 				batch->old_pages[i] = old_page;
 				
 				// control mm counter
@@ -1013,7 +1010,6 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
  		   new_pte = pte_mkdirty(new_pte);
 		}
 		set_pte_at(mm, user_addr, ptep, new_pte);
-		pr_info("[syeon] set_pte_at new_pte %px\n", new_pte);
 		/*if (remap_pfn_range(vma, user_addr & PAGE_MASK, page_to_pfn(new_page), PAGE_SIZE, vma->vm_page_prot)){
 			pr_info("[syeon] batch_remap_pages: remap_pfn_range failed\n");
 			put_page(new_page);

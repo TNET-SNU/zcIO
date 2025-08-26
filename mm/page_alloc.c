@@ -2626,8 +2626,8 @@ void free_unref_page(struct page *page, unsigned int order)
 	int migratetype;
 
 	/* rx-zcopy */
+/*
 	pr_info("[syeon] free_unref_page: %px, refcount : %d\n", page, page_ref_count(page));
-
 	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
 		if (page_pool_napi_local(page->pp)) {
 			pr_info("[O NAPI] put_page: %px\n", page);
@@ -2639,7 +2639,7 @@ void free_unref_page(struct page *page, unsigned int order)
 		}
 		return;
 	}
-
+*/
 	if (!pcp_allowed_order(order)) {
 		__free_pages_ok(page, order, FPI_NONE);
 		return;
