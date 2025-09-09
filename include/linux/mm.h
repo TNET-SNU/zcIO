@@ -4216,4 +4216,10 @@ void vma_pgtable_walk_end(struct vm_area_struct *vma);
 
 int reserve_mem_find_by_name(const char *name, phys_addr_t *start, phys_addr_t *size);
 
+struct my_ctx {
+	unsigned long *user_addr;
+	struct page **page;
+	int nr_pages;
+};
+
 #endif /* _LINUX_MM_H */

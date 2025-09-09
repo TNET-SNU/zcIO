@@ -288,19 +288,13 @@ static inline bool is_pp_page(struct page *page)
 static void transfer_skb_page_ownership(struct bio *bio)
 {
 	struct page *cur_skb_page, *bvec_page;
-	
+
 	for (int i = 0; i < bio->bi_vcnt; i++) {
 		unsigned int npages = DIV_ROUND_UP(bio->bi_io_vec[i].bv_len, PAGE_SIZE);
 		for (int j = 0; j < npages; j++) {
 			bvec_page = bio->bi_io_vec[i].bv_page;
 			bvec_page = nth_page(bvec_page, j);
 			if (bvec_page && bvec_page->private) {
-			    cur_skb_page = (struct page*)bvec_page -> private;
-				/* SKB fragment page가 page pool에서 온 페이지인지 확인 */
-				if (cur_skb_page && cur_skb_page->pp && is_pp_page(cur_skb_page)) {
-					//pr_info("[syeon] cur_skb_page pp_ref_count: %ld, page : %px	\n", page_ref_count(cur_skb_page), cur_skb_page);
-					cur_skb_page->private = 127;
-				}
 			}
 		}
 	}
@@ -311,6 +305,10 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 	struct blkdev_dio *dio = container_of(bio, struct blkdev_dio, bio);
 	struct kiocb *iocb = dio->iocb;
 	ssize_t ret;
+	/* rx-zcopy */
+	if (bio->bi_mm && bio->bi_io_vec && bio->bi_zerocopy_used){
+			//transfer_skb_page_ownership(bio);
+	}
 
 	WRITE_ONCE(iocb->private, NULL);
 
@@ -322,10 +320,6 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 	}
 
 	iocb->ki_complete(iocb, ret);
-	/* rx-zcopy */
-	if (bio->bi_mm && bio->bi_io_vec && bio->bi_zerocopy_used){
-			transfer_skb_page_ownership(bio);
-	}
 
 	if (dio->flags & DIO_SHOULD_DIRTY) {
 		bio_check_pages_dirty(bio);
@@ -333,10 +327,21 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 		bio_release_pages(bio, false);
 		bio_put(bio);
 	}
-	
+
+	// free user address from bio->bi_private
 	if (bio->bi_mm)
 	{
+		if (bio->bi_private){
+			struct my_ctx *ctx = bio->bi_private;
+			if (ctx){
+				kfree(ctx->user_addr);
+				kfree(ctx->page);
+				kfree(ctx);
+			}
+			bio->bi_private = NULL;
+		}
 		mmdrop(bio->bi_mm);
+		bio->bi_mm = NULL;
 	}
 }
 
@@ -364,12 +369,19 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	bio->bi_end_io = blkdev_bio_end_io_async;
 	bio->bi_ioprio = iocb->ki_ioprio;
 
-	/* rx-zcopy */
 	struct mm_struct * mm = current->mm;
+	struct my_ctx *ctx = NULL;
+	// store user address to bio->bi_private
 	if (mm){
 		mmgrab(mm);
 		bio->bi_mm = mm;
-		pr_info("[syeon] __blkdev_direct_IO_async");
+
+		ctx = kmalloc(sizeof(struct my_ctx), GFP_KERNEL);
+		if (!ctx)
+			return -ENOMEM;
+		ctx->user_addr = kmalloc(nr_pages * sizeof(unsigned long), GFP_KERNEL);
+		ctx->page = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
+		bio->bi_private = ctx;
 	}
 
 	if (iov_iter_is_bvec(iter)) {
@@ -380,12 +392,9 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 		 * bio_iov_iter_get_pages() and set the bvec directly.
 		 */
 		bio_iov_bvec_set(bio, iter);
-		pr_info("iov_iter_is_bvec\n");
 	} else {
-		pr_info("iov_iter_is_not_bvec\n");
 		ret = bio_iov_iter_get_pages(bio, iter);
 		if (unlikely(ret)) {
-			pr_info("bio_iov_iter_get_pages failed\n");
 			bio_put(bio);
 			return ret;
 		}

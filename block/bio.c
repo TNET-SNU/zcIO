@@ -1178,10 +1178,7 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 		nr_pages = (fi.offset + fi.length - 1) / PAGE_SIZE -
 			   fi.offset / PAGE_SIZE + 1;
 		do {
-			pr_info("[syeon] bio_release_page: %px, refcount : %d\n", page, page_ref_count(page));
-			temp_page = page;
 			bio_release_page(bio, page++);
-			pr_info("[syeon] bio_release_page: %px, refcount : %d\n", temp_page, page_ref_count(temp_page));
 		} while (--nr_pages != 0);
 	}
 }
@@ -1265,6 +1262,7 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 	size_t offset;
 	int ret = 0;
 
+
 	/*
 	 * Move page array up in the allocated memory for the bio vecs as far as
 	 * possible so that we can start filling biovecs from the beginning
@@ -1311,8 +1309,28 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 					offset);
 			if (ret)
 				break;
-		} else
+		} else {
+			// store user address to bio->bi_private
+			if (bio->bi_mm){
+				struct my_ctx *ctx = bio->bi_private;
+				if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE){
+					if (page->_pp_mapping_pad){
+						ctx->user_addr[i] = (unsigned long)page->_pp_mapping_pad;
+						page->_pp_mapping_pad = 0;
+						ctx->page[i] = page;
+					}
+				}
+				else {
+					if (page->private){
+						ctx->user_addr[i] = (unsigned long)page->private;
+						page->private = 0;
+						ctx->page[i] = page;
+					}
+				}
+				ctx->nr_pages++;
+			}
 			bio_iov_add_page(bio, page, len, offset);
+		}
 
 		offset = 0;
 	}
@@ -1357,15 +1375,11 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 		iov_iter_advance(iter, bio->bi_iter.bi_size);
 		return 0;
 	}
-	pr_info("bio_iov_iter_get_pages 1\n");
 	if (iov_iter_extract_will_pin(iter))
 		bio_set_flag(bio, BIO_PAGE_PINNED);
-	pr_info("bio_iov_iter_get_pages 2\n");
 	do {
 		ret = __bio_iov_iter_get_pages(bio, iter);
-		pr_info("bio_iov_iter_get_pages 3\n");
 	} while (!ret && iov_iter_count(iter) && !bio_full(bio, 0));
-	pr_info("bio_iov_iter_get_pages 4\n");
 
 	return bio->bi_vcnt ? 0 : ret;
 }

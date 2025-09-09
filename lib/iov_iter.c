@@ -1546,10 +1546,18 @@ static ssize_t iov_iter_extract_kvec_pages(struct iov_iter *i,
 /* rx-zcopy*/
 static bool set_user_address_page(struct page **page, unsigned long addr, int page_count)
 {
+	// store user address to page
+	// 1. page is pp_page : page->_pp_mapping_pad
+	// 2. page is not pp_page : page->private
 	for (int i = 0; i < page_count; i++) {
 		if (!page[i]) continue;
-		page[i]->private = (unsigned long)addr + i * PAGE_SIZE;
-		pr_info("[syeon] set_user_address_page: %d pages(%d- %px) set with user address starting at %lx\n", page_count, i, page[i], page[i]->private);
+		if ( (page[i]->pp_magic & ~0x3UL) == PP_SIGNATURE)
+		{
+			page[i]->_pp_mapping_pad = (unsigned long)addr + i * PAGE_SIZE;
+		}
+		else {
+			set_page_private(page[i], (unsigned long)addr + i * PAGE_SIZE);
+		}
 	}
 	return true;
 }
