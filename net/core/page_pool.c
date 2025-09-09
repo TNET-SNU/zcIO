@@ -697,6 +697,7 @@ static bool page_pool_recycle_in_cache(netmem_ref netmem,
 
 static bool __page_pool_page_can_be_recycled(netmem_ref netmem)
 {
+	//pr_info("**** __page_pool_page_can_be_recycled : page: %px, refcnt: %d, pfmemalloc: %d\n", netmem_to_page(netmem), page_ref_count(netmem_to_page(netmem)), page_is_pfmemalloc(netmem_to_page(netmem)));
 	return page_ref_count(netmem_to_page(netmem)) == 1 &&
 	       !page_is_pfmemalloc(netmem_to_page(netmem));
 }
@@ -712,7 +713,6 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 		     unsigned int dma_sync_size, bool allow_direct)
 {
 	lockdep_assert_no_hardirq();
-
 	/* This allocator is optimized for the XDP mode that uses
 	 * one-frame-per-page, but have fallbacks that act like the
 	 * regular page allocator APIs.
@@ -726,7 +726,6 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 		/* Read barrier done in page_ref_count / READ_ONCE */
 
 		page_pool_dma_sync_for_device(pool, netmem, dma_sync_size);
-
 		if (allow_direct && page_pool_recycle_in_cache(netmem, pool))
 			return 0;
 
@@ -747,6 +746,7 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 	 * will be invoking put_page.
 	 */
 	recycle_stat_inc(pool, released_refcnt);
+	//pr_info("**** page_pool_return_page : page: %px, allow_direct: %d\n", netmem_to_page(netmem), allow_direct);
 	page_pool_return_page(pool, netmem);
 
 	return 0;
@@ -778,6 +778,7 @@ bool page_pool_napi_local(const struct page_pool *pool)
 void page_pool_put_unrefed_netmem(struct page_pool *pool, netmem_ref netmem,
 				  unsigned int dma_sync_size, bool allow_direct)
 {
+	//pr_info(" ==== page_pool_put_unrefed_netmem : page: %px, allow_direct: %d\n", netmem_to_page(netmem), allow_direct);
 	if (!allow_direct)
 		allow_direct = page_pool_napi_local(pool);
 
@@ -867,7 +868,6 @@ static netmem_ref page_pool_drain_frag(struct page_pool *pool,
 				       netmem_ref netmem)
 {
 	long drain_count = BIAS_MAX - pool->frag_users;
-
 	/* Some user is still using the page frag */
 	if (likely(page_pool_unref_netmem(netmem, drain_count)))
 		return 0;
@@ -888,6 +888,7 @@ static void page_pool_free_frag(struct page_pool *pool)
 
 	pool->frag_page = 0;
 
+	//pr_info(" ==== page_pool_free_frag : page: %px, drain_count: %ld\n", netmem_to_page(netmem), drain_count);
 	if (!netmem || page_pool_unref_netmem(netmem, drain_count))
 		return;
 

@@ -1049,7 +1049,6 @@ __always_inline bool free_pages_prepare(struct page *page,
 	
 	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
 		//pr_info("[syeon] ***** is_pp_page : %px\n", page);
-		//pr_info("[syeon] ***** pp_ref_count : %ld\n", atomic_long_read(&page->pp_ref_count));
 		return false;
 	}
 	trace_mm_page_free(page, order);
@@ -1214,7 +1213,7 @@ static void free_one_page(struct zone *zone, struct page *page,
 {
 	unsigned long flags;
 	int migratetype;
-	pr_info("[************] free_one_page : %px\n", page);
+	//pr_info("[************] free_one_page : %px\n", page);
 	spin_lock_irqsave(&zone->lock, flags);
 	migratetype = get_pfnblock_migratetype(page, pfn);
 	__free_one_page(page, pfn, zone, order, migratetype, fpi_flags);
@@ -2625,21 +2624,6 @@ void free_unref_page(struct page *page, unsigned int order)
 	unsigned long pfn = page_to_pfn(page);
 	int migratetype;
 
-	/* rx-zcopy */
-/*
-	pr_info("[syeon] free_unref_page: %px, refcount : %d\n", page, page_ref_count(page));
-	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
-		if (page_pool_napi_local(page->pp)) {
-			pr_info("[O NAPI] put_page: %px\n", page);
-			page_pool_recycle_direct(page->pp, page);
-		}
-		else {
-			pr_info("[X NAPI] put_page: %px\n", page);
-			page_pool_put_unrefed_page(page->pp, page, 0, true);
-		}
-		return;
-	}
-*/
 	if (!pcp_allowed_order(order)) {
 		__free_pages_ok(page, order, FPI_NONE);
 		return;
@@ -2648,7 +2632,7 @@ void free_unref_page(struct page *page, unsigned int order)
 	// print function
 	if (!free_pages_prepare(page, order))
 		return;
-	
+	//pr_info("[free_unref_page] page : %px - refcount : %d", page, page_ref_count(page));	
 	/*
 	 * We only track unmovable, reclaimable and movable on pcp lists.
 	 * Place ISOLATE pages on the isolated list because they are being

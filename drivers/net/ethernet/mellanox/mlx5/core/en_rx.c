@@ -302,14 +302,9 @@ static void mlx5e_page_release_fragmented(struct mlx5e_rq *rq,
 {
 	u16 drain_count = MLX5E_PAGECNT_BIAS_MAX - frag_page->frags;
 	struct page *page = frag_page->page;
-	// block release of frag page since it is used in app
-	if (page->private == 127) {
-		pr_info("[syeon] page->private is 127. page: %px -- can't release stil using in app\n", page);
-		page->private = 0;
-		return ;
-	}
-	if (page_pool_unref_page(page, drain_count) == 0)
+	if (page_pool_unref_page(page, drain_count) == 0){
 		page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
+	}
 }
 
 static inline int mlx5e_get_rx_frag(struct mlx5e_rq *rq,
