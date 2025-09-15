@@ -27,6 +27,8 @@
 /* rx-zcopy */
 #include <linux/rmap.h>
 #include <net/page_pool/helpers.h>
+#include <linux/hugetlb.h>
+#include <linux/skbuff_ref.h>
 
 
 /* rx-zcopy: 배치 처리를 위한 구조체 */
@@ -37,6 +39,8 @@ struct page_remap_batch {
 	int count;                    /* 배치 크기 */
 	struct mm_struct *mm;         /* 메모리 디스크립터 */
 };
+
+
 
 struct nvme_tcp_queue;
 
@@ -835,12 +839,22 @@ static inline bool is_pp_page(struct page *page)
 	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
 }
 
+static inline void apply_rss_delta_vec(struct mm_struct *mm, long *rss)
+{
+	int c;
+	for (c = 0; c < NR_MM_COUNTERS; c++) {
+		long d = rss[c];
+		if (d)
+			add_mm_counter(mm, c, d);
+	}
+}
+
 /* rx-zcopy: 고성능 배치 페이지 매핑 함수 */
 static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 {
 	struct mm_struct *mm = batch->mm;
 	int success_count = 0;
-	int i;
+	size_t i = 0;
 
 	if (unlikely(!mm || batch->count <= 0)) {
 		pr_info_ratelimited("[zerocopy] batch_remap FAIL: mm=%p count=%d\n", 
@@ -856,137 +870,119 @@ static int batch_remap_pages(struct page_remap_batch *batch, struct bio *bio)
 		/* trylock 실패 시 일반 락 사용하되 빠른 처리 */
 		down_write(&mm->mmap_lock);
 		//pr_info_ratelimited("[zerocopy] mmap_lock: trylock=FAILED, using regular lock\n");
-	} else {
-		//pr_info_ratelimited("[zerocopy] mmap_lock: trylock=SUCCESS\n");
 	}
 
 	/* 배치 전체를 최대한 빠르게 처리 */
-	for (i = 0; i < batch->count; i++) {
-		unsigned long user_addr = batch->user_addrs[i];
-		struct page *new_page = batch->new_pages[i];
-		struct vm_area_struct *vma;
-		pgd_t *pgd;
-		p4d_t *p4d;
-		pud_t *pud;
-		pmd_t *pmd;
-		pte_t *ptep, old_pte, new_pte;
-		spinlock_t *ptl;
+	while (i < batch->count) {
+		unsigned long addr = batch->user_addrs[i];
+		struct vm_area_struct *vma = vma_lookup(mm, addr);
+		if (!vma || addr < vma->vm_start || addr >= vma->vm_end) { i++; continue; }
+		if (unlikely(vma->vm_flags & VM_PFNMAP)) { i++; continue; }
+
+		// 같은 pmd 안에서 연속인 run 경계를 찾자
+		unsigned long run_start = addr;
+		unsigned long run_end   = addr + PAGE_SIZE;
+		unsigned long pmd_cap = pmd_addr_end(run_start, vma->vm_end);
+		size_t j = i + 1;
+		for (; j < batch->count; j++) {
+			unsigned long a = batch->user_addrs[j];
+			if (a != run_end) break;               // 비연속이면 중단
+			// pmd 경계 넘어가면 중단
+			if (run_end >= pmd_cap) break;
+			run_end += PAGE_SIZE;
+		}
+
+		// 이제 [i..j-1]가 같은 pmd의 연속 페이지 run
+		pmd_t *pmd = pmd_offset(pud_offset(p4d_offset(pgd_offset(mm, run_start), run_start), run_start), run_start);
+		if (unlikely(pmd_none(*pmd) || pmd_bad(*pmd))) { i = j; continue; }
+		if (unlikely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd))) {
+			split_huge_pmd(vma, pmd, run_start);
+			if (unlikely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd))) {
+				// split 지연/실패: 안전하게 이 run은 건너뛰기
+				i = j; 
+				continue;
+			}
+		}
 		
-		struct page *old_page;
+		spinlock_t *ptl;
+		pte_t *ptep0 = pte_offset_map_lock(mm, pmd, run_start, &ptl);
+		pte_t *pbase = ptep0 - pte_index(run_start);
 
-		/* 빠른 검증 */
-		if (unlikely(!IS_ALIGNED(user_addr, PAGE_SIZE)))
-			continue;
+		long rss[NR_MM_COUNTERS] = {0};
 
-		/* VMA 검색 - 캐시 친화적 */
-		vma = find_vma(mm, user_addr);
-		if (unlikely(!vma || user_addr < vma->vm_start || user_addr >= vma->vm_end)){
-			pr_info("[syeon] batch_remap_pages: vma not found\n");
-			continue;
-		}
 
-		if (unlikely(vma->vm_flags & VM_PFNMAP)){
-			pr_info("[syeon] batch_remap_pages: vma is not file-backed or PFNMAP\n");
-			continue;
-		}
+		// 1) old PTE들 clear (flush 보류)
+		for (size_t k = i; k < j; k++) {
+			unsigned long a = batch->user_addrs[k];
+			pte_t *p = pbase + pte_index(a);
+			pte_t old = READ_ONCE(*p);
+			if (!pte_present(old)){
+				pr_info("pte not present\n");
+				continue;
 
-		/* 페이지 테이블 워크 - 최적화된 경로 */
-		pgd = pgd_offset(mm, user_addr);
-		if (unlikely(pgd_none(*pgd) || pgd_bad(*pgd)))
-		{
-			pr_info("[syeon] batch_remap_pages: pgd is none or bad\n");
-			continue;
-		}
+			}
 
-		p4d = p4d_offset(pgd, user_addr);
-		if (unlikely(p4d_none(*p4d) || p4d_bad(*p4d)))
-		{
-			pr_info("[syeon] batch_remap_pages: p4d is none or bad\n");
-			continue;
-		}
-			
-		pud = pud_offset(p4d, user_addr);
-		if (unlikely(pud_none(*pud) || pud_bad(*pud)))
-		{
-			pr_info("[syeon] batch_remap_pages: pud is none or bad\n");
-			continue;
-		}
-			
-		pmd = pmd_offset(pud, user_addr);
-		if (unlikely(pmd_none(*pmd) || pmd_bad(*pmd)))
-		{
-			pr_info("[syeon] batch_remap_pages: pmd is none or bad\n");
-			continue;
-		}
-		ptep = pte_offset_map_lock(mm, pmd, user_addr, &ptl);
-		if (unlikely(!ptep))
-		{
-			pr_info("[syeon] batch_remap_pages: ptep is none\n");
-			continue;
-		}
+			old = ptep_get_and_clear(mm, a, p);  // 여기선 flush 안 함
 
-		if (pte_present(*ptep)) {
-			old_pte = ptep_get_and_clear(mm, user_addr, ptep);
+			struct page *old_page = pte_page(old);
+			struct folio *old_f = page_folio(old_page);
 
-			if (likely(pte_present(old_pte))) {
-				old_page = pte_page(old_pte);
-				batch->old_pages[i] = old_page;
-				
-				// control mm counter
-				if (old_page && PageAnon(old_page)){
-					dec_mm_counter(mm, MM_ANONPAGES);
-					folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
-					//pr_info("[old page is not pp page] old_page : %px, private : %lx\n", old_page, old_page->private);
-				}
-				else {
-					//pr_info("[old page is pp page] old_page : %px, private : %lx\n", old_page, old_page->_pp_mapping_pad);
-					dec_mm_counter(mm, MM_FILEPAGES);
-					folio_remove_rmap_ptes(page_folio(old_page), old_page, 1, vma);
-				}
 
-				// increment file mm counter
-				// when new_page is pp_page and old_page is not pp_page or old_page is NULL
-				// to keep the mm counter balance
-				if (new_page && is_pp_page(new_page)){ //  && (!old_page || !is_pp_page(old_page))){
-					inc_mm_counter(mm, MM_FILEPAGES);
-				}
-				if (is_pp_page(old_page)) {
+			// rmap & RSS 감소
+			rss[mm_counter(old_f)]--;
+			folio_remove_rmap_ptes(old_f, old_page, 1, vma);
+
+			// 내가 올렸던 추가 ref 회수 (pp면 page_pool_unref_page 포함)
+			put_page(old_page);
+			if (is_pp_page(old_page)){
+				// check if externel pp ref count is 0 and unref if so
+				long pp = atomic_long_read(&old_page->pp_ref_count);
+				long ext_pp = pp -1;
+				if (ext_pp > 0){
+					pr_info("page_pool_unref_page: %px - ext_pp: %ld -> will decrement pp ref count (-1)", old_page, ext_pp);
 					page_pool_unref_page(old_page, 1);
-					put_page(old_page);
 				}
-				else {
-					put_page(old_page);
-					pr_info("old page : %px - ref count : %d\n", old_page, page_ref_count(old_page));
+				else{
+					pr_info("skb_page_unref: %px - ext_pp: %ld", old_page, ext_pp);
+					skb_page_unref(old_page, true);
 				}
 			}
 		}
-		/* 새 페이지 매핑 - SKB fragment page 보호 */
-		/* 네트워크 스택이 먼저 해제하지 못하도록 보호 */
-		if (is_pp_page(new_page)) {
-			page_pool_ref_page(new_page);
+
+		// 2) run 단위로 한 번만 TLB flush
+		flush_tlb_range(vma, run_start, run_end);
+
+		// 3) 새 PTE들 설치
+		for (size_t k = i; k < j; k++) {
+			unsigned long a = batch->user_addrs[k];
+			struct page *new_page = batch->new_pages[k];
+			struct folio *new_f = page_folio(new_page);
+
+			pte_t *p = pbase + pte_index(a);
+			pte_t np = mk_pte(new_page, vma->vm_page_prot);
+			bool is_anon = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
+			
+			if (is_pp_page(new_page)){
+				page_pool_ref_page(new_page);
+			}
 			get_page(new_page);
-		}
-		else {
-			get_page(new_page);
+
+			set_pte_at(mm, a, p, np);
+
+
+			if (is_anon)
+				folio_add_anon_rmap_ptes(new_f, new_page, 1, vma, a, RMAP_NONE);
+			else
+				folio_add_file_rmap_ptes(new_f, new_page, 1, vma);
+			
+			rss[mm_counter(new_f)]++;
+
 		}
 
-		new_pte = mk_pte(new_page, vma->vm_page_prot);
-		if (pte_dirty(old_pte)) {
- 		   new_pte = pte_mkdirty(new_pte);
-		}
-		set_pte_at(mm, user_addr, ptep, new_pte);
-		
-		bool is_anon_vma = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
-		if (is_anon_vma) {
-			folio_add_anon_rmap_ptes(page_folio(new_page), new_page, 1, vma, user_addr, RMAP_NONE);
-		} else {
-			// file-backed 이거나 PFNMAP 
-			folio_add_file_rmap_ptes(page_folio(new_page), new_page, 1, vma);
-		}
-
-		flush_tlb_page(vma, user_addr);
-		pte_unmap_unlock(ptep, ptl);
-		success_count++;
+		apply_rss_delta_vec(mm, rss);
+		pte_unmap_unlock(ptep0, ptl);
+		success_count += (j - i);
+		i = j; // 다음 run으로
 	}
 
 	up_write(&mm->mmap_lock);
@@ -1126,7 +1122,6 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	//skb_dump(KERN_INFO, skb, false);
 
 	req->curr_bio->bi_zerocopy_used = false;
-	pr_info("[nvme_tcp_recv_data] queue data_remaining: %ld\n", queue->data_remaining);
 	while (true) {
 		int recv_len, ret;
 

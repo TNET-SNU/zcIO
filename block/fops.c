@@ -310,6 +310,23 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 			//transfer_skb_page_ownership(bio);
 	}
 
+	struct my_ctx *ctx = bio->bi_private;
+	struct mm_struct *mm = bio->bi_mm;
+
+	bio->bi_private = NULL;
+	bio->bi_mm = NULL;
+
+	if (ctx){
+		kfree(ctx->user_addr);
+		kfree(ctx->page);
+		kfree(ctx);
+	}
+
+	if (mm){
+		mmdrop(mm);
+		mm = NULL;
+	}
+
 	WRITE_ONCE(iocb->private, NULL);
 
 	if (likely(!bio->bi_status)) {
@@ -326,22 +343,6 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 	} else {
 		bio_release_pages(bio, false);
 		bio_put(bio);
-	}
-
-	// free user address from bio->bi_private
-	if (bio->bi_mm)
-	{
-		if (bio->bi_private){
-			struct my_ctx *ctx = bio->bi_private;
-			if (ctx){
-				kfree(ctx->user_addr);
-				kfree(ctx->page);
-				kfree(ctx);
-			}
-			bio->bi_private = NULL;
-		}
-		mmdrop(bio->bi_mm);
-		bio->bi_mm = NULL;
 	}
 }
 
@@ -377,10 +378,26 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 		bio->bi_mm = mm;
 
 		ctx = kmalloc(sizeof(struct my_ctx), GFP_KERNEL);
-		if (!ctx)
+		if (!ctx){
+			bio_put(bio);
+			mmdrop(mm);
 			return -ENOMEM;
+		}
 		ctx->user_addr = kmalloc(nr_pages * sizeof(unsigned long), GFP_KERNEL);
+		if (!ctx->user_addr){
+			kfree(ctx);
+			bio_put(bio);
+			mmdrop(mm);
+			return -ENOMEM;
+		}
 		ctx->page = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
+		if (!ctx->page){
+			kfree(ctx->user_addr);
+			kfree(ctx);
+			bio_put(bio);
+			mmdrop(mm);
+			return -ENOMEM;
+		}
 		bio->bi_private = ctx;
 	}
 
@@ -395,6 +412,13 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	} else {
 		ret = bio_iov_iter_get_pages(bio, iter);
 		if (unlikely(ret)) {
+			kfree(ctx->user_addr);
+			kfree(ctx->page);
+			kfree(ctx);
+			if (mm) {
+				mmdrop(mm);
+				bio->bi_mm = NULL;
+			}
 			bio_put(bio);
 			return ret;
 		}
