@@ -1549,14 +1549,17 @@ static bool set_user_address_page(struct page **page, unsigned long addr, int pa
 	// store user address to page
 	// 1. page is pp_page : page->_pp_mapping_pad
 	// 2. page is not pp_page : page->private
+	//pr_info("[ set_user_address_page: page_count = %d ]\n", page_count);
 	for (int i = 0; i < page_count; i++) {
 		if (!page[i]) continue;
+		unsigned long user_addr = (unsigned long)addr + i * PAGE_SIZE;
+//		pr_info("---- [ %d ] : user_addr = %lx ]\n", i, user_addr);
 		if ( (page[i]->pp_magic & ~0x3UL) == PP_SIGNATURE)
 		{
-			page[i]->_pp_mapping_pad = (unsigned long)addr + i * PAGE_SIZE;
+			page[i]->_pp_mapping_pad = user_addr;
 		}
 		else {
-			set_page_private(page[i], (unsigned long)addr + i * PAGE_SIZE);
+			set_page_private(page[i], user_addr);
 		}
 	}
 	return true;

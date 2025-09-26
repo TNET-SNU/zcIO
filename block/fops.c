@@ -294,7 +294,8 @@ static void transfer_skb_page_ownership(struct bio *bio)
 		for (int j = 0; j < npages; j++) {
 			bvec_page = bio->bi_io_vec[i].bv_page;
 			bvec_page = nth_page(bvec_page, j);
-			if (bvec_page && bvec_page->private) {
+			if (bvec_page) {
+				pr_info("transfer_skb_page_ownership: bvec_page : %px\n", bvec_page);
 			}
 		}
 	}
@@ -307,7 +308,7 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 	ssize_t ret;
 	/* rx-zcopy */
 	if (bio->bi_mm && bio->bi_io_vec && bio->bi_zerocopy_used){
-			//transfer_skb_page_ownership(bio);
+		//transfer_skb_page_ownership(bio);
 	}
 
 	struct my_ctx *ctx = bio->bi_private;
@@ -318,7 +319,7 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 
 	if (ctx){
 		kfree(ctx->user_addr);
-		kfree(ctx->page);
+		kfree(ctx->pages);
 		kfree(ctx);
 	}
 
@@ -376,7 +377,10 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	if (mm){
 		mmgrab(mm);
 		bio->bi_mm = mm;
-
+	//	pr_info("[========== nr_pages: %d 	==========\n", nr_pages);
+		//if (bio->bi_private){
+			//pr_info("bio->bi_private: %px\n", bio->bi_private);
+		//}
 		ctx = kmalloc(sizeof(struct my_ctx), GFP_KERNEL);
 		if (!ctx){
 			bio_put(bio);
@@ -390,14 +394,19 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 			mmdrop(mm);
 			return -ENOMEM;
 		}
-		ctx->page = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
-		if (!ctx->page){
+		ctx->pages = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
+		if (!ctx->pages){
 			kfree(ctx->user_addr);
 			kfree(ctx);
 			bio_put(bio);
 			mmdrop(mm);
 			return -ENOMEM;
 		}
+		ctx->index = 0;
+		ctx->pending_cnt = 0;
+		ctx->mm = mm;
+		ctx->next_flush_index = 0;
+		ctx->committed_bytes = 0;
 		bio->bi_private = ctx;
 	}
 
@@ -413,7 +422,7 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 		ret = bio_iov_iter_get_pages(bio, iter);
 		if (unlikely(ret)) {
 			kfree(ctx->user_addr);
-			kfree(ctx->page);
+			kfree(ctx->pages);
 			kfree(ctx);
 			if (mm) {
 				mmdrop(mm);
@@ -424,6 +433,11 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 		}
 	}
 	dio->size = bio->bi_iter.bi_size;
+	ctx = bio->bi_private;
+	if (ctx){
+		ctx->total_bytes = bio->bi_iter.bi_size;
+		//pr_info("total_bytes: %d\n", ctx->total_bytes);
+	}
 
 	if (is_read) {
 		if (user_backed_iter(iter)) {

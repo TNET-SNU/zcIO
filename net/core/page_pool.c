@@ -724,12 +724,16 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 	 */
 	if (likely(__page_pool_page_can_be_recycled(netmem))) {
 		/* Read barrier done in page_ref_count / READ_ONCE */
+		//trace_printk("**[1]** __page_pool_put_page : page: %px, dma_sync_size: %d, allow_direct: %d\n", netmem_to_page(netmem), dma_sync_size, allow_direct);
 
 		page_pool_dma_sync_for_device(pool, netmem, dma_sync_size);
-		if (allow_direct && page_pool_recycle_in_cache(netmem, pool))
+		if (allow_direct && page_pool_recycle_in_cache(netmem, pool)){
+			//trace_printk("**[2]** page direct recycled\n");
 			return 0;
+		}
 
 		/* Page found as candidate for recycling */
+		//trace_printk("**[3]** page recycle candidate\n");
 		return netmem;
 	}
 	/* Fallback/non-XDP mode: API user have elevated refcnt.
@@ -746,7 +750,7 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 	 * will be invoking put_page.
 	 */
 	recycle_stat_inc(pool, released_refcnt);
-	//pr_info("**** page_pool_return_page : page: %px, allow_direct: %d\n", netmem_to_page(netmem), allow_direct);
+	//trace_printk("**** page_pool_return_page : page: %px, allow_direct: %d\n", netmem_to_page(netmem), allow_direct);
 	page_pool_return_page(pool, netmem);
 
 	return 0;
@@ -787,6 +791,7 @@ void page_pool_put_unrefed_netmem(struct page_pool *pool, netmem_ref netmem,
 	if (netmem && !page_pool_recycle_in_ring(pool, netmem)) {
 		/* Cache full, fallback to free pages */
 		recycle_stat_inc(pool, ring_full);
+		//pr_info("cant recycle page: %px\n", netmem_to_page(netmem));
 		page_pool_return_page(pool, netmem);
 	}
 }

@@ -1048,7 +1048,7 @@ __always_inline bool free_pages_prepare(struct page *page,
 	VM_BUG_ON_PAGE(PageTail(page), page);
 	
 	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
-		//pr_info("[syeon] ***** is_pp_page : %px\n", page);
+		pr_info("[syeon] ***** is_pp_page : %px, refcount : %d, pp_count : %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
 		return false;
 	}
 	trace_mm_page_free(page, order);
@@ -2629,10 +2629,9 @@ void free_unref_page(struct page *page, unsigned int order)
 		return;
 	}
 
-	// print function
 	if (!free_pages_prepare(page, order))
 		return;
-	//pr_info("[free_unref_page] page : %px - refcount : %d", page, page_ref_count(page));	
+	//trace_printk("[free_unref_page] page : %px - refcount : %d\n", page, page_ref_count(page));	
 	/*
 	 * We only track unmovable, reclaimable and movable on pcp lists.
 	 * Place ISOLATE pages on the isolated list because they are being

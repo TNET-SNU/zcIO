@@ -4836,7 +4836,7 @@ static bool is_nvme_tcp_recv_pdu(struct sk_buff *skb)
 
     // NVMe-TCP PDU header magic은 0x0 or 0x1, type field 확인 (offset 0)
     u8 pdu_type = skb->data[0];
-    if (pdu_type == 0x07){
+    if (pdu_type == 0x07 || pdu_type == 0x05){
         return true;
 	}
 
@@ -4872,7 +4872,7 @@ static bool tcp_try_coalesce(struct sock *sk,
 	if (!tcp_skb_can_collapse_rx(to, from))
 		return false;
 	// if skb linear data is pdu header dont merge
-	if (is_nvme_tcp_recv_pdu(from)){
+	if (is_nvme_tcp_recv_pdu(from) || is_nvme_tcp_recv_pdu(to)){
 		//pr_info("[skb linear data is pdu header dont merge]\n");
 		//pr_info("========== skb to: %px ==========\n", to);
 		//skb_dump(KERN_INFO, to, false);
@@ -4956,6 +4956,7 @@ static void tcp_ofo_queue(struct sock *sk)
 		}
 
 		tail = skb_peek_tail(&sk->sk_receive_queue);
+		pr_info("========== tail: %px ==========\n", tail);
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;

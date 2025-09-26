@@ -4218,8 +4218,16 @@ int reserve_mem_find_by_name(const char *name, phys_addr_t *start, phys_addr_t *
 
 struct my_ctx {
 	unsigned long *user_addr;
-	struct page **page;
-	int nr_pages;
+	struct page **pages;
+	int total_bytes;
+	int committed_bytes;
+	int index;
+	int pending_cnt;
+	int next_flush_index;
+	struct mm_struct *mm;
+
+	struct delayed_work pend_flush_dwork;
+	unsigned long last_activity_jiffies;
 };
 
 #endif /* _LINUX_MM_H */
