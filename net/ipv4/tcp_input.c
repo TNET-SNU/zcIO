@@ -4881,8 +4881,15 @@ static bool tcp_try_coalesce(struct sock *sk,
 
 		return false;
 	}
+	// skb dump 
 	if (!skb_try_coalesce(to, from, fragstolen, &delta))
 		return false;
+
+	//pr_info("****** skb_try_coalesce success ****** \n");
+	//pr_info("========== skb from: %px ==========\n", from);
+	//skb_dump(KERN_INFO, from, true);
+	//pr_info("========== skb to: %px ==========\n", to);
+	//skb_dump(KERN_INFO, to, true);
 
 	atomic_add(delta, &sk->sk_rmem_alloc);
 	sk_mem_charge(sk, delta);
@@ -4938,6 +4945,9 @@ static void tcp_ofo_queue(struct sock *sk)
 	p = rb_first(&tp->out_of_order_queue);
 	while (p) {
 		skb = rb_to_skb(p);
+		//pr_info("========== tcp_ofo_queue skb: %px ==========\n", skb);
+	//	skb_dump(KERN_INFO, skb, true);
+		//pr_info("========== tcp_ofo_queue end ==========\n");
 		if (after(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
 			break;
 
@@ -4956,7 +4966,6 @@ static void tcp_ofo_queue(struct sock *sk)
 		}
 
 		tail = skb_peek_tail(&sk->sk_receive_queue);
-		pr_info("========== tail: %px ==========\n", tail);
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
@@ -5135,6 +5144,10 @@ end:
 		/* For non sack flows, do not grow window to force DUPACK
 		 * and trigger fast retransmit.
 		 */
+		//pr_info("========== tcp_data_queue_ofo coalesce success ==========\n");
+		//pr_info("========== tcp_data_queue_ofo skb: %px ==========\n", skb);
+		//skb_dump(KERN_INFO, skb, true);
+		//pr_info("========== tcp_data_queue_ofo end ==========\n");
 		if (tcp_is_sack(tp))
 			tcp_grow_window(sk, skb, false);
 		skb_condense(skb);
@@ -6081,6 +6094,7 @@ reset:
  */
 void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 {
+
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	const struct tcphdr *th = (const struct tcphdr *)skb->data;
 	struct tcp_sock *tp = tcp_sk(sk);

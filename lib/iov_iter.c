@@ -1544,16 +1544,30 @@ static ssize_t iov_iter_extract_kvec_pages(struct iov_iter *i,
 }
 
 /* rx-zcopy*/
-static bool set_user_address_page(struct page **page, unsigned long addr, int page_count)
+static bool set_user_address_page(struct page **page, unsigned long first_addr, unsigned long addr, int page_count)
 {
 	// store user address to page
 	// 1. page is pp_page : page->_pp_mapping_pad
 	// 2. page is not pp_page : page->private
 	//pr_info("[ set_user_address_page: page_count = %d ]\n", page_count);
-	for (int i = 0; i < page_count; i++) {
+	
+	// save user address to each page 
+	// cosider offset of start address and total size
+	if (page[0]) {
+		if ((page[0]->pp_magic & ~0x3UL) == PP_SIGNATURE)
+		{
+			page[0]->_pp_mapping_pad = first_addr;
+		}
+		else {
+			set_page_private(page[0], first_addr);
+		}
+
+		//pr_info("---- [ 0 ] : user_addr = %lx ]\n", first_addr);
+	}
+	for (int i = 1; i < page_count; i++) {
 		if (!page[i]) continue;
 		unsigned long user_addr = (unsigned long)addr + i * PAGE_SIZE;
-//		pr_info("---- [ %d ] : user_addr = %lx ]\n", i, user_addr);
+		//pr_info("---- [ %d ] : user_addr = %lx ]\n", i, user_addr);
 		if ( (page[i]->pp_magic & ~0x3UL) == PP_SIGNATURE)
 		{
 			page[i]->_pp_mapping_pad = user_addr;
@@ -1584,7 +1598,7 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
 					   iov_iter_extraction_t extraction_flags,
 					   size_t *offset0)
 {
-	unsigned long addr;
+	unsigned long addr, first_addr;
 	unsigned int gup_flags = 0;
 	size_t offset;
 	int res;
@@ -1597,7 +1611,9 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
 		gup_flags |= FOLL_NOFAULT;
 
 	addr = first_iovec_segment(i, &maxsize);
+	first_addr = addr;
 	*offset0 = offset = addr % PAGE_SIZE;
+//	pr_info("[iov_iter_extract_user_pages] original_start_addr = %lx - offset = %zu\n", addr, offset);
 	addr &= PAGE_MASK;
 	maxpages = want_pages_array(pages, maxsize, offset, maxpages);
 	if (!maxpages)
@@ -1610,7 +1626,8 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
 	if (i->data_source == ITER_DEST && offset != 0){
 		//pr_info("[syeon] user address page offset is not zero, offset = %zu\n", offset);
 	}
-	set_user_address_page(*pages, addr, res);
+
+	set_user_address_page(*pages, first_addr, addr, res);
 
 	iov_iter_advance(i, maxsize);
 	return maxsize;

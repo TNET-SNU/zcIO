@@ -318,6 +318,7 @@ static void blkdev_bio_end_io_async(struct bio *bio)
 	bio->bi_mm = NULL;
 
 	if (ctx){
+		kfree(ctx->old_pages);
 		kfree(ctx->user_addr);
 		kfree(ctx->pages);
 		kfree(ctx);
@@ -402,11 +403,25 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 			mmdrop(mm);
 			return -ENOMEM;
 		}
+		ctx->old_pages = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
+		if (!ctx->old_pages){
+			kfree(ctx->user_addr);
+			kfree(ctx->pages);
+			kfree(ctx);
+			bio_put(bio);
+			mmdrop(mm);
+			return -ENOMEM;
+		}
+		ctx->head_aligned = true;
+		ctx->tail_aligned = true;
 		ctx->index = 0;
 		ctx->pending_cnt = 0;
 		ctx->mm = mm;
 		ctx->next_flush_index = 0;
 		ctx->committed_bytes = 0;
+		ctx->remaining_bytes = 0;
+		ctx->can_use_zerocopy = true;
+		ctx->start_frag_page_index = 0;
 		bio->bi_private = ctx;
 	}
 

@@ -1190,7 +1190,7 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 					skb_page_unref(page, true);
 				}
 			}
-			else pr_info("[2][original page] page :%px - refcount : %d", page, page_ref_count(page));
+			//else pr_info("[2][original page] page :%px - refcount : %d", page, page_ref_count(page));
 			page++;
 	
 		} while (--nr_pages != 0);
@@ -1360,11 +1360,14 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 						ctx->index++;
 					}
 				}
+				if (offset != 0) ctx->head_aligned = false;
 			}
 			bio_iov_add_page(bio, page, len, offset);
 		}
-
 		offset = 0;
+	}
+	if (bio->bi_mm){
+		if (len != PAGE_SIZE) ctx->tail_aligned = false;
 	}
 
 	iov_iter_revert(iter, left);
