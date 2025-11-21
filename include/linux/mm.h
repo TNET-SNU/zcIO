@@ -4216,24 +4216,4 @@ void vma_pgtable_walk_end(struct vm_area_struct *vma);
 
 int reserve_mem_find_by_name(const char *name, phys_addr_t *start, phys_addr_t *size);
 
-struct my_ctx {
-	unsigned long *user_addr;
-	struct page **pages;
-	struct page **old_pages;
-	bool head_aligned;
-	bool tail_aligned;
-	size_t total_bytes;
-	size_t committed_bytes;
-	int index;
-	int pending_cnt;
-	int next_flush_index;
-	struct mm_struct *mm;
-	bool can_use_zerocopy;
-	size_t remaining_bytes;
-	int start_frag_page_index;
-
-	struct delayed_work pend_flush_dwork;
-	unsigned long last_activity_jiffies;
-};
-
 #endif /* _LINUX_MM_H */

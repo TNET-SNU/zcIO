@@ -21,6 +21,7 @@
 
 /*rx-zcopy*/
 #include <net/page_pool/helpers.h>
+#include <linux/zcopy_ctx.h>
 
 static inline struct inode *bdev_file_inode(struct file *file)
 {
@@ -301,33 +302,29 @@ static void transfer_skb_page_ownership(struct bio *bio)
 	}
 }
 
+static void blkdev_my_bio_end_io_async(struct bio *bio)
+{
+	struct my_bio_private *priv = bio->bi_private;
+	struct my_ctx *ctx = priv->ctx;
+	if (ctx){
+		free_my_ctx(ctx);
+	}
+	bio->bi_private = priv->orig_private;
+	bio->bi_end_io = priv->orig_end_io;
+	if (priv->orig_end_io){
+		priv->orig_end_io(bio);
+	}
+	else {
+		pr_info("blkdev_my_bio_end_io_async: priv->orig_end_io is NULL\n");
+	}
+	kfree(priv);
+}
+
 static void blkdev_bio_end_io_async(struct bio *bio)
 {
 	struct blkdev_dio *dio = container_of(bio, struct blkdev_dio, bio);
 	struct kiocb *iocb = dio->iocb;
 	ssize_t ret;
-	/* rx-zcopy */
-	if (bio->bi_mm && bio->bi_io_vec && bio->bi_zerocopy_used){
-		//transfer_skb_page_ownership(bio);
-	}
-
-	struct my_ctx *ctx = bio->bi_private;
-	struct mm_struct *mm = bio->bi_mm;
-
-	bio->bi_private = NULL;
-	bio->bi_mm = NULL;
-
-	if (ctx){
-		kfree(ctx->old_pages);
-		kfree(ctx->user_addr);
-		kfree(ctx->pages);
-		kfree(ctx);
-	}
-
-	if (mm){
-		mmdrop(mm);
-		mm = NULL;
-	}
 
 	WRITE_ONCE(iocb->private, NULL);
 
@@ -359,6 +356,7 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	struct bio *bio;
 	loff_t pos = iocb->ki_pos;
 	int ret = 0;
+	struct my_bio_private *priv = NULL;
 
 	if (iocb->ki_flags & IOCB_ALLOC_CACHE)
 		opf |= REQ_ALLOC_CACHE;
@@ -372,57 +370,19 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	bio->bi_end_io = blkdev_bio_end_io_async;
 	bio->bi_ioprio = iocb->ki_ioprio;
 
-	struct mm_struct * mm = current->mm;
-	struct my_ctx *ctx = NULL;
-	// store user address to bio->bi_private
-	if (mm){
-		mmgrab(mm);
-		bio->bi_mm = mm;
-	//	pr_info("[========== nr_pages: %d 	==========\n", nr_pages);
-		//if (bio->bi_private){
-			//pr_info("bio->bi_private: %px\n", bio->bi_private);
-		//}
-		ctx = kmalloc(sizeof(struct my_ctx), GFP_KERNEL);
-		if (!ctx){
-			bio_put(bio);
-			mmdrop(mm);
-			return -ENOMEM;
+	// syeon - create priv only for read
+	if (is_read)
+	{
+		priv = kmalloc(sizeof(struct my_bio_private), GFP_KERNEL);
+		if (priv){
+			//bio->bi_mm = current->mm;
+			priv->magic = MY_BIO_PRIVATE_MAGIC;
+			priv->ctx = init_my_ctx(nr_pages, current->mm);
+			priv->orig_private = bio->bi_private;
+			priv->orig_end_io = bio->bi_end_io;
+			bio->bi_private = priv;
+			bio->bi_end_io = blkdev_my_bio_end_io_async;
 		}
-		ctx->user_addr = kmalloc(nr_pages * sizeof(unsigned long), GFP_KERNEL);
-		if (!ctx->user_addr){
-			kfree(ctx);
-			bio_put(bio);
-			mmdrop(mm);
-			return -ENOMEM;
-		}
-		ctx->pages = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
-		if (!ctx->pages){
-			kfree(ctx->user_addr);
-			kfree(ctx);
-			bio_put(bio);
-			mmdrop(mm);
-			return -ENOMEM;
-		}
-		ctx->old_pages = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
-		if (!ctx->old_pages){
-			kfree(ctx->user_addr);
-			kfree(ctx->pages);
-			kfree(ctx);
-			bio_put(bio);
-			mmdrop(mm);
-			return -ENOMEM;
-		}
-		ctx->head_aligned = true;
-		ctx->tail_aligned = true;
-		ctx->index = 0;
-		ctx->pending_cnt = 0;
-		ctx->mm = mm;
-		ctx->next_flush_index = 0;
-		ctx->committed_bytes = 0;
-		ctx->remaining_bytes = 0;
-		ctx->can_use_zerocopy = true;
-		ctx->start_frag_page_index = 0;
-		bio->bi_private = ctx;
 	}
 
 	if (iov_iter_is_bvec(iter)) {
@@ -436,28 +396,27 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	} else {
 		ret = bio_iov_iter_get_pages(bio, iter);
 		if (unlikely(ret)) {
-			kfree(ctx->user_addr);
-			kfree(ctx->pages);
-			kfree(ctx);
-			if (mm) {
-				mmdrop(mm);
-				bio->bi_mm = NULL;
+			if (is_read && priv){
+				if (priv->ctx){
+					free_my_ctx(priv->ctx);
+				}
+				kfree(priv);
+				//bio->bi_mm = NULL;
 			}
 			bio_put(bio);
 			return ret;
 		}
 	}
 	dio->size = bio->bi_iter.bi_size;
-	ctx = bio->bi_private;
-	if (ctx){
-		ctx->total_bytes = bio->bi_iter.bi_size;
-		//pr_info("total_bytes: %d\n", ctx->total_bytes);
-	}
 
 	if (is_read) {
 		if (user_backed_iter(iter)) {
 			dio->flags |= DIO_SHOULD_DIRTY;
 			bio_set_pages_dirty(bio);
+		}
+		// syeon
+		if (priv && priv->ctx){
+			priv->ctx->total_bytes = bio->bi_iter.bi_size;
 		}
 	} else {
 		task_io_account_write(bio->bi_iter.bi_size);

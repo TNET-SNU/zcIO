@@ -1720,6 +1720,7 @@ int tcp_set_rcvlowat(struct sock *sk, int val)
 	else
 		cap = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rmem[2]) >> 1;
 	val = min(val, cap);
+	pr_info("%s: sk_rcvlowat: %d\n", __func__, val);
 	WRITE_ONCE(sk->sk_rcvlowat, val ? : 1);
 
 	/* Check if we need to signal EPOLLIN right now */

@@ -12,9 +12,12 @@
 #include <linux/backing-dev.h>
 #include <linux/uio.h>
 #include <linux/task_io_accounting_ops.h>
+#include <linux/zcopy_ctx.h>
 #include "trace.h"
 
 #include "../internal.h"
+
+#include <linux/zcopy_ctx.h>
 
 /*
  * Private flags for iomap_dio, must not overlap with the public ones in
@@ -156,6 +159,25 @@ static inline void iomap_dio_set_error(struct iomap_dio *dio, int ret)
 	cmpxchg(&dio->error, 0, ret);
 }
 
+void iomap_my_dio_bio_end_io(struct bio *bio)
+{
+	struct my_bio_private *priv = bio->bi_private;
+	struct my_ctx *ctx = priv->ctx;
+
+	if (ctx != NULL){
+		free_my_ctx(ctx);
+	}
+	bio->bi_private = priv->orig_private;
+	bio->bi_end_io = priv->orig_end_io;
+	if (priv->orig_end_io != NULL){
+		priv->orig_end_io(bio);
+	}
+	else {
+		pr_info("iomap_my_dio_bio_end_io: priv->orig_end_io is NULL\n");
+	}
+	kfree(priv);
+}
+
 void iomap_dio_bio_end_io(struct bio *bio)
 {
 	struct iomap_dio *dio = bio->bi_private;
@@ -287,6 +309,7 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 	int nr_pages, ret = 0;
 	size_t copied = 0;
 	size_t orig_count;
+	struct my_bio_private *priv;
 
 	if ((pos | length) & (bdev_logical_block_size(iomap->bdev) - 1) ||
 	    !bdev_iter_is_aligned(iomap->bdev, dio->submit.iter))
@@ -376,6 +399,7 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 			goto out;
 		}
 
+
 		bio = iomap_dio_alloc_bio(iter, dio, nr_pages, bio_opf);
 		fscrypt_set_bio_crypt_ctx(bio, inode, pos >> inode->i_blkbits,
 					  GFP_KERNEL);
@@ -385,8 +409,33 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 		bio->bi_private = dio;
 		bio->bi_end_io = iomap_dio_bio_end_io;
 
+		// syeon
+		if (!(dio->flags & IOMAP_DIO_WRITE)){
+			priv = kmalloc(sizeof(struct my_bio_private), GFP_KERNEL);
+			if (priv){
+			//	bio->bi_mm = current->mm;
+				priv->magic = MY_BIO_PRIVATE_MAGIC;
+				priv->orig_private = dio;
+				priv->orig_end_io = iomap_dio_bio_end_io;
+				priv->ctx = init_my_ctx(nr_pages, current->mm);
+				bio->bi_private = priv;
+				bio->bi_end_io = iomap_my_dio_bio_end_io;
+			}
+			else {
+				pr_info("iomap_dio_bio_iter: kmalloc failed\n");
+			}
+		}
+
 		ret = bio_iov_iter_get_pages(bio, dio->submit.iter);
 		if (unlikely(ret)) {
+			// syeon
+			if (!(dio->flags & IOMAP_DIO_WRITE) && priv){
+				if (priv->ctx){
+					free_my_ctx(priv->ctx);
+				}
+				kfree(priv);
+				//bio->bi_mm = NULL;
+			}
 			/*
 			 * We have to stop part way through an IO. We must fall
 			 * through to the sub-block tail zeroing here, otherwise
@@ -403,6 +452,10 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 		} else {
 			if (dio->flags & IOMAP_DIO_DIRTY)
 				bio_set_pages_dirty(bio);
+			// syeon
+			if (priv && priv->ctx){
+				priv->ctx->total_bytes = n;
+			}
 		}
 
 		dio->size += n;

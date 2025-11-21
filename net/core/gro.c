@@ -610,6 +610,7 @@ static gro_result_t napi_skb_finish(struct napi_struct *napi,
 		break;
 
 	case GRO_MERGED_FREE:
+	//	pr_info("GRO_MERGED_FREE\n");
 		if (NAPI_GRO_CB(skb)->free == NAPI_GRO_FREE_STOLEN_HEAD)
 			napi_skb_free_stolen_head(skb);
 		else if (skb->fclone != SKB_FCLONE_UNAVAILABLE)
@@ -619,7 +620,11 @@ static gro_result_t napi_skb_finish(struct napi_struct *napi,
 		break;
 
 	case GRO_HELD:
+		//pr_info("GRO_HELD\n");
+		break;
 	case GRO_MERGED:
+		pr_info("GRO_MERGED\n");
+		break;
 	case GRO_CONSUMED:
 		break;
 	}

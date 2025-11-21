@@ -367,6 +367,7 @@ bool mlx5e_rx_mpwqe_is_linear_skb(struct mlx5_core_dev *mdev,
 		return false;
 
 	log_stride_sz = order_base_2(mlx5e_rx_get_linear_stride_sz(mdev, params, xsk, true));
+	//r_info("[mlx5e_rx_mpwqe_is_linear_skb] log_stride_sz=%u\n", log_stride_sz);
 	log_wqe_sz = mlx5e_mpwrq_log_wqe_sz(mdev, page_shift, umr_mode);
 
 	if (log_wqe_sz < log_stride_sz)
@@ -433,14 +434,16 @@ u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
 				   struct mlx5e_xsk_param *xsk)
 {
 	if (mlx5e_rx_mpwqe_is_linear_skb(mdev, params, xsk))
+	{
+		//pr_info("linear skb\n");
 		return order_base_2(mlx5e_rx_get_linear_stride_sz(mdev, params, xsk, true));
-
+	}
 	/* XDP in mlx5e doesn't support multiple packets per page. */
 	if (params->xdp_prog)
 		return PAGE_SHIFT;
 
-	//return MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev);
-	/* shin */
+//	return MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev);
+	/* syeon */
 	return 12;
 }
 

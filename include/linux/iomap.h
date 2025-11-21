@@ -401,6 +401,7 @@ struct iomap_dio *__iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
 		unsigned int dio_flags, void *private, size_t done_before);
 ssize_t iomap_dio_complete(struct iomap_dio *dio);
 void iomap_dio_bio_end_io(struct bio *bio);
+void iomap_my_dio_bio_end_io(struct bio *bio);
 
 #ifdef CONFIG_SWAP
 struct file;

@@ -26,6 +26,8 @@
 
 #include <linux/skbuff_ref.h>
 
+#include <linux/zcopy_ctx.h>
+
 #define ALLOC_CACHE_THRESHOLD	16
 #define ALLOC_CACHE_MAX		256
 
@@ -1288,14 +1290,6 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 	if (bio->bi_bdev && blk_queue_pci_p2pdma(bio->bi_bdev->bd_disk->queue))
 		extraction_flags |= ITER_ALLOW_P2PDMA;
 
-	/* rx-zcopy */
-	/*
-	if (bio->bi_mm){
-		size_t maxsize = 0;
-		unsigned long addr = first_iovec_segment(iter, &maxsize);
-		pr_info("start user addr: %lx", addr);
-	}*/
-
 	/*
 	 * Each segment in the iov is required to be a block size multiple.
 	 * However, we may not be able to get the entire segment if it spans
@@ -1323,13 +1317,14 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 	}
 
 	struct my_ctx *ctx = NULL;
+	struct my_bio_private *priv = bio->bi_private;
 	int base_idx = 0;
-	if (bio->bi_mm){
-		ctx = bio->bi_private;
+//	if (bio->bi_mm){
+	if (priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
+		ctx = priv->ctx;
 		if (ctx){
 			base_idx = ctx->index;
 		}
-		//pr_info("base_idx: %d", base_idx);
 	}
 
 	for (left = size, i = 0; left > 0; left -= len, i++) {
@@ -1343,30 +1338,36 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 				break;
 		} else {
 			// store user address to bio->bi_private
-			if (bio->bi_mm){
-				if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE){
-					if (page->_pp_mapping_pad){
-						ctx->user_addr[base_idx + i] = (unsigned long)page->_pp_mapping_pad;
-						page->_pp_mapping_pad = 0;
-						ctx->pages[base_idx + i] = page;
-						ctx->index++;
-					}
+			if (ctx){
+				if (base_idx + i >= ctx->nr_pages){
+					pr_info("bio_iov_iter_get_pages: base_idx(%d) + i(%d) >= ctx->nr_pages(%d)\n", base_idx, i, ctx->nr_pages);
+					ctx->error = 1; // fallback to original copy
 				}
 				else {
-					if (page->private){
-						ctx->user_addr[base_idx + i] = (unsigned long)page->private;
-						page->private = 0;
-						ctx->pages[base_idx + i] = page;
-						ctx->index++;
+					if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE){
+						if (page->_pp_mapping_pad){
+							ctx->user_addr[base_idx + i] = (unsigned long)page->_pp_mapping_pad;
+							page->_pp_mapping_pad = 0;
+							ctx->pages[base_idx + i] = page;
+							ctx->index++;
+						}
 					}
+					else {
+						if (page->private){
+							ctx->user_addr[base_idx + i] = (unsigned long)page->private;
+							page->private = 0;
+							ctx->pages[base_idx + i] = page;
+							ctx->index++;
+						}
+					}
+					if (offset != 0) ctx->head_aligned = false;
 				}
-				if (offset != 0) ctx->head_aligned = false;
 			}
 			bio_iov_add_page(bio, page, len, offset);
 		}
 		offset = 0;
 	}
-	if (bio->bi_mm){
+	if (ctx){
 		if (len != PAGE_SIZE) ctx->tail_aligned = false;
 	}
 
@@ -1414,7 +1415,6 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 	if (iov_iter_extract_will_pin(iter))
 		bio_set_flag(bio, BIO_PAGE_PINNED);
 	do {
-//		pr_info("[%d] __bio_iov_iter_get_pages", count);
 		count++;
 		ret = __bio_iov_iter_get_pages(bio, iter);
 	} while (!ret && iov_iter_count(iter) && !bio_full(bio, 0));
