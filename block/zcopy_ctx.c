@@ -4,20 +4,20 @@
 
 struct my_ctx *init_my_ctx(int nr_pages, struct mm_struct *mm)
 {
-	struct my_ctx *ctx = kmalloc(sizeof(struct my_ctx), GFP_KERNEL);
+	struct my_ctx *ctx = kzalloc(sizeof(struct my_ctx), GFP_KERNEL);
 	if (!ctx){
 		return NULL;
 	}
     ctx->magic = MY_CTX_MAGIC;
-    ctx->user_addr = kmalloc(nr_pages * sizeof(unsigned long), GFP_KERNEL);
+    ctx->user_addr = kzalloc(nr_pages * sizeof(unsigned long), GFP_KERNEL);
     if (!ctx->user_addr){
         goto free_ctx;
     }
-    ctx->pages = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
+    ctx->pages = kzalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
     if (!ctx->pages){
         goto free_user_addr;
     }
-    ctx->old_pages = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
+    ctx->old_pages = kzalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
     if (!ctx->old_pages){
         goto free_pages;
     }

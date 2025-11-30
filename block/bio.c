@@ -1184,14 +1184,15 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 		do {
 			bio_release_page(bio, page);
 
-			if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
-				long pp = atomic_long_read(&page->pp_ref_count);
+//			if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
 				//pr_info("[bio_release_page] page: %px - pp_ref_count: %ld - page_ref_count: %d", page, pp, page_ref_count(page));
-				if (pp == 1) {
+		/*		if (atomic_long_read(&page->pp_ref_count) == 1) {
+					trace_printk("**[7]** bio_release_page - calling skb_page_unref : page: %px - pp_ref_count: %ld\n", page, atomic_long_read(&page->pp_ref_count));
 					//pr_info("skb_page_unref: %px - pp: %ld", page, pp);
 					skb_page_unref(page, true);
-				}
-			}
+
+				}*/
+//			}
 			//else pr_info("[2][original page] page :%px - refcount : %d", page, page_ref_count(page));
 			page++;
 	
@@ -1321,6 +1322,7 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 	int base_idx = 0;
 //	if (bio->bi_mm){
 	if (priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
+		//pr_info("bio_iov_iter_get_pages: priv->magic == MY_BIO_PRIVATE_MAGIC\n");
 		ctx = priv->ctx;
 		if (ctx){
 			base_idx = ctx->index;

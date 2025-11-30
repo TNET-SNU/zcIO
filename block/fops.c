@@ -306,16 +306,34 @@ static void blkdev_my_bio_end_io_async(struct bio *bio)
 {
 	struct my_bio_private *priv = bio->bi_private;
 	struct my_ctx *ctx = priv->ctx;
-	if (ctx){
-		free_my_ctx(ctx);
-	}
 	bio->bi_private = priv->orig_private;
 	bio->bi_end_io = priv->orig_end_io;
 	if (priv->orig_end_io){
+
 		priv->orig_end_io(bio);
+		// unref frag pages and return to the page pool when it is the last reference
+		//trace_printk("[bio_end_io_async][ctx: %px] unref frag pages and return to the page pool when it is the last reference\n", ctx);
+		for(int i = 0; i < ctx->nr_pages; i++){
+			struct page *page = ctx->old_pages[i];
+			if (page){
+				// save page pool in zcopy ctx or check if pp is valid
+				if (unlikely(!is_pp_page(page))){
+					pr_info("blkdev_my_bio_end_io_async: page is not a page pool page\n");
+					continue;
+				}
+				put_page(page);
+				//trace_printk("[bio_end_io_async][ctx: %px] page_pool_put_full_page: %px, pp_ref_count: %ld, page_count: %d \n", ctx, page, atomic_long_read(&page->pp_ref_count), page_ref_count(page));
+				page_pool_put_full_page(page->pp, page, false);
+				//page_pool_put_page(page, 1);
+				ctx->old_pages[i] = NULL;
+			}
+		}
 	}
 	else {
 		pr_info("blkdev_my_bio_end_io_async: priv->orig_end_io is NULL\n");
+	}
+	if (ctx){
+		free_my_ctx(ctx);
 	}
 	kfree(priv);
 }
