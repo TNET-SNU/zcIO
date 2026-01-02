@@ -27,6 +27,6 @@ nvme-rdma-y				+= rdma.o
 
 nvme-fc-y				+= fc.o
 
-nvme-tcp-y				+= tcp.o
+nvme-tcp-y				+= tcp.o zcopy_mem.o
 
 nvme-apple-y				+= apple.o

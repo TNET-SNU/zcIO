@@ -26,6 +26,7 @@ struct my_ctx {
   bool can_use_zerocopy;
   size_t remaining_bytes;
   int nr_pages;
+  int old_nr_pages;
   int start_frag_page_index;
   int error; 
 

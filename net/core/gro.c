@@ -623,7 +623,7 @@ static gro_result_t napi_skb_finish(struct napi_struct *napi,
 		//pr_info("GRO_HELD\n");
 		break;
 	case GRO_MERGED:
-		pr_info("GRO_MERGED\n");
+		//pr_info("GRO_MERGED\n");
 		break;
 	case GRO_CONSUMED:
 		break;

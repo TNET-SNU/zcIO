@@ -791,7 +791,7 @@ void page_pool_put_unrefed_netmem(struct page_pool *pool, netmem_ref netmem,
 	if (netmem && !page_pool_recycle_in_ring(pool, netmem)) {
 		/* Cache full, fallback to free pages */
 		recycle_stat_inc(pool, ring_full);
-		//pr_info("cant recycle page: %px\n", netmem_to_page(netmem));
+		//pr_info("cant recycle page: %px, refcnt: %d, pp_refcnt: %d, pfmemalloc: %d\n", netmem_to_page(netmem), page_ref_count(netmem_to_page(netmem)), atomic_long_read(&netmem_to_page(netmem)->pp_ref_count), page_is_pfmemalloc(netmem_to_page(netmem)));
 		page_pool_return_page(pool, netmem);
 	}
 }

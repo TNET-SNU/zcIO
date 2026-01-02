@@ -36,6 +36,7 @@ struct my_ctx *init_my_ctx(int nr_pages, struct mm_struct *mm)
     ctx->remaining_bytes = 0;
     ctx->start_frag_page_index = 0;
     ctx->nr_pages = nr_pages;
+    ctx->old_nr_pages = 0;
     ctx->error = 0;
     ctx->submit_cpu = raw_smp_processor_id();
 	return ctx;

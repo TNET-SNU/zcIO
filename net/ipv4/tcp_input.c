@@ -4965,11 +4965,11 @@ static void tcp_ofo_queue(struct sock *sk)
 			tcp_drop_reason(sk, skb, SKB_DROP_REASON_TCP_OFO_DROP);
 			continue;
 		}
-		pr_info("tcp_ofo_queue - skb data payload size: %d, total size: %d\n", skb->data_len, skb->len);
+		//pr_info_ratelimited("tcp_ofo_queue - skb data payload size: %d, total size: %d\n", skb->data_len, skb->len);
 		tail = skb_peek_tail(&sk->sk_receive_queue);
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
 		if (eaten) {
-			pr_info("tcp_ofo_queue - coalesce success\n");
+			//pr_info("tcp_ofo_queue - coalesce success\n");
 		}
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;

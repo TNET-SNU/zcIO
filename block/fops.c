@@ -22,6 +22,7 @@
 /*rx-zcopy*/
 #include <net/page_pool/helpers.h>
 #include <linux/zcopy_ctx.h>
+#include <linux/zcopy_mem.h>
 
 static inline struct inode *bdev_file_inode(struct file *file)
 {
@@ -284,24 +285,6 @@ static inline bool is_pp_page(struct page *page)
 	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
 }
 
-
-/* rx-zcopy: 페이지 소유권 이전 (bio->bi_io_vec이 SKB fragment page로 업데이트된 상태) */
-static void transfer_skb_page_ownership(struct bio *bio)
-{
-	struct page *cur_skb_page, *bvec_page;
-
-	for (int i = 0; i < bio->bi_vcnt; i++) {
-		unsigned int npages = DIV_ROUND_UP(bio->bi_io_vec[i].bv_len, PAGE_SIZE);
-		for (int j = 0; j < npages; j++) {
-			bvec_page = bio->bi_io_vec[i].bv_page;
-			bvec_page = nth_page(bvec_page, j);
-			if (bvec_page) {
-				pr_info("transfer_skb_page_ownership: bvec_page : %px\n", bvec_page);
-			}
-		}
-	}
-}
-
 static void blkdev_my_bio_end_io_async(struct bio *bio)
 {
 	struct my_bio_private *priv = bio->bi_private;
@@ -313,7 +296,7 @@ static void blkdev_my_bio_end_io_async(struct bio *bio)
 		priv->orig_end_io(bio);
 		// unref frag pages and return to the page pool when it is the last reference
 		//trace_printk("[bio_end_io_async][ctx: %px] unref frag pages and return to the page pool when it is the last reference\n", ctx);
-		for(int i = 0; i < ctx->nr_pages; i++){
+		for(int i = 0; i < ctx->old_nr_pages; i++){
 			struct page *page = ctx->old_pages[i];
 			if (page){
 				// save page pool in zcopy ctx or check if pp is valid
@@ -400,6 +383,7 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 			priv->orig_end_io = bio->bi_end_io;
 			bio->bi_private = priv;
 			bio->bi_end_io = blkdev_my_bio_end_io_async;
+			zcopy_try_register();
 		}
 	}
 

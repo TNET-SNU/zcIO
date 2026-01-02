@@ -33,7 +33,6 @@
 
 
 
-
 struct nvme_tcp_queue;
 
 /* Define the socket priority to use for connections were it is desirable
@@ -853,6 +852,9 @@ static int batch_remap_pages(struct bio *bio)
 	size_t i = 0;
 	struct my_bio_private *priv = bio->bi_private;
 	struct my_ctx *ctx = NULL;
+	struct page* normal_old_pages[256] = {0};
+	int nnormal = 0;
+	
 
 	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)){
 		pr_info("[zerocopy] batch_remap FAIL: priv=NULL or priv->magic != MY_BIO_PRIVATE_MAGIC\n");
@@ -874,7 +876,6 @@ static int batch_remap_pages(struct bio *bio)
 			mm);
 		return 0;
 	}
-
 
 	// 소프트IRQ 문맥이면 절대 sleep 금지: trylock 실패시 빠르게 탈출 
 	if (in_softirq() || in_interrupt()) {
@@ -908,9 +909,6 @@ static int batch_remap_pages(struct bio *bio)
 			cur_vma = vma;
 			vma_end = cur_vma->vm_end;
 		}
-	//	struct vm_area_struct *vma = vma_lookup(mm, addr);
-	//	if (!vma || addr < vma->vm_start || addr >= vma->vm_end) continue;
-	//	if (unlikely(vma->vm_flags & VM_PFNMAP)) continue;
 
 		// 같은 pmd 안에서 연속인 run 경계를 찾자
 		unsigned long run_start = addr;
@@ -963,7 +961,6 @@ static int batch_remap_pages(struct bio *bio)
 				struct page *old_page = pte_page(old);
 				struct folio *old_f = page_folio(old_page);
 				// rmap & RSS 감소
-				//rss[mm_counter(old_f)]--;
 				rss_delta[mm_counter(old_f)]--;
 				folio_remove_rmap_ptes(old_f, old_page, 1, vma);
 
@@ -971,47 +968,41 @@ static int batch_remap_pages(struct bio *bio)
 				if (is_pp_page(old_page)){
 					// normal case
 					ctx->old_pages[nold++] = old_page;
+					ctx->old_nr_pages++;
+					//trace_printk("old_page: %px, addr: %lx, refcount: %d, pp_refcnt: %ld\n", old_page, (unsigned long)ctx->user_addr[k], page_ref_count(old_page), atomic_long_read(&old_page->pp_ref_count));
 					if (nold > ctx->nr_pages){
 						pr_info("[batch_remap_pages] nold > ctx->nr_pages: %d > %d\n", nold, ctx->nr_pages);
 					}
 				}
-
 				else {
-					//pr_info("[user_address: %lx] old_page is not pp_page: %px, page_count: %d\n", a, old_page, page_count(old_page));
-					put_page(old_page);
+					normal_old_pages[nnormal++] = old_page;
+					//put_page(old_page);
 				}
-
+			}	
+			if (pte_none(old) || pte_present(old)){
 				struct page *new_page = ctx->pages[k];
 				struct folio *new_f   = page_folio(new_page);
 				pte_t np = mk_pte(new_page, vma->vm_page_prot);
+				//trace_printk("new_page: %px, addr: %lx, refcount: %d\n", new_page, (unsigned long)ctx->user_addr[k], page_ref_count(new_page));
+
+				if (vma->vm_flags & VM_WRITE){
+					np = pte_mkwrite(np, vma);
+					np = pte_mkdirty(np);
+				}
+				np = pte_mkyoung(np);
+
 				bool is_anon = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
 				set_pte_at(mm, a, p, np);
 				if (is_anon){
 					folio_add_anon_rmap_ptes(new_f, new_page, 1, vma, a, RMAP_NONE);
-				//	pr_info("folio_add_anon_rmap_ptes: new_page: %px, user_address: %lx, \n",new_page, a);
 				}
-				else         folio_add_file_rmap_ptes(new_f, new_page, 1, vma);
+				else{
+					folio_add_file_rmap_ptes(new_f, new_page, 1, vma);
+				}
 				rss_delta[mm_counter(new_f)]++;
 			}
-			// pte not present but not none
 			else {
-				if (pte_none(old)){
-					struct page *new_page = ctx->pages[k];
-					struct folio *new_f   = page_folio(new_page);
-					pte_t np = mk_pte(new_page, vma->vm_page_prot);
-					bool is_anon = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
-					set_pte_at(mm, a, p, np);
-					if (is_anon){
-						folio_add_anon_rmap_ptes(new_f, new_page, 1, 
-						vma, a, RMAP_NONE);
-					//	pr_info("folio_add_anon_rmap_ptes: new_page: %px, user_address: %lx, \n",new_page, a);
-					}
-					else
-						folio_add_file_rmap_ptes(new_f, new_page, 1, vma);
-					
-					//rss[mm_counter(new_f)]++;
-					rss_delta[mm_counter(new_f)]++;
-				}
+				pr_info("pte_none(old) or pte_present(old) is not true\n");
 			}
 		
 			ctx->user_addr[k] = 0;
@@ -1033,6 +1024,9 @@ static int batch_remap_pages(struct bio *bio)
 	}
 
 	apply_rss_delta_vec(mm, rss_delta);
+	for (int k = 0; k < nnormal; k++) {
+		put_page(normal_old_pages[k]);
+	}
 	/*if (nold != ctx->nr_pages){
 		trace_printk("=== ctx: %px, nold: %d, nr_pages: %d\n", ctx, nold, ctx->nr_pages);
 	}	*/
@@ -1369,6 +1363,9 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		
 		// set recv_len to PAGE_SIZE aligned
 		zc_recv_len = recv_len & ~(PAGE_SIZE - 1);
+		if (zc_recv_len == 0) {
+			//skb_dump(KERN_INFO, skb, true);
+		}
 		tail_len = recv_len - zc_recv_len;
 		bool is_last_unaligned_chunk = (queue->data_remaining == tail_len);
 		if (is_last_unaligned_chunk) {
@@ -1382,7 +1379,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			ret = skb_copy_and_hash_datagram_iter(skb, *offset,
 				&req->iter, recv_len, queue->rcv_hash);
 		else if (can_use_zerocopy(req->curr_bio, zc_recv_len, *len) == false || is_last_unaligned_chunk){
-			//pr_info("[Fallback to skb_copy_datagram_iter], recv_len: %d\n", recv_len);
+			//pr_info("[Fallback to skb_copy_datagram_iter], recv_len: %d, zc_recv_len: %d, queue->data_remaining: %zu\n", recv_len, zc_recv_len, queue->data_remaining);
 			ret = skb_copy_datagram_iter(skb, *offset,
 					&req->iter, recv_len);
 		}
@@ -2441,9 +2438,9 @@ static int nvme_tcp_start_queue(struct nvme_ctrl *nctrl, int idx)
 	nvme_tcp_init_recv_ctx(queue);
 	nvme_tcp_setup_sock_ops(queue);
 
-	if (idx)
+	if (idx){
 		ret = nvmf_connect_io_queue(nctrl, idx);
-	else
+	}else
 		ret = nvmf_connect_admin_queue(nctrl);
 
 	if (!ret) {

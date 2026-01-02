@@ -18,6 +18,15 @@
 #include "../internal.h"
 
 #include <linux/zcopy_ctx.h>
+#include <net/page_pool/helpers.h>
+#include <linux/zcopy_mem.h>
+
+
+/* rx-zcopy: Page pool 관련 함수들 */
+static inline bool is_pp_page(struct page *page)
+{
+	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
+}
 
 /*
  * Private flags for iomap_dio, must not overlap with the public ones in
@@ -164,16 +173,30 @@ void iomap_my_dio_bio_end_io(struct bio *bio)
 	struct my_bio_private *priv = bio->bi_private;
 	struct my_ctx *ctx = priv->ctx;
 
-	if (ctx != NULL){
-		free_my_ctx(ctx);
-	}
 	bio->bi_private = priv->orig_private;
 	bio->bi_end_io = priv->orig_end_io;
-	if (priv->orig_end_io != NULL){
+	if (priv->orig_end_io){
 		priv->orig_end_io(bio);
+		//pr_info("iomap_my_dio_bio_end_io: nr_pages: %d\n", ctx->old_nr_pages);
+		for(int i = 0; i < ctx->old_nr_pages; i++){
+			struct page *page = ctx->old_pages[i];
+			if (page){
+				if (unlikely(!is_pp_page(page))){
+					pr_info("iomap_my_dio_bio_end_io: page is not a page pool page\n");
+					continue;
+				}
+				put_page(page);
+				page_pool_put_full_page(page->pp, page, false);
+			}
+			ctx->old_pages[i] = NULL;
+		}
 	}
 	else {
 		pr_info("iomap_my_dio_bio_end_io: priv->orig_end_io is NULL\n");
+	}
+	
+	if (ctx){
+		free_my_ctx(ctx);
 	}
 	kfree(priv);
 }
@@ -293,6 +316,7 @@ static inline blk_opf_t iomap_dio_bio_opflags(struct iomap_dio *dio,
 
 	return opflags;
 }
+
 
 static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 		struct iomap_dio *dio)
@@ -420,6 +444,7 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 				priv->ctx = init_my_ctx(nr_pages, current->mm);
 				bio->bi_private = priv;
 				bio->bi_end_io = iomap_my_dio_bio_end_io;
+				zcopy_try_register();
 			}
 			else {
 				pr_info("iomap_dio_bio_iter: kmalloc failed\n");
