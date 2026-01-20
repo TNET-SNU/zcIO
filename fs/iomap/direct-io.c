@@ -441,7 +441,7 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 				priv->magic = MY_BIO_PRIVATE_MAGIC;
 				priv->orig_private = dio;
 				priv->orig_end_io = iomap_dio_bio_end_io;
-				priv->ctx = init_my_ctx(nr_pages, current->mm);
+				priv->ctx = init_my_ctx(priv, nr_pages, current->mm);
 				bio->bi_private = priv;
 				bio->bi_end_io = iomap_my_dio_bio_end_io;
 				zcopy_try_register();

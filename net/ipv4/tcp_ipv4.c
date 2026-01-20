@@ -2192,6 +2192,15 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	if (!pskb_may_pull(skb, sizeof(struct tcphdr)))
 		goto discard_it;
 
+		// rollback tcp doff for NVMe/TCP when tcp doff is 14
+	/*if (skb_cow_head(skb, 0))
+	    goto discard_it;
+	struct tcphdr *thw = (struct tcphdr *)skb->data;
+	if (thw->doff == 14){
+ 	  	thw->doff = 8;
+	}
+	*/
+
 	th = (const struct tcphdr *)skb->data;
 
 	if (unlikely(th->doff < sizeof(struct tcphdr) / 4)) {

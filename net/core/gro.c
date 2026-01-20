@@ -133,6 +133,7 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 	pinfo = skb_shinfo(lp);
 
 	if (headlen <= offset) {
+		//pr_info("skb_gro_receive: headlen <= offset: headlen = %d, offset = %d\n", headlen, offset);
 		skb_frag_t *frag;
 		skb_frag_t *frag2;
 		int i = skbinfo->nr_frags;
@@ -165,6 +166,7 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE;
 		goto done;
 	} else if (skb->head_frag) {
+		//pr_info("skb_gro_receive: skb->head_frag: headlen = %d, offset = %d\n", headlen, offset);
 		int nr_frags = pinfo->nr_frags;
 		skb_frag_t *frag = pinfo->frags + nr_frags;
 		struct page *page = virt_to_head_page(skb->head);
@@ -181,7 +183,6 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 		pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;
 
 		skb_frag_fill_page_desc(frag, page, first_offset, first_size);
-
 		memcpy(frag + 1, skbinfo->frags, sizeof(*frag) * skbinfo->nr_frags);
 		/* We dont need to clear skbinfo->nr_frags here */
 
@@ -198,6 +199,7 @@ merge:
 	skb->sk = NULL;
 	delta_truesize = skb->truesize;
 	if (offset > headlen) {
+		pr_info("skb_gro_receive: merge: offset > headlen: offset = %d, headlen = %d\n", offset, headlen);
 		unsigned int eat = offset - headlen;
 
 		skb_frag_off_add(&skbinfo->frags[0], eat);
@@ -207,6 +209,7 @@ merge:
 		offset = headlen;
 	}
 
+	//pr_info("skb_gro_receive: pull: offset = %d\n", offset);
 	__skb_pull(skb, offset);
 
 	if (NAPI_GRO_CB(p)->last == p)
@@ -292,6 +295,7 @@ static void napi_gro_complete(struct napi_struct *napi, struct sk_buff *skb)
 	}
 
 out:
+	//pr_info("gro count = %d\n", NAPI_GRO_CB(skb)->count);
 	gro_normal_one(napi, skb, NAPI_GRO_CB(skb)->count);
 }
 
@@ -428,10 +432,12 @@ static void gro_pull_from_frag0(struct sk_buff *skb, int grow)
 	skb->data_len -= grow;
 	skb->tail += grow;
 
+	pr_info("gro_pull_from_frag0: skb->data_len = %d, skb->tail = %d\n", skb->data_len, skb->tail);
 	skb_frag_off_add(&pinfo->frags[0], grow);
 	skb_frag_size_sub(&pinfo->frags[0], grow);
 
 	if (unlikely(!skb_frag_size(&pinfo->frags[0]))) {
+		pr_info("gro_pull_from_frag0: skb_frag_size(&pinfo->frags[0]) = 0\n");
 		skb_frag_unref(skb, 0);
 		memmove(pinfo->frags, pinfo->frags + 1,
 			--pinfo->nr_frags * sizeof(pinfo->frags[0]));
@@ -441,6 +447,7 @@ static void gro_pull_from_frag0(struct sk_buff *skb, int grow)
 static void gro_try_pull_from_frag0(struct sk_buff *skb)
 {
 	int grow = skb_gro_offset(skb) - skb_headlen(skb);
+	//pr_info("gro_try_pull_from_frag0: grow = %d, skb_gro_offset(skb) = %d, skb_headlen(skb) = %d\n", grow, skb_gro_offset(skb), skb_headlen(skb));
 
 	if (grow > 0)
 		gro_pull_from_frag0(skb, grow);
@@ -610,7 +617,7 @@ static gro_result_t napi_skb_finish(struct napi_struct *napi,
 		break;
 
 	case GRO_MERGED_FREE:
-	//	pr_info("GRO_MERGED_FREE\n");
+		//pr_info("GRO_MERGED_FREE\n");
 		if (NAPI_GRO_CB(skb)->free == NAPI_GRO_FREE_STOLEN_HEAD)
 			napi_skb_free_stolen_head(skb);
 		else if (skb->fclone != SKB_FCLONE_UNAVAILABLE)

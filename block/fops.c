@@ -288,34 +288,39 @@ static inline bool is_pp_page(struct page *page)
 static void blkdev_my_bio_end_io_async(struct bio *bio)
 {
 	struct my_bio_private *priv = bio->bi_private;
+	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)) return;
 	struct my_ctx *ctx = priv->ctx;
 	bio->bi_private = priv->orig_private;
 	bio->bi_end_io = priv->orig_end_io;
+	// this should be called first 
+	// so frag page can be returned to the page pool not released
 	if (priv->orig_end_io){
-
 		priv->orig_end_io(bio);
-		// unref frag pages and return to the page pool when it is the last reference
-		//trace_printk("[bio_end_io_async][ctx: %px] unref frag pages and return to the page pool when it is the last reference\n", ctx);
-		for(int i = 0; i < ctx->old_nr_pages; i++){
-			struct page *page = ctx->old_pages[i];
-			if (page){
-				// save page pool in zcopy ctx or check if pp is valid
-				if (unlikely(!is_pp_page(page))){
-					pr_info("blkdev_my_bio_end_io_async: page is not a page pool page\n");
-					continue;
-				}
-				put_page(page);
-				//trace_printk("[bio_end_io_async][ctx: %px] page_pool_put_full_page: %px, pp_ref_count: %ld, page_count: %d \n", ctx, page, atomic_long_read(&page->pp_ref_count), page_ref_count(page));
-				page_pool_put_full_page(page->pp, page, false);
-				//page_pool_put_page(page, 1);
-				ctx->old_pages[i] = NULL;
-			}
-		}
 	}
-	else {
-		pr_info("blkdev_my_bio_end_io_async: priv->orig_end_io is NULL\n");
-	}
+	
 	if (ctx){
+		// unref frag pages and return to the page pool when it is the last reference
+		//if (!ctx->zc_batch_mode) {
+            /* 기존 동작: old page release + free */
+            for (int i = 0; i < ctx->old_nr_pages; i++) {
+                struct page *page = ctx->old_pages[i];
+                if (!page) continue;
+                if (unlikely(!is_pp_page(page))) {
+					pr_info("page is not pp page: %px\n", page);
+					//put_page(page);
+				}
+				else {
+                	put_page(page);
+                	page_pool_put_full_page(page->pp, page, false);
+				}
+                ctx->old_pages[i] = NULL;
+            }
+            ctx->old_nr_pages = 0;
+        //} else {
+            /* 배치 모드: 워커가 이미 old page를 반환했고,
+               zc_finish_cleanup_ctx에서 old_nr_pages=0으로 정리됨 */
+        //}
+
 		free_my_ctx(ctx);
 	}
 	kfree(priv);
@@ -378,7 +383,7 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 		if (priv){
 			//bio->bi_mm = current->mm;
 			priv->magic = MY_BIO_PRIVATE_MAGIC;
-			priv->ctx = init_my_ctx(nr_pages, current->mm);
+			priv->ctx = init_my_ctx(priv, nr_pages, current->mm);
 			priv->orig_private = bio->bi_private;
 			priv->orig_end_io = bio->bi_end_io;
 			bio->bi_private = priv;

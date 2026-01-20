@@ -1170,7 +1170,7 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 	struct folio_iter fi;
 
 	bio_for_each_folio_all(fi, bio) {
-		struct page *page, *temp_page;
+		struct page *page;
 		size_t nr_pages;
 
 		if (mark_dirty) {
@@ -1350,7 +1350,7 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 						if (page->_pp_mapping_pad){
 							ctx->user_addr[base_idx + i] = (unsigned long)page->_pp_mapping_pad;
 							page->_pp_mapping_pad = 0;
-							ctx->pages[base_idx + i] = page;
+							//ctx->pages[base_idx + i] = page;
 							ctx->index++;
 						}
 					}
@@ -1358,11 +1358,11 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 						if (page->private){
 							ctx->user_addr[base_idx + i] = (unsigned long)page->private;
 							page->private = 0;
-							ctx->pages[base_idx + i] = page;
+						//	ctx->pages[base_idx + i] = page;
 							ctx->index++;
 						}
 					}
-					if (offset != 0) ctx->head_aligned = false;
+					//if (offset != 0) ctx->head_aligned = false;
 				}
 			}
 			bio_iov_add_page(bio, page, len, offset);

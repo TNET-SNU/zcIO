@@ -259,7 +259,7 @@ void zcopy_try_register(void) {
     new_ctx = kzalloc(sizeof(*new_ctx), GFP_ATOMIC);
     if (!new_ctx)
       return;
-
+    INIT_HLIST_NODE(&new_ctx->node);
     new_ctx->mm = mm;
     new_ctx->mn.ops = &zcopy_mn_ops;
 
@@ -293,7 +293,7 @@ void zcopy_try_register(void) {
       spin_unlock(&zcopy_ctx_lock);
 
       mmu_notifier_unregister(&new_ctx->mn, mm);
-      kfree(new_ctx);
+      //kfree(new_ctx);
       return;
     }
 
