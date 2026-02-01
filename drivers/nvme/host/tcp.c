@@ -90,58 +90,6 @@ module_param_named(rx_zc_debug, nvme_tcp_rx_zc_debug, bool, 0644);
 #define ZC_LOG_RL(fmt, ...) \
 	do { if (unlikely(nvme_tcp_rx_zc_debug)) pr_info_ratelimited("[rxzc] " fmt, ##__VA_ARGS__); } while (0)
 
-static void zc_dump_skb_chain(struct sk_buff *skb, unsigned int off, const char *tag)
-{
-	struct sk_buff *fskb;
-	int i;
-
-	if (!nvme_tcp_rx_zc_debug)
-		return;
-
-	pr_info("[rxzc][%s] head=%px off=%u len=%u data_len=%u headlen=%u nr_frags=%u frag_list=%px\n",
-		tag, skb, off, skb->len, skb->data_len, skb_headlen(skb),
-		skb_shinfo(skb)->nr_frags, skb_shinfo(skb)->frag_list);
-
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
-		skb_frag_t *f = &skb_shinfo(skb)->frags[i];
-		pr_info("[rxzc][%s]  frags[%d] page=%px off=%u size=%u\n",
-			tag, i, skb_frag_page(f), skb_frag_off(f), skb_frag_size(f));
-	}
-
-	/* frag_list chain */
-	if (skb_shinfo(skb)->frag_list) {
-		int n = 0;
-		skb_walk_frags(skb, fskb) {
-			pr_info("[rxzc][%s]  frag_list[%d] skb=%px len=%u headlen=%u nr_frags=%u frag_list=%px\n",
-				tag, n, fskb, fskb->len, skb_headlen(fskb),
-				skb_shinfo(fskb)->nr_frags, skb_shinfo(fskb)->frag_list);
-
-			for (i = 0; i < skb_shinfo(fskb)->nr_frags; i++) {
-				skb_frag_t *f = &skb_shinfo(fskb)->frags[i];
-				pr_info("[rxzc][%s]    fskb->frags[%d] page=%px off=%u size=%u\n",
-					tag, i, skb_frag_page(f), skb_frag_off(f), skb_frag_size(f));
-			}
-			n++;
-		}
-	}
-}
-
-static inline void zc_log_found(struct sk_buff *owner, int idx, unsigned int page_off,
-			       unsigned int cur_off)
-{
-	skb_frag_t *f;
-
-	if (!nvme_tcp_rx_zc_debug)
-		return;
-
-	f = &skb_shinfo(owner)->frags[idx];
-
-	pr_info("[rxzc] FOUND: cur_off=%u page_off=%u owner=%px idx=%d frag(size=%u off=%u page=%px)\n",
-		cur_off, page_off, owner, idx,
-		skb_frag_size(f), skb_frag_off(f), skb_frag_page(f));
-}
-
-
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 /* lockdep can detect a circular dependency of the form
  *   sk_lock -> mmap_lock (page fault) -> fs locks -> sk_lock
@@ -982,8 +930,6 @@ static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 	long *rss_delta = ctx->zc_rss_delta;
 
 	struct vm_area_struct *cur_vma = NULL;
-	//struct vm_area_struct *vma = NULL;
-	//VMA_ITERATOR(vmi, mm, 0);
 	unsigned long vma_end = 0;
 	for (i = start; i < end;) {
 		unsigned long addr = ctx->user_addr[i];
@@ -1000,40 +946,6 @@ static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 			vma_end = cur_vma->vm_end;
 		}
 
-/*
-	for (i = start; i < end;) {
-		unsigned long addr = ctx->user_addr[i];
-		if (unlikely(!addr)) {
-            i++;
-            continue;
-        }
-
-      
-		if (!(vma && addr >= vma->vm_start && addr < vma_end)) {
-			
-			vma_iter_set(&vmi, addr);
-			vma = vma_find(&vmi, addr);// + 1);
-			if (!vma || addr < vma->vm_start || addr >= vma->vm_end) {
-				i++;
-				continue;
-			}
-
-			if (unlikely(vma->vm_flags & VM_PFNMAP)) {
-				i++;
-				continue;
-			}
-
-			vma_end = vma->vm_end;
-			//vma_write = (vma->vm_flags & VM_WRITE);
-			//is_anon =
-			//	(vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
-		}
-	
-		if (unlikely(!vma)) {
-			pr_info("vma is NULL\n");
-			return 0;
-		}
-*/
         unsigned long run_start = addr;
 		unsigned long run_end = addr + PAGE_SIZE;
 		unsigned long pmd_cap = pmd_addr_end(run_start, vma->vm_end);
@@ -1105,13 +1017,9 @@ static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 			}
 		
 			if (pte_none(old) || pte_present(old)) {
-				//struct page *new_page = ctx->pages[k];
 				struct page *new_page = new_pages[k-start];
-
 				struct folio *new_f = page_folio(new_page);
-
 				pte_t np = mk_pte(new_page, vma->vm_page_prot);
-				//if (vma->vm_flags & VM_WRITE) {
 				if (vma_write) {
 					np = pte_mkwrite(np, vma);
 					np = pte_mkdirty(np);
@@ -1120,7 +1028,6 @@ static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 
 				set_pte_at(mm, a, p, np);
 
-				//bool is_anon = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
 				if (is_anon) {
 					folio_add_anon_rmap_ptes(new_f, new_page, 1, vma, a, RMAP_NONE);
 				}
@@ -1243,12 +1150,10 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 
 	//pr_info("[[[ batch remap start : page count = %d\n", end - start);
 	unsigned long mm_flush_min = ULONG_MAX, mm_flush_max = 0;
+	long rss_delta[NR_MM_COUNTERS] = {0}; 
 
 	struct vm_area_struct *cur_vma = NULL;
-	unsigned long vma_end = 0;
-
-	long rss_delta[NR_MM_COUNTERS] = {0}; //
-	
+	unsigned long vma_end = 0;	
 	for (i = start; i < end;) {
 		unsigned long addr = ctx->user_addr[i];
 		struct vm_area_struct *vma = NULL;
@@ -1268,9 +1173,14 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 		unsigned long run_start = addr;
 		unsigned long run_end   = addr + PAGE_SIZE;
 		unsigned long pmd_cap = pmd_addr_end(run_start, vma->vm_end);
+
 		size_t j = i + 1;
 		for (; j < end; j++) {
 			unsigned long a = ctx->user_addr[j];
+			if (unlikely(!a)) {
+				pr_info("a is NULL\n");
+				break;
+			}
 			if (a != run_end) break;               // 비연속이면 중단
 			// pmd 경계 넘어가면 중단
 			if (run_end >= pmd_cap) break;
@@ -1278,8 +1188,12 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 		}
 
 		// 이제 [i..j-1]가 같은 pmd의 연속 페이지 run
-		pmd_t *pmd = pmd_offset(pud_offset(p4d_offset(pgd_offset(mm, run_start), run_start), run_start), run_start);
-		if (unlikely(pmd_none(*pmd) || pmd_bad(*pmd))) { i = j; continue; }
+		pmd_t *pmd = pmd_offset(
+			pud_offset(p4d_offset(pgd_offset(mm, run_start), run_start), run_start), run_start);
+		if (unlikely(pmd_none(*pmd) || pmd_bad(*pmd))) {
+			i = j;
+			continue;
+		}
 		if (unlikely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd))) {
 			split_huge_pmd(vma, pmd, run_start);
 			if (unlikely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd))) {
@@ -1298,11 +1212,6 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 			unsigned long a = ctx->user_addr[k];
 			//pr_info("user_address: %lx\n", a);
 			pte_t *p = pbase + pte_index(a);
-			
-			/*if (likely(k + 1 < j)) {
-				prefetchw(pbase + pte_index(na));
-				prefetchw(&ctx->pages[k + 1]->flags);
-			}*/
 
 			if (likely(k + 1 < j)) {
 				unsigned long na = ctx->user_addr[k + 1];
@@ -1328,12 +1237,8 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 				if (ctx->old_nr_pages >= ctx->nr_pages) {
 					pr_info("[batch_remap_pages] old_nr_pages overflow: %d > %d\n",
 							ctx->old_nr_pages, ctx->nr_pages);
-					/* 여기서는 그냥 put하거나, 에러 처리 정책에 맞게 */
 				} else {
-					//ctx->old_pages[ctx->old_nr_pages++] = old_page;
-
 					if (unlikely(!is_pp_page(old_page))){
-						//ctx->normal_old_nr_pages++;
 						put_page(old_page);
 					}
 					else {
@@ -1342,15 +1247,9 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 				}
 			}	
 			if (pte_none(old) || pte_present(old)){
-				/* main change: new_pages is passed as an argument*/
-//				struct page *new_page = ctx->pages[k];
 				struct page *new_page = new_pages[k-start];
-
-
 				struct folio *new_f   = page_folio(new_page);
 				pte_t np = mk_pte(new_page, vma->vm_page_prot);
-				//trace_printk("new_page: %px, addr: %lx, refcount: %d\n", new_page, (unsigned long)ctx->user_addr[k], page_ref_count(new_page));
-
 				if (vma->vm_flags & VM_WRITE){
 					np = pte_mkwrite(np, vma);
 					np = pte_mkdirty(np);
@@ -1396,190 +1295,9 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 	return success_count;
 }
 
-/* rx-zcopy */
-static int find_frag_index(struct sk_buff *skb, unsigned int offset)
-{
-	int i;
-	int frag_offset =  skb_headlen(skb);
-	/*
-		pr_info("find_frag_index: offset: %d, frag_offset: %d\n", offset, 
-			frag_offset);
-		pr_info("nr_frags=%d frag_list=%p\n",
-			skb_shinfo(skb)->nr_frags,
-			skb_shinfo(skb)->frag_list);
-			*/
-	if (offset < frag_offset) {
-		pr_info("offset < frag_offset, offset: %d, frag_offset: %d\n", offset, frag_offset);
-		return -1;
-	}
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
-		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
-		int len = skb_frag_size(frag);
-		int off = skb_frag_off(frag);
-		//	pr_info("[frag %d] frag_offset: %d, len: %d, off: %d\n", i, frag_offset, len, off);	
-		
-		//if (len == PAGE_SIZE && off == 0)	
-		if (len == PAGE_SIZE && off ==0 && offset >= frag_offset && 
-		offset < frag_offset + len)
-			return i;
-
-		if (len == PAGE_SIZE && off != 0 && offset >= frag_offset && offset < frag_offset + len)
-		{
-			pr_info("frag offset : %d is not 0\n", off);
-			if (skb_frag_page(frag) == virt_to_head_page(skb->data))
-			{
-				pr_info("frag page is the same as the head page\n");
-			}
-			//skb_dump(KERN_INFO, skb, true);
-		}
-
-		frag_offset += len;
-	}
-	//skb_dump(KERN_INFO, skb, true);
-	return -1; /* not found */
-}
-
 static inline bool zc_is_full_4k_page_frag(const skb_frag_t *f)
 {
 	return skb_frag_size(f) == PAGE_SIZE && skb_frag_off(f) == 0;
-}
-
-/*
- * Scan one skb (including its frag_list chain) as a virtual byte stream.
- *
- * head skb layout order:
- *   [linear(headlen)] [frags[]...] [frag_list skb #0] [frag_list skb #1] ...
- *
- * Inputs:
- *   skb      : head of (possibly GRO-aggregated) skb
- *   cur_off  : global offset from skb->data (same coordinate as nvme_tcp_recv_data's *offset)
- *   base     : global base offset of 'skb' within the top-level head skb stream
- *
- * Outputs:
- *   *owner   : skb that owns the found 4K frag
- *   *frag_idx: index inside owner->frags[]
- *   *page_off: global offset where that frag starts (page boundary in this virtual stream)
- *
- * Returns:
- *   0 on found, -ENOENT if not found
- */
-static int zc_find_next_4k_in_skb_chain(struct sk_buff *skb,
-				       unsigned int cur_off,
-				       unsigned int base,
-				       struct sk_buff **owner,
-				       int *frag_idx,
-				       unsigned int *page_off)
-{
-	unsigned int pos, headlen;
-	int i;
-
-	/* 1) linear */
-	headlen = skb_headlen(skb);
-	pos = base + headlen;
-
-	/* If we're still inside linear area, skip to the end of linear */
-	if (cur_off < pos)
-		cur_off = pos;
-
-	/* 2) frags[] */
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
-		skb_frag_t *f = &skb_shinfo(skb)->frags[i];
-		unsigned int len = skb_frag_size(f);
-		unsigned int start = pos;
-		unsigned int end = pos + len;
-
-		if (cur_off < end) {
-			/*
-			 * We can only remap a full 4K page when we're at the
-			 * fragment boundary (cur_off == start).
-			 */
-			if (cur_off == start && zc_is_full_4k_page_frag(f)) {
-				*owner = skb;
-				*frag_idx = i;
-				*page_off = start;
-				return 0;
-			}
-
-			/* Otherwise, skip this fragment entirely */
-			cur_off = end;
-		}
-
-		pos = end;
-	}
-
-	/* 3) frag_list (skb chain) */
-	if (skb_shinfo(skb)->frag_list) {
-		struct sk_buff *fskb;
-
-		/*
-		 * Each fskb is appended logically after 'pos' (end of this skb's
-		 * linear+frags). Their internal layout is similar: linear+frags.
-		 */
-		skb_walk_frags(skb, fskb) {
-			/*
-			 * fskb occupies [pos .. pos + fskb->len) in the global stream.
-			 */
-			if (cur_off < pos + fskb->len) {
-				int ret = zc_find_next_4k_in_skb_chain(fskb, cur_off, pos,
-								      owner, frag_idx, page_off);
-				if (!ret)
-					return 0;
-
-				/*
-				 * If not found inside that fskb, we must skip it.
-				 * (cur_off is advanced inside recursion only when it was inside,
-				 *  but if still not found, move to end of that fskb.)
-				 */
-				cur_off = pos + fskb->len;
-			}
-
-			pos += fskb->len;
-		}
-	}
-
-	return -ENOENT;
-}
-
-/* Public wrapper: search from 'cur_off' in the top-level skb */
-static int zc_find_next_4k_page(struct sk_buff *skb,
-				unsigned int cur_off,
-				struct sk_buff **owner,
-				int *frag_idx,
-				unsigned int *page_off)
-{
-	*owner = NULL;
-	*frag_idx = -1;
-	*page_off = 0;
-
-	return zc_find_next_4k_in_skb_chain(skb, cur_off, 0, owner, frag_idx, page_off);
-}
-
-static int zc_find_4k_page_exact(struct sk_buff *skb,
-                                unsigned int cur_off,
-                                struct sk_buff **owner,
-                                int *frag_idx)
-{
-    unsigned int page_off;
-    int ret = zc_find_next_4k_page(skb, cur_off, owner, frag_idx, &page_off);
-    if (ret){
-		ZC_LOG_RL("NOTFOUND: cur_off=%u skb=%px len=%u headlen=%u nr_frags=%u frag_list=%px\n",
-		  cur_off, skb, skb->len, skb_headlen(skb),
-		  skb_shinfo(skb)->nr_frags, skb_shinfo(skb)->frag_list);
-		if(nvme_tcp_rx_zc_debug){
-			zc_dump_skb_chain(skb, cur_off, "NOTFOUND");
-		}
-        return ret;          // not found
-	}
-    if (page_off != cur_off){
-		ZC_LOG_RL("do_zc: MISALIGN offset=%u page_off=%u (skip/fallback)\n", cur_off, page_off);
-		/* 여기서 레이아웃 한번 덤프하면 원인 바로 나옴 */
-		if (nvme_tcp_rx_zc_debug){
-			zc_dump_skb_chain(skb, cur_off, "DOZC_MISALIGN");
-		}
-        return -ENOENT;      // found, but not exactly at cur_off
-	}
-	//zc_log_found(*owner, *frag_idx, page_off, cur_off);
-    return 0;
 }
 
 static __always_inline void zc_cursor_reset(struct nvme_tcp_queue *q,
@@ -1781,11 +1499,6 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		if (unlikely(page_off != cur_off))
 			goto error;
 
-/*        if (zc_find_4k_page_exact(skb, cur_off, &owner, &frag_index)) {
-            pr_info("no exact 4K page at offset=%u -> fallback\n", cur_off);
-            goto error;
-        }
-*/
         skb_frag_t *frag = &skb_shinfo(owner)->frags[frag_index];
         /* 이중 체크 */
         if (unlikely(skb_frag_size(frag) != PAGE_SIZE || skb_frag_off(frag) != 0)) {
@@ -1864,238 +1577,6 @@ error:
 
     return -1;
 }
-
-/*
-// return : success count
-// return : -1 if failed
-// return : need if partial remap is required
-static inline int do_zerocopy(struct sk_buff *skb, struct nvme_tcp_request *req,
-                              int recv_len, unsigned int offset)
-{
-    struct my_ctx *ctx;
-	struct my_bio_private *priv;
-    int max_frags, frag_index;
-    size_t need = recv_len;
-    size_t committed = 0;
-	int count = 0;
-	struct sk_buff *owner;
-	unsigned int page_off;
-	int ret;
-
-    if (unlikely(!req->curr_bio))
-	{
-		pr_info("req->curr_bio is null\n");
-        return -1;
-	}
-
-	// check bio private
-    priv = req->curr_bio->bi_private;
-	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)){
-		pr_info("priv is null or priv->magic is not MY_BIO_PRIVATE_MAGIC\n");
-		return -1;
-	}
-	ctx = priv->ctx;
-	if (unlikely(!ctx)){
-		pr_info("ctx is null\n");
-		return -1;
-	}
-
-	if (recv_len < PAGE_SIZE)
-		return recv_len;
-
-    max_frags = skb_shinfo(skb)->nr_frags;
-	if (need >= PAGE_SIZE){
-		frag_index = find_frag_index(skb, offset);
-		
-		if (frag_index < 0 || frag_index >= max_frags)
-		{
-			pr_info("frag_index < 0 or frag_index >= max_frags, offset: %d, frag_index: %d, max_frags: %d\n", offset, frag_index, max_frags);
-			//skb_dump(KERN_INFO, skb, true);
-			return -1;
-		}
-	}
-	// iov_iter_count is the amount of data bytes left to copy
-    size_t consumed      = ctx->total_bytes - iov_iter_count(&req->iter);
-	//trace_printk(" consumed: %zu\n", consumed);
-    size_t base_page_idx = consumed >> PAGE_SHIFT;
-	// this code should not be called 
-	if (ctx->remaining_bytes > 0) {
-		pr_info("remaining_bytes: %ld\n", ctx->remaining_bytes);
-		need += ctx->remaining_bytes;
-		pr_info("current frag_index: %d - start_frag_page_index: %d\n", frag_index, ctx->start_frag_page_index);
-		frag_index = ctx->start_frag_page_index;
-	}
-
-    while (need >= PAGE_SIZE) {
-		 // user_addr 범위/접근 검사
-        unsigned long uaddr = ctx->user_addr[base_page_idx + count];
-        if (unlikely(!uaddr || !access_ok((void __user*)uaddr, PAGE_SIZE))) {
-			trace_printk(" [user address] %px is not valid\n", (void __user*)uaddr);
-			pr_info(" [user address] %px is not valid\n", (void __user*)uaddr);
-			goto error;
-        }
-
-        // 다음 데이터 프래그 찾기
-        do {
-            if (unlikely(frag_index >= max_frags)){
-				pr_info(" frag_index >= max_frags\n");
-                goto error;                 // 남은 건 호출자에서 copy
-			}
-            skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_index];
-            int fsz = skb_frag_size(frag);
-			int off = skb_frag_off(frag);
-            if (fsz == PAGE_SIZE && off == 0){
-//				pr_info("[frag_index: %d]\n", frag_index);
-				break;
-			}
-			else {
-				pr_info("this frag : %d is not PAGE_SIZE (%d) or off is not 0 (%d) pass this frag to next frag\n", frag_index, fsz, off);
-			}
-            // 헤더(예: 24B)는 그냥 건너뛰되 경계 체크 유지
-            frag_index++;
-        } while (true);
-
-		// get frag page & increase ref count
-        struct page *fp = skb_frag_page(&skb_shinfo(skb)->frags[frag_index]);
-		if (unlikely(!is_pp_page(fp))){
-			pr_info(" not pp page: %px\n", fp);
-			goto error;
-		}
-		// get page 
-		// 실패 시 ctx->pages에 add하지 않고 바로 error 
-        if (!get_page_unless_zero(fp)) {
-			pr_info(" failed to get_page: %px\n", fp);
-			trace_printk(" failed to get_page: %px\n", fp);
-			goto error;
-        }
-		
-		page_pool_ref_page(fp);
-		ctx->pages[base_page_idx + count] = fp;
-        need         -= PAGE_SIZE;
-        frag_index++;
-		count++;
-		ctx->pending_cnt++;
-		
-		if (base_page_idx + count != ctx->pending_cnt){
-			pr_info("[ctx: %px]===== base_page_idx(%zu) + count(%d) != ctx->pending_cnt(%d)\n", ctx, base_page_idx, count, ctx->pending_cnt);
-			goto error;
-		}
-    }
-
-	int bytes_to_commit = ctx->pending_cnt * PAGE_SIZE;
-
-	// Always call batch_remap_pages when all data is received
-	if ((ctx->pending_cnt > 0) && ((ctx->total_bytes - bytes_to_commit) < PAGE_SIZE)){ //bytes_left){
-		int rc = 0;
-		if (nvme_tcp_rx_zc_batch_flush){
-			//pr_info("stage_remap_pages\n");
-			rc = stage_remap_pages(req->curr_bio);
-		}
-		else {
-			rc = batch_remap_pages(req->curr_bio);
-		}
-		committed += (size_t)rc * PAGE_SIZE;
-		//ctx->committed_bytes += (size_t)rc * PAGE_SIZE;
-
-		if (rc != ctx->pending_cnt){
-			pr_info("rc : %d != ctx->pending_cnt: %d\n", rc, ctx->pending_cnt);
-			trace_printk("rc : %d != ctx->pending_cnt: %d\n", rc, ctx->pending_cnt);
-		}
-		if (rc == 0){
-			pr_info("no pages are remapped -> return the amount of data that can be used for copy\n");
-			return ctx->pending_cnt * PAGE_SIZE;
-		}
-		ctx->pending_cnt = 0;
-
-		if (need > 0 && !ctx->tail_aligned){
-			return need;
-		}
-		goto out;
-	}
-	if (need > 0) {
-		// does it have to be += ? i don't know  but i don't think so 
-		pr_info("this code should not be called\n");
-		pr_info("[ctx: %px] remaining_bytes: %ld\n", ctx, need);
-		ctx->remaining_bytes = need;
-		ctx->start_frag_page_index = frag_index;
-	}
-	goto out;
-
-error:
-	pr_info("[ctx: %px] error - consumed: %zu, total_bytes: %zu, iov_iter_count: %zu\n", ctx, consumed, ctx->total_bytes, iov_iter_count(&req->iter));
-	pr_info("[error]===== batch_remap_pages failed, pending_cnt: %d\n", ctx->pending_cnt);
-	// remap partial pages
-	if (ctx->pending_cnt > 0){
-	
-		// unref pages 
-		for (int i = 0; i < ctx->pending_cnt; i++){
-			struct page *page = ctx->pages[i];
-			if (page){
-				put_page(page);
-				page_pool_unref_page(page, 1);
-				ctx->pages[i] = NULL;
-			}
-		}
-		ctx->pending_cnt = 0;
-	}
-	return -1;
-
-out:
-//	pr_info("[ctx: %px] out - committed: %ld\n", ctx, committed);
-	return 0; 
-}
-*/
-
-/*
-static bool can_use_zerocopy(struct bio *bio, size_t zc_recv_len, size_t skb_data_len){
-	if (enable_zerocopy != 1)
-		return false;
-
-	struct my_bio_private *priv = bio->bi_private;
-	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)){
-		pr_info("[zerocopy] can_use_zerocopy FAIL: priv=NULL or priv->magic != MY_BIO_PRIVATE_MAGIC\n");
-		return false;
-	}
-	struct my_ctx *ctx = priv->ctx;
-	if (unlikely(!ctx || ctx->magic != MY_CTX_MAGIC || ctx->error != 0)) {
-		pr_info("[can_use_zerocopy] ctx is null\n");
-		return false;
-	}
-	size_t total_len = ctx->total_bytes;
-
-	if (ctx->can_use_zerocopy == false)
-	{
-		pr_info("[can_use_zerocopy] ctx->can_use_zerocopy is false\n");
-		return false;
-	}
-
-	// start user address is not aligned - frag page remap cannot be used because start offset of frag page is always 0
-	if (!ctx->head_aligned){
-		pr_info("[can_use_zerocopy] ctx->head_aligned is false\n");
-		ctx->can_use_zerocopy = false;
-		return false;
-	}
-
-	// start user address is not aligned && total len is less than PAGE_SIZE 
-	if (total_len < PAGE_SIZE){
-		pr_info("[can_use_zerocopy] total_len < PAGE_SIZE\n");
-		ctx->can_use_zerocopy = false;
-		return false;
-	}
-	if (zc_recv_len == 0){
-		pr_info("[can_use_zerocopy] zc_recv_len is 0\n");
-		ctx->can_use_zerocopy = false;
-		return false;
-	}
-	if (skb_data_len <PAGE_SIZE){
-		pr_info("[can_use_zerocopy] skb_data_len < PAGE_SIZE\n");
-		ctx->can_use_zerocopy = false;
-		return false;
-	}
-	return true;
-}
-*/
-
 
 #define ZC_FLUSH_CHUNK 256
 #define ZC_CTX_MAX     2048   /* batch 내 ctx 최대치 가드 */
@@ -2189,7 +1670,6 @@ static void nvme_tcp_zc_flush_workfn(struct work_struct *work)
 
     spin_unlock_irqrestore(&q->zc_lock, flags);
 
-    //if (!cid_cnt) return;
 	if (!cid_cnt) return;
 
 	struct mm_range mrs[ZC_FLUSH_CHUNK];
@@ -2223,13 +1703,12 @@ static void nvme_tcp_zc_flush_workfn(struct work_struct *work)
     spin_lock_irqsave(&q->zc_lock, flags);
     bool more = (q->zc_cnt != 0);
     spin_unlock_irqrestore(&q->zc_lock, flags);
-	//pr_info("[nvme_tcp_zc_flush_workfn] done (QID:%d) - req count: %u, miss: %u, done_pages: %u\n", nvme_tcp_queue_id(q), rq_cnt, miss, done_pages);
-    if (more){
-		//queue_work_on(q->io_cpu, q->zc_wq, &q->zc_flush_work);
+    
+	if (more){
 		queue_work(q->zc_wq, &q->zc_flush_work);
 	}
 	if (unlikely(miss)){
-        //pr_debug("[zc_flush] miss rq=%u (cid_cnt=%u rq_cnt=%u)\n", miss, cid_cnt, rq_cnt);
+        pr_info("[zc_flush] miss rq=%u (cid_cnt=%u rq_cnt=%u)\n", miss, cid_cnt, rq_cnt);
 	}
 }
 
@@ -2375,7 +1854,7 @@ static inline bool can_use_zerocopy(struct nvme_tcp_queue *queue, struct nvme_tc
 		 *   is also 4K-aligned at the start of this req.
 		 */
 		req->zc_policy = (req->iter.iov_offset == 0) ? ZC_ENABLED : ZC_DISABLED;
-	//	pr_info("[can_use_zerocopy] req->zc_policy : %d\n", req->zc_policy);
+		//pr_info("[can_use_zerocopy] req->zc_policy : %d, req->iter.iov_offset : %d\n", req->zc_policy, req->iter.iov_offset);
 	}
 
 	if (req->zc_policy != ZC_ENABLED){
@@ -2383,10 +1862,17 @@ static inline bool can_use_zerocopy(struct nvme_tcp_queue *queue, struct nvme_tc
 		return false;
 	}
 
+	if (ctx->tail_aligned == false) {
+		trace_printk("[can_use_zerocopy][ctx: %px] ctx->tail_aligned is false\n", ctx);
+	}
 	/* we only remap when the amount of data to be remapped is at least PAGE_SIZE */
 	if (recv_len < PAGE_SIZE) {
-		pr_info("[can_use_zerocopy] recv_len < PAGE_SIZE\n");
-		req->zc_policy = ZC_DISABLED;
+		trace_printk("[can_use_zerocopy] recv_len < PAGE_SIZE\n");
+		if (ctx->total_bytes < PAGE_SIZE) {
+			trace_printk("[can_use_zerocopy] ctx->total_bytes < PAGE_SIZE: %zu\n", ctx->total_bytes);
+			//req->zc_policy = ZC_DISABLED;
+			return false;
+		}
 		return false;
 	}
 
@@ -2401,7 +1887,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		nvme_cid_to_rq(nvme_tcp_tagset(queue), pdu->command_id);
 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
 	int zcopy_len = 0;
-//	pr_info("[nvme_tcp_recv_data] recv_data start- len: %zu\n", *len);
+	trace_printk("nvme_tcp_recv_data: start - len: %zu\n", *len);
 	while (true) {
 		int recv_len, ret, zc_recv_len;
 		// 이번 pdu에서 필요한 만큼 
@@ -2428,7 +1914,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		/* we can read only from what is left in this bio */
 		recv_len = min_t(size_t, recv_len,
 				iov_iter_count(&req->iter));
-		
+		trace_printk("   --nvme_tcp_recv_data: recv_len: %d\n", recv_len);
 		// set recv_len to PAGE_SIZE aligned
 		zc_recv_len = recv_len & ~(PAGE_SIZE - 1);
 	
@@ -2437,6 +1923,8 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 				&req->iter, recv_len, queue->rcv_hash);
 		}
 		else if (!can_use_zerocopy(queue, req, recv_len) || zc_recv_len == 0){
+			trace_printk("[nvme_tcp_recv_data] current_bio : %px\n", req->curr_bio);
+
 			ret = skb_copy_datagram_iter(skb, *offset,
 					&req->iter, recv_len);
 		}
@@ -2444,7 +1932,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			// set recv_len to PAGE_SIZE aligned
 			recv_len = zc_recv_len;
 			zcopy_len = do_zerocopy(queue, skb, req, recv_len, *offset);
-			
+			trace_printk("==> [nvme_tcp_recv_data] zc done - recv_len: %d, zcopy_len: %d\n", recv_len, zcopy_len);
 			// remap/queueing done; completion is deferred (do not copy)
 			if (zcopy_len ==0) 
 			{
@@ -2461,7 +1949,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			// zcopy_len > 0 is amount of data this need to be copied to req->iter
 			else if (zcopy_len > 0)
 			{
-				pr_info("[nvme_tcp_recv_data] recv_len: %d, zcopy_len: %d\n", recv_len, zcopy_len);
+				trace_printk("[nvme_tcp_recv_data] recv_len: %d, zcopy_len: %d\n", recv_len, zcopy_len);
 				if (recv_len - zcopy_len > 0){ // already mapped to req->iter = recv_len - zcopy_len
 					iov_iter_advance(&req->iter, recv_len - zcopy_len);
 				}
@@ -2487,19 +1975,15 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			queue->ddgst_remaining = NVME_TCP_DIGEST_LENGTH;
 		} else {
 			if (pdu->hdr.flags & NVME_TCP_F_DATA_SUCCESS) {
-				/*pr_info("batch=%d pend=%p qid=%d\n",
-						nvme_tcp_rx_zc_batch_flush,
-						queue->zc_pend_cids,
-						nvme_tcp_queue_id(queue));
-						*/
-				if (!nvme_tcp_rx_zc_batch_flush || !enable_zerocopy || req->zc_policy != ZC_ENABLED) {
-					//pr_info("[nvme_tcp_recv_data] end_request: %d\n", pdu->command_id);
+				if (!nvme_tcp_rx_zc_batch_flush || !enable_zerocopy /*|| req->zc_policy != ZC_ENABLED*/) {
+					trace_printk("==> [nvme_tcp_recv_data] end_request - req->status: %d\n", le16_to_cpu(req->status));
+
 					nvme_tcp_end_request(rq, le16_to_cpu(req->status));
 					queue->nr_cqe++;
 				} else {
-				//	pr_info("[nvme_tcp_recv_data] defer_complete: %d\n", pdu->command_id);
+					trace_printk("==> [nvme_tcp_recv_data] defer_complete - req->status: %d\n", le16_to_cpu(req->status));
+
 					nvme_tcp_defer_complete(queue, pdu->command_id, rq);
-					/* nr_cqe는 워커에서 실제 complete한 만큼만 증가 */
 				}
 			}
 			nvme_tcp_init_recv_ctx(queue);

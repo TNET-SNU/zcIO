@@ -175,9 +175,13 @@ void iomap_my_dio_bio_end_io(struct bio *bio)
 
 	bio->bi_private = priv->orig_private;
 	bio->bi_end_io = priv->orig_end_io;
+	
+	// [important] this should be called first 
 	if (priv->orig_end_io){
 		priv->orig_end_io(bio);
-		//pr_info("iomap_my_dio_bio_end_io: nr_pages: %d\n", ctx->old_nr_pages);
+	}
+
+	if (ctx){
 		for(int i = 0; i < ctx->old_nr_pages; i++){
 			struct page *page = ctx->old_pages[i];
 			if (page){
@@ -190,14 +194,9 @@ void iomap_my_dio_bio_end_io(struct bio *bio)
 			}
 			ctx->old_pages[i] = NULL;
 		}
-	}
-	else {
-		pr_info("iomap_my_dio_bio_end_io: priv->orig_end_io is NULL\n");
-	}
-	
-	if (ctx){
 		free_my_ctx(ctx);
 	}
+	
 	kfree(priv);
 }
 
@@ -415,6 +414,7 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 	bio_opf = iomap_dio_bio_opflags(dio, iomap, use_fua);
 
 	nr_pages = bio_iov_vecs_to_alloc(dio->submit.iter, BIO_MAX_VECS);
+
 	do {
 		size_t n;
 		if (dio->error) {
@@ -437,10 +437,10 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 		if (!(dio->flags & IOMAP_DIO_WRITE)){
 			priv = kmalloc(sizeof(struct my_bio_private), GFP_KERNEL);
 			if (priv){
-			//	bio->bi_mm = current->mm;
 				priv->magic = MY_BIO_PRIVATE_MAGIC;
 				priv->orig_private = dio;
 				priv->orig_end_io = iomap_dio_bio_end_io;
+				nr_pages = DIV_ROUND_UP(iov_iter_count(dio->submit.iter), PAGE_SIZE);
 				priv->ctx = init_my_ctx(priv, nr_pages, current->mm);
 				bio->bi_private = priv;
 				bio->bi_end_io = iomap_my_dio_bio_end_io;
@@ -453,13 +453,19 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 
 		ret = bio_iov_iter_get_pages(bio, dio->submit.iter);
 		if (unlikely(ret)) {
+			pr_info("[failed] [bio: %px] bio_iov_iter_get_pages: ret: %d\n", bio, ret);
 			// syeon
-			if (!(dio->flags & IOMAP_DIO_WRITE) && priv){
-				if (priv->ctx){
-					free_my_ctx(priv->ctx);
+			if (!(dio->flags & IOMAP_DIO_WRITE) && priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
+				struct my_ctx *ctx = priv->ctx;
+				if (ctx && ctx->magic == MY_CTX_MAGIC){
+					pr_info("[failed] bio_iov_iter_get_pages: bio: %px\n", bio);
+					free_my_ctx(ctx);
+					ctx = NULL;
+
 				}
+				bio->bi_private = priv->orig_private;
+				bio->bi_end_io = priv->orig_end_io;
 				kfree(priv);
-				//bio->bi_mm = NULL;
 			}
 			/*
 			 * We have to stop part way through an IO. We must fall
@@ -478,8 +484,13 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 			if (dio->flags & IOMAP_DIO_DIRTY)
 				bio_set_pages_dirty(bio);
 			// syeon
-			if (priv && priv->ctx){
-				priv->ctx->total_bytes = n;
+			if (priv && priv->magic == MY_BIO_PRIVATE_MAGIC ){
+				if (priv->ctx  && priv->ctx->magic == MY_CTX_MAGIC){
+					priv->ctx->total_bytes = n;
+					trace_printk("[final] [iomap_dio_bio_iter] total_bytes: %zu, nr_pages: %d\n", priv->ctx->total_bytes, priv->ctx->index);
+					priv->ctx->nr_pages = priv->ctx->index;
+				
+				}
 			}
 		}
 

@@ -53,5 +53,6 @@ struct my_bio_private{
 
 
 struct my_ctx *init_my_ctx(struct my_bio_private *priv, int nr_pages, struct mm_struct *mm);
+struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm);
 void free_my_ctx(struct my_ctx *ctx);
 #endif /* __LINUX_ZCOPY_CTX_H */

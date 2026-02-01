@@ -1320,19 +1320,20 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 	struct my_ctx *ctx = NULL;
 	struct my_bio_private *priv = bio->bi_private;
 	int base_idx = 0;
-//	if (bio->bi_mm){
 	if (priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
-		//pr_info("bio_iov_iter_get_pages: priv->magic == MY_BIO_PRIVATE_MAGIC\n");
 		ctx = priv->ctx;
-		if (ctx){
+		if (ctx && ctx->magic == MY_CTX_MAGIC){
 			base_idx = ctx->index;
 		}
 	}
-
+		
 	for (left = size, i = 0; left > 0; left -= len, i++) {
 		struct page *page = pages[i];
 
 		len = min_t(size_t, PAGE_SIZE - offset, left);
+		if (len != PAGE_SIZE){
+			trace_printk("---[ctx: %px] len: %d - not PAGE_SIZE - offset: %zu\n", ctx, len, offset);
+		}
 		if (bio_op(bio) == REQ_OP_ZONE_APPEND) {
 			ret = bio_iov_add_zone_append_page(bio, page, len,
 					offset);
@@ -1340,37 +1341,37 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 				break;
 		} else {
 			// store user address to bio->bi_private
-			if (ctx){
+			if (ctx && ctx->magic == MY_CTX_MAGIC){
 				if (base_idx + i >= ctx->nr_pages){
-					pr_info("bio_iov_iter_get_pages: base_idx(%d) + i(%d) >= ctx->nr_pages(%d)\n", base_idx, i, ctx->nr_pages);
-					ctx->error = 1; // fallback to original copy
+					trace_printk("[error] [bio: %px] base_idx(%d) + i(%d) >= ctx->nr_pages(%d)\n", bio, base_idx, i, ctx->nr_pages);
 				}
-				else {
+			//	else {
 					if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE){
 						if (page->_pp_mapping_pad){
 							ctx->user_addr[base_idx + i] = (unsigned long)page->_pp_mapping_pad;
 							page->_pp_mapping_pad = 0;
-							//ctx->pages[base_idx + i] = page;
-							ctx->index++;
 						}
 					}
 					else {
 						if (page->private){
 							ctx->user_addr[base_idx + i] = (unsigned long)page->private;
 							page->private = 0;
-						//	ctx->pages[base_idx + i] = page;
-							ctx->index++;
 						}
 					}
 					//if (offset != 0) ctx->head_aligned = false;
-				}
+			//	}
 			}
 			bio_iov_add_page(bio, page, len, offset);
 		}
 		offset = 0;
 	}
-	if (ctx){
-		if (len != PAGE_SIZE) ctx->tail_aligned = false;
+	if (ctx && ctx->magic == MY_CTX_MAGIC){
+		ctx->index = base_idx + i;
+		if (len != PAGE_SIZE)
+		{
+			ctx->tail_aligned = false;
+			trace_printk("[ctx: %px] tail_aligned: false - len: %d\n", ctx, len);
+		}
 	}
 
 	iov_iter_revert(iter, left);
@@ -1404,7 +1405,6 @@ out:
 int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 {
 	int ret = 0;
-	int count = 0;
 
 	if (WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED)))
 		return -EIO;
@@ -1417,10 +1417,8 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 	if (iov_iter_extract_will_pin(iter))
 		bio_set_flag(bio, BIO_PAGE_PINNED);
 	do {
-		count++;
 		ret = __bio_iov_iter_get_pages(bio, iter);
 	} while (!ret && iov_iter_count(iter) && !bio_full(bio, 0));
-
 	return bio->bi_vcnt ? 0 : ret;
 }
 EXPORT_SYMBOL_GPL(bio_iov_iter_get_pages);

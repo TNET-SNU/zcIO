@@ -5,6 +5,8 @@
 DEFINE_HASHTABLE(zcopy_ctx_hash, 8);
 DEFINE_SPINLOCK(zcopy_ctx_lock);
 
+extern bool enable_zerocopy;
+
 // add page pool page to list when invalidate_range_start is called, and remove it when release is called
 static LIST_HEAD(zcopy_page_pool_list);
 static spinlock_t zcopy_page_pool_list_lock;
@@ -63,7 +65,7 @@ static const struct mm_walk_ops zcopy_walk_ops = {
 
 static void zcopy_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
 {
-    trace_printk("zcopy_mn_release called with mm %p\n", mm);
+   // trace_printk("zcopy_mn_release called with mm %p\n", mm);
     struct zcopy_ctx *ctx = container_of(mn, struct zcopy_ctx, mn);
     struct vm_area_struct *vma;
     VMA_ITERATOR(vmi, mm, 0);
@@ -127,7 +129,7 @@ static struct page *zcopy_check_pte(struct mm_struct *mm, unsigned long addr,
 
     /* Magic 확인 */
     if (page && (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
-      trace_printk("ZeroCopy: Found page %px at %lx, refcount %d, pp_refcount: %ld\n", page, (unsigned long)addr, page_ref_count(page),  atomic_long_read(&page->pp_ref_count));
+     // trace_printk("ZeroCopy: Found page %px at %lx, refcount %d, pp_refcount: %ld\n", page, (unsigned long)addr, page_ref_count(page),  atomic_long_read(&page->pp_ref_count));
       // 1. PTE Steal
       ptep_get_and_clear(mm, addr, pte);
 
@@ -166,7 +168,7 @@ zcopy_mn_invalidate_range_start(struct mmu_notifier *mn,
   } else if (!rwsem_is_locked(&mm->mmap_lock)) {
       // 락도 못 잡았는데, 현재 락이 걸려있지도 않다면?
       // (do_wp_page 처럼 VMA Lock만 걸린 상황) -> 위험하므로 스킵
-      trace_printk("ZeroCopy: Skip invalidation (No mmap_lock held)\n");
+     // trace_printk("ZeroCopy: Skip invalidation (No mmap_lock held)\n");
       return 0; 
   }
   // ★ Flush 시작 지점을 기억할 변수 추가 ★
@@ -176,7 +178,7 @@ zcopy_mn_invalidate_range_start(struct mmu_notifier *mn,
   if (!mmu_notifier_range_blockable(range))
     return 0;
 
-   trace_printk("======= Invalidate Range: %lx - %lx\n", range->start, range->end);
+   //trace_printk("======= Invalidate Range: %lx - %lx\n", range->start, range->end);
 
   for (addr = range->start; addr < range->end; addr += PAGE_SIZE) {
 
@@ -185,7 +187,7 @@ zcopy_mn_invalidate_range_start(struct mmu_notifier *mn,
     }
 
     if (!vma || addr < vma ->vm_start){
-      trace_printk("[2]Invalidate Range: %lx - %lx (Event: %d) - No VMA\n", range->start, range->end, range->event);
+     // trace_printk("[2]Invalidate Range: %lx - %lx (Event: %d) - No VMA\n", range->start, range->end, range->event);
      // continue;
     }
 
@@ -204,7 +206,7 @@ zcopy_mn_invalidate_range_start(struct mmu_notifier *mn,
       flush_tlb_mm_range(mm, batch_start, addr + PAGE_SIZE, PAGE_SHIFT, false);
 
       for (int i = 0; i < nr_recycled; i++) {
-        trace_printk("ZeroCopy: Recycle page %px at %lx\n", pages_to_recycle[i], (unsigned long)addr);
+     //  trace_printk("ZeroCopy: Recycle page %px at %lx\n", pages_to_recycle[i], (unsigned long)addr);
         struct page *pg = pages_to_recycle[i];
         put_page(pg);                               // PTE 몫
         page_pool_put_full_page(pg->pp, pg, false); // Pool 복귀
@@ -219,7 +221,7 @@ zcopy_mn_invalidate_range_start(struct mmu_notifier *mn,
     flush_tlb_mm_range(mm, batch_start, range->end, PAGE_SHIFT, false);
 
     for (int i = 0; i < nr_recycled; i++) {
-      trace_printk("ZeroCopy: Last Recycle page %px at %lx, pp_refcount: %ld, refcount: %d\n", pages_to_recycle[i], (unsigned long)addr, atomic_long_read(&pages_to_recycle[i]->pp_ref_count), page_ref_count(pages_to_recycle[i]));
+     // trace_printk("ZeroCopy: Last Recycle page %px at %lx, pp_refcount: %ld, refcount: %d\n", pages_to_recycle[i], (unsigned long)addr, atomic_long_read(&pages_to_recycle[i]->pp_ref_count), page_ref_count(pages_to_recycle[i]));
       struct page *pg = pages_to_recycle[i];
       put_page(pg);
       page_pool_put_full_page(pg->pp, pg, false);
@@ -243,6 +245,9 @@ void zcopy_try_register(void) {
     struct zcopy_ctx *new_ctx;
     struct mm_struct *mm = current->mm;
     int ret;
+
+    if (!READ_ONCE(enable_zerocopy))
+        return;
 
     /* 1. Fast Path: Lock 없이 빠르게 확인 */
     rcu_read_lock();

@@ -27,11 +27,6 @@
 #define NVMET_TCP_MAXH2CDATA		0x400000 /* 16M arbitrary limit */
 #define NVMET_TCP_BACKLOG 128
 
-// rx-zcopy
-int enable_zerocopy = 0;
-module_param(enable_zerocopy, int, 0644);
-MODULE_PARM_DESC(enable_zerocopy, "Enable rx-zcopy (default 0)");
-
 static int param_store_val(const char *str, int *val, int min, int max)
 {
 	int ret, new_val;
@@ -111,12 +106,6 @@ enum {
 	NVMET_TCP_F_INIT_FAILED = (1 << 0),
 };
 
-enum nvme_tcp_zc_policy {
-	ZC_UNDECIDED,
-	ZC_ENABLED,
-	ZC_DISABLED,
-};
-
 struct nvmet_tcp_cmd {
 	struct nvmet_tcp_queue		*queue;
 	struct nvmet_req		req;
@@ -147,9 +136,6 @@ struct nvmet_tcp_cmd {
 
 	__le32				exp_ddgst;
 	__le32				recv_ddgst;
-
-	/* rx-zcopy */
-	enum nvme_tcp_zc_policy zc_policy;
 };
 
 enum nvmet_tcp_queue_state {
@@ -435,37 +421,19 @@ static int nvmet_tcp_map_data(struct nvmet_tcp_cmd *cmd)
 		if (len > cmd->req.port->inline_data_size)
 			return NVME_SC_SGL_INVALID_OFFSET | NVME_STATUS_DNR;
 		cmd->pdu_len = len;
-
-		cmd->zc_policy = ZC_DISABLED;
 	}
 	cmd->req.transfer_len += len;
 
-	/*
-	 * copy_path 판단:
-	 *  - zerocopy 기능이 꺼져 있거나
-	 *  - 이 cmd가 zerocopy 불가로 판정된 경우
-	 */
-	copy_path = (!enable_zerocopy ||
-		     cmd->zc_policy == ZC_DISABLED);
-			 
-	if (copy_path){
-		cmd->req.sg = sgl_alloc(len, GFP_KERNEL, &cmd->req.sg_cnt);
-		if (!cmd->req.sg)
-			return NVME_SC_INTERNAL;
-		cmd->cur_sg = cmd->req.sg;
+	cmd->req.sg = sgl_alloc(len, GFP_KERNEL, &cmd->req.sg_cnt);
+	if (!cmd->req.sg)
+		return NVME_SC_INTERNAL;
+	cmd->cur_sg = cmd->req.sg;
 
-		if (nvmet_tcp_has_data_in(cmd)) {
-			cmd->iov = kmalloc_array(cmd->req.sg_cnt,
-					sizeof(*cmd->iov), GFP_KERNEL);
-			if (!cmd->iov)
-				goto err;
-		}
-	}
-	else {
-		cmd->req.sg = NULL;
-		cmd->cur_sg = NULL;
-		cmd->iov = NULL;
-		cmd->req.sg_cnt = 0;
+	if (nvmet_tcp_has_data_in(cmd)) {
+		cmd->iov = kmalloc_array(cmd->req.sg_cnt,
+				sizeof(*cmd->iov), GFP_KERNEL);
+		if (!cmd->iov)
+			goto err;
 	}
 
 	return 0;

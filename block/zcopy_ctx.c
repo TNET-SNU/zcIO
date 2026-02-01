@@ -24,7 +24,6 @@ struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
     if (u_sz == SIZE_MAX || p_sz == SIZE_MAX)
         return NULL;
 
-    //total = sizeof(*ctx) + u_sz + 2 * p_sz; /* user_addr + pages + old_pages */
     total = sizeof(*ctx) + u_sz + p_sz; /* user_addr + old_pages */
 
     mem = kvmalloc(total, gfp);  /* 0-init 아님 */
@@ -36,8 +35,8 @@ struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
     ctx = mem;
 
     p = (void *)(ctx + 1);
-    ctx->user_addr = p; p += u_sz;
-   // ctx->pages     = p; p += p_sz;
+    ctx->user_addr = p;
+    p += u_sz;
     ctx->old_pages = p;
 
     ctx->magic = MY_CTX_MAGIC;
@@ -46,6 +45,7 @@ struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
     ctx->can_use_zerocopy = true;
     ctx->zc_flush_min = ULONG_MAX;
     ctx->inline_ctx = false;
+    ctx->index = 0;
 
     //mmgrab(mm);
     ctx->mm = mm;
@@ -67,6 +67,7 @@ static struct my_ctx *init_my_ctx_inline(struct my_bio_private *priv, int nr_pag
 
     ctx->magic = MY_CTX_MAGIC;
     ctx->nr_pages = nr_pages;
+    ctx->index = 0;
 
     ctx->mm = mm;
 
@@ -92,76 +93,10 @@ void free_my_ctx(struct my_ctx *ctx)
     if (!ctx || ctx->magic != MY_CTX_MAGIC)
         return;
 
-    //if (ctx->mm)
-    //    mmdrop(ctx->mm);
-
-    ctx->magic = 0;
+    ctx->index = 0;
     if (!ctx->inline_ctx) {
         kvfree(ctx); 
     }
 }
 
 
-/*
-struct my_ctx *init_my_ctx(int nr_pages, struct mm_struct *mm)
-{
-    struct my_ctx *ctx;
-	if (!READ_ONCE(enable_zerocopy))
-		return NULL;
-
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (!ctx){
-		return NULL;
-	}
-
-    ctx->magic = MY_CTX_MAGIC;
-    ctx->nr_pages = nr_pages;
-    ctx->tail_aligned = true;
-    ctx->can_use_zerocopy = true;
-    ctx->zc_flush_min = ULONG_MAX;
-
-    ctx->user_addr = kmalloc_array(nr_pages, sizeof(*ctx->user_addr), GFP_KERNEL);
-	if (!ctx->user_addr)
-		goto free_ctx;
-
-	ctx->pages = kmalloc_array(nr_pages, sizeof(*ctx->pages), GFP_KERNEL);
-	if (!ctx->pages)
-		goto free_user_addr;
-
-	ctx->old_pages = kmalloc_array(nr_pages, sizeof(*ctx->old_pages), GFP_KERNEL);
-	if (!ctx->old_pages)
-		goto free_pages;
-    
-    mmgrab(mm);
-    ctx->mm = mm;
-	return ctx;
-
-free_pages:
-    kfree(ctx->pages);
-free_user_addr:
-    kfree(ctx->user_addr);
-free_ctx:
-    kfree(ctx);
-    return NULL;
-}
-
-
-void free_my_ctx(struct my_ctx *ctx)
-{
-    if (!ctx)
-        return;
-
-    if (ctx->magic != MY_CTX_MAGIC){
-        return;
-    }
-
-    ctx->magic = 0;
-    if (ctx->mm)
-        mmdrop(ctx->mm);
-    kfree(ctx->old_pages);
-    kfree(ctx->user_addr);
-    kfree(ctx->pages);
-	kfree(ctx);
-}
-
-*/

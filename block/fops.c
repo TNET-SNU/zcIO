@@ -302,25 +302,20 @@ static void blkdev_my_bio_end_io_async(struct bio *bio)
 		// unref frag pages and return to the page pool when it is the last reference
 		//if (!ctx->zc_batch_mode) {
             /* 기존 동작: old page release + free */
-            for (int i = 0; i < ctx->old_nr_pages; i++) {
-                struct page *page = ctx->old_pages[i];
-                if (!page) continue;
-                if (unlikely(!is_pp_page(page))) {
-					pr_info("page is not pp page: %px\n", page);
-					//put_page(page);
-				}
-				else {
-                	put_page(page);
-                	page_pool_put_full_page(page->pp, page, false);
-				}
-                ctx->old_pages[i] = NULL;
-            }
-            ctx->old_nr_pages = 0;
-        //} else {
-            /* 배치 모드: 워커가 이미 old page를 반환했고,
-               zc_finish_cleanup_ctx에서 old_nr_pages=0으로 정리됨 */
-        //}
-
+		for (int i = 0; i < ctx->old_nr_pages; i++) {
+			struct page *page = ctx->old_pages[i];
+			if (!page) continue;
+			if (unlikely(!is_pp_page(page))) {
+				pr_info("page is not pp page: %px\n", page);
+				//put_page(page);
+			}
+			else {
+				put_page(page);
+				page_pool_put_full_page(page->pp, page, false);
+			}
+			ctx->old_pages[i] = NULL;
+		}
+		ctx->old_nr_pages = 0;
 		free_my_ctx(ctx);
 	}
 	kfree(priv);
@@ -403,12 +398,16 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	} else {
 		ret = bio_iov_iter_get_pages(bio, iter);
 		if (unlikely(ret)) {
-			if (is_read && priv){
-				if (priv->ctx){
-					free_my_ctx(priv->ctx);
+			if (is_read && priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
+				struct my_ctx *ctx = priv->ctx;
+				if (ctx && ctx->magic == MY_CTX_MAGIC){
+					trace_printk("[failed] bio_iov_iter_get_pages: bio: %px\n", bio);
+					free_my_ctx(ctx);
+					ctx = NULL;
 				}
+				bio->bi_private = priv->orig_private;
+				bio->bi_end_io = priv->orig_end_io;
 				kfree(priv);
-				//bio->bi_mm = NULL;
 			}
 			bio_put(bio);
 			return ret;
@@ -422,8 +421,11 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 			bio_set_pages_dirty(bio);
 		}
 		// syeon
-		if (priv && priv->ctx){
-			priv->ctx->total_bytes = bio->bi_iter.bi_size;
+		if (priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
+			if (priv->ctx && priv->ctx->magic == MY_CTX_MAGIC){
+				priv->ctx->total_bytes = bio->bi_iter.bi_size;
+				priv->ctx->nr_pages = priv->ctx->index;
+			}
 		}
 	} else {
 		task_io_account_write(bio->bi_iter.bi_size);
