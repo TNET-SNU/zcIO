@@ -67,10 +67,14 @@ MODULE_PARM_DESC(tls_handshake_timeout,
 /*
  * rx-zcopy: zerocopy 성능 최적화 설정
  */
-int enable_zerocopy = 0;
 #define ZC_MAX_STAGE_PAGES 64
+
+
+int enable_zerocopy = 0;
 module_param(enable_zerocopy, int, 0644);
-MODULE_PARM_DESC(enable_zerocopy, "Enable zero-copy receive (default 0)");
+MODULE_PARM_DESC(enable_zerocopy, "Enable RX zerocopy");
+EXPORT_SYMBOL_GPL(enable_zerocopy); /* 여러 오브젝트에서 쓰면 export 필요 */
+
 
 static bool nvme_tcp_rx_zc_batch_flush = false;
 module_param_named(rx_zc_batch_flush, nvme_tcp_rx_zc_batch_flush, bool, 0644);
@@ -1004,15 +1008,17 @@ static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 				// old page 관리: pp만 모으고, normal은 여기서 put 
 				if (likely(ctx->old_nr_pages < ctx->nr_pages)) {
 					if (unlikely(!is_pp_page(old_page))) {
+						//pr_info("[stage_remap_pages] old_page: %px, ref count: %d\n", old_page, page_ref_count(old_page), atomic_long_read(&old_page->pp_ref_count));
 						put_page(old_page);
 					} else {
 						ctx->old_pages[ctx->old_nr_pages++] = old_page;
-					//	pr_info("old_page: %px\n", old_page);
+						//trace_printk("[stage_remap_pages] old_page: %px\n", old_page);
 					}
 				} else {
 					// overflow면 안전하게 normal 처리 
-					if (unlikely(!is_pp_page(old_page)))
-						put_page(old_page);
+					pr_info("[overflow] old_page: %px\n", old_page);
+					//if (unlikely(!is_pp_page(old_page)))
+						//put_page(old_page);
 				}
 			}
 		
@@ -1020,7 +1026,8 @@ static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 				struct page *new_page = new_pages[k-start];
 				struct folio *new_f = page_folio(new_page);
 				pte_t np = mk_pte(new_page, vma->vm_page_prot);
-				if (vma_write) {
+				//if (vma_write) {
+				if (vma->vm_flags & VM_WRITE) {
 					np = pte_mkwrite(np, vma);
 					np = pte_mkdirty(np);
 				}
@@ -1028,6 +1035,7 @@ static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 
 				set_pte_at(mm, a, p, np);
 
+				bool is_anon = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
 				if (is_anon) {
 					folio_add_anon_rmap_ptes(new_f, new_page, 1, vma, a, RMAP_NONE);
 				}
@@ -1079,22 +1087,6 @@ static int zc_finish_cleanup_ctx(struct request *rq)
 		/* RSS 적용 */
 		apply_rss_delta_vec(mm, ctx->zc_rss_delta);
 
-		/* pp old pages 반환: 너 end_io에서 하던 로직을 여기로 옮김 */
-		/*
-		for (int i = 0; i < ctx->old_nr_pages; i++) {
-			struct page *page = ctx->old_pages[i];
-			if (!page) continue;
-			if (unlikely(!is_pp_page(page))) {
-				continue;
-			}
-			else {
-				put_page(page);
-				page_pool_put_full_page(page->pp, page, false);
-			}
-			ctx->old_pages[i] = NULL;
-		}
-		ctx->old_nr_pages = 0;
-*/
 		ctx->zc_staged = false;
 		done_pages += ctx->zc_staged_pages;
 		ctx->zc_staged_pages = 0;
@@ -1270,7 +1262,7 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 				pr_info("pte_none(old) or pte_present(old) is not true\n");
 			}
 		
-			ctx->user_addr[k] = 0;
+			//ctx->user_addr[k] = 0;
 		}
 
 	
@@ -1471,6 +1463,12 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	unsigned int cur_off = offset;
 
 	chunk_base = page_idx;
+	trace_printk("**** do_zerocopy: consumed: %zu , total_bytes: %zu, page_idx: %zu, chunk_base: %zu\n", consumed, ctx->total_bytes, page_idx, chunk_base);
+	if ((consumed & (PAGE_SIZE - 1)) != 0) {
+   		trace_printk("ZC forbid: consumed not aligned: %zu\n", consumed);
+	 //return -1;
+	}
+
 
     /*
      * 기존 로직은 remaining_bytes/start_frag_page_index로 이어붙였는데,
@@ -1489,6 +1487,9 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
             pr_info(" [user address] %px is not valid\n", (void __user*)uaddr);
             goto error;
         }
+		if (unlikely(uaddr & (PAGE_SIZE-1))) {
+			trace_printk("ZC BAD: uaddr not aligned: uaddr=%lx\n", uaddr);
+		}
 
         /* (중요) cur_off에서 '정확히 시작하는' 4K page frag만 remap */
         struct sk_buff *owner = NULL;
@@ -1518,6 +1519,9 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
             pr_info("failed to get_page: %px\n", fp);
             goto error;
         }
+		else {
+			//trace_printk("get_page: %px, ref count: %d, pp_ref count: %ld\n", fp, page_ref_count(fp), atomic_long_read(&fp->pp_ref_count));
+		}
 
         page_pool_ref_page(fp);
 		/* main change: new_pages is passed as an argument*/
@@ -1846,6 +1850,11 @@ static inline bool can_use_zerocopy(struct nvme_tcp_queue *queue, struct nvme_tc
 		return false;
 	}
 
+	if (ctx->head_aligned == false) {
+		pr_info("[can_use_zerocopy] ctx->head_aligned is false\n");
+		return false;
+	}
+
 	if (req->zc_policy == ZC_UNDECIDED) {
 		/*
 		 * Design assumption for rx-zcopy:
@@ -1873,7 +1882,7 @@ static inline bool can_use_zerocopy(struct nvme_tcp_queue *queue, struct nvme_tc
 			//req->zc_policy = ZC_DISABLED;
 			return false;
 		}
-		return false;
+		//return false;
 	}
 
 	return true;
@@ -1887,7 +1896,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		nvme_cid_to_rq(nvme_tcp_tagset(queue), pdu->command_id);
 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
 	int zcopy_len = 0;
-	trace_printk("nvme_tcp_recv_data: start - len: %zu\n", *len);
+	trace_printk("---------[0]nvme_tcp_recv_data: start - len: %zu\n", *len);
 	while (true) {
 		int recv_len, ret, zc_recv_len;
 		// 이번 pdu에서 필요한 만큼 
@@ -1914,17 +1923,25 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		/* we can read only from what is left in this bio */
 		recv_len = min_t(size_t, recv_len,
 				iov_iter_count(&req->iter));
-		trace_printk("   --nvme_tcp_recv_data: recv_len: %d\n", recv_len);
+		trace_printk("[1] nvme_tcp_recv_data: recv_len: %d, iov_iter_count: %zu, queue->data_remaining: %zu\n", recv_len, iov_iter_count(&req->iter), queue->data_remaining);
 		// set recv_len to PAGE_SIZE aligned
 		zc_recv_len = recv_len & ~(PAGE_SIZE - 1);
+		trace_printk("[2]nvme_tcp_recv_data: zc_recv_len: %d\n", zc_recv_len);
 	
 		if (queue->data_digest){
 			ret = skb_copy_and_hash_datagram_iter(skb, *offset,
 				&req->iter, recv_len, queue->rcv_hash);
 		}
-		else if (!can_use_zerocopy(queue, req, recv_len) || zc_recv_len == 0){
-			trace_printk("[nvme_tcp_recv_data] current_bio : %px\n", req->curr_bio);
-
+		else if (!can_use_zerocopy(queue, req, recv_len)){
+			trace_printk("[3] [nvme_tcp_recv_data] can_use_zerocopy, recv_len: %d\n", recv_len);
+			ret = skb_copy_datagram_iter(skb, *offset,
+					&req->iter, recv_len);
+		}
+		else if (zc_recv_len == 0)
+		{
+			trace_printk("[4] [nvme_tcp_recv_data] zc_recv_len == 0, recv_len: %d\n", recv_len);
+			// zc_recv_len == 0 means that the data is not aligned to PAGE_SIZE
+			// so we need to copy the data to req->iter
 			ret = skb_copy_datagram_iter(skb, *offset,
 					&req->iter, recv_len);
 		}
@@ -1932,10 +1949,11 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			// set recv_len to PAGE_SIZE aligned
 			recv_len = zc_recv_len;
 			zcopy_len = do_zerocopy(queue, skb, req, recv_len, *offset);
-			trace_printk("==> [nvme_tcp_recv_data] zc done - recv_len: %d, zcopy_len: %d\n", recv_len, zcopy_len);
+			//trace_printk("==> [nvme_tcp_recv_data] zc done - recv_len: %d, zcopy_len: %d\n", recv_len, zcopy_len);
 			// remap/queueing done; completion is deferred (do not copy)
 			if (zcopy_len ==0) 
 			{
+				trace_printk("[4] [nvme_tcp_recv_data] zcopy_len == 0\n");
 				iov_iter_advance(&req->iter, recv_len);
 				ret = 0;
 			}
@@ -1976,12 +1994,12 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		} else {
 			if (pdu->hdr.flags & NVME_TCP_F_DATA_SUCCESS) {
 				if (!nvme_tcp_rx_zc_batch_flush || !enable_zerocopy /*|| req->zc_policy != ZC_ENABLED*/) {
-					trace_printk("==> [nvme_tcp_recv_data] end_request - req->status: %d\n", le16_to_cpu(req->status));
+					//trace_printk("==> [nvme_tcp_recv_data] end_request - req->status: %d\n", le16_to_cpu(req->status));
 
 					nvme_tcp_end_request(rq, le16_to_cpu(req->status));
 					queue->nr_cqe++;
 				} else {
-					trace_printk("==> [nvme_tcp_recv_data] defer_complete - req->status: %d\n", le16_to_cpu(req->status));
+					//trace_printk("==> [nvme_tcp_recv_data] defer_complete - req->status: %d\n", le16_to_cpu(req->status));
 
 					nvme_tcp_defer_complete(queue, pdu->command_id, rq);
 				}

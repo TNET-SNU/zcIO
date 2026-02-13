@@ -12,6 +12,7 @@
 // small i/o does not need to alloc pages (4pages = 16KB)
 #define MYCTX_INLINE_PAGES 4
 
+
 #define MY_CTX_MAGIC 0x12345678
 struct my_ctx {
   u32 magic;
@@ -27,6 +28,7 @@ struct my_ctx {
   struct mm_struct *mm;
 
   bool tail_aligned;
+  bool head_aligned;
   size_t total_bytes;
   int index;
   bool can_use_zerocopy;

@@ -1,8 +1,8 @@
 #include <linux/zcopy_ctx.h>
 #include <linux/slab.h>
 
-extern bool enable_zerocopy;
 
+extern int enable_zerocopy;
 
 
 struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
@@ -42,10 +42,17 @@ struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
     ctx->magic = MY_CTX_MAGIC;
     ctx->nr_pages = nr_pages;
     ctx->tail_aligned = true;
+    ctx->head_aligned = true;
     ctx->can_use_zerocopy = true;
     ctx->zc_flush_min = ULONG_MAX;
     ctx->inline_ctx = false;
     ctx->index = 0;
+    ctx->old_nr_pages = 0;
+    
+    // init zc_rss_delta
+    for (int i = 0; i < NR_MM_COUNTERS; i++) {
+        ctx->zc_rss_delta[i] = 0;
+    }
 
     //mmgrab(mm);
     ctx->mm = mm;
@@ -80,9 +87,9 @@ struct my_ctx *init_my_ctx(struct my_bio_private *priv, int nr_pages, struct mm_
         return NULL;
 
     /* 작은 I/O는 inline으로: 4K/8K/16K(1/2/4 pages)에서 kvmalloc 제거 */
-    if ((unsigned)nr_pages <= MYCTX_INLINE_PAGES) {
-        return init_my_ctx_inline(priv, nr_pages, mm);
-    }
+    //if ((unsigned)nr_pages <= MYCTX_INLINE_PAGES) {
+     //   return init_my_ctx_inline(priv, nr_pages, mm);
+   // }
 
     return init_my_ctx_heap(nr_pages, mm);
 }
@@ -94,6 +101,7 @@ void free_my_ctx(struct my_ctx *ctx)
         return;
 
     ctx->index = 0;
+    //ctx->old_nr_pages = 0;
     if (!ctx->inline_ctx) {
         kvfree(ctx); 
     }

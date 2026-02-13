@@ -1358,7 +1358,10 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 							page->private = 0;
 						}
 					}
-					//if (offset != 0) ctx->head_aligned = false;
+					if (offset != 0) {
+						ctx->head_aligned = false;
+						trace_printk("[ctx: %px] head_aligned: false - offset: %zu\n", ctx, offset);
+					}
 			//	}
 			}
 			bio_iov_add_page(bio, page, len, offset);

@@ -171,6 +171,10 @@ static inline void iomap_dio_set_error(struct iomap_dio *dio, int ret)
 void iomap_my_dio_bio_end_io(struct bio *bio)
 {
 	struct my_bio_private *priv = bio->bi_private;
+	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)){
+		pr_info("[iomap_my_dio_bio_end_io] priv is NULL or magic is not MY_BIO_PRIVATE_MAGIC\n");
+		return;	
+	}
 	struct my_ctx *ctx = priv->ctx;
 
 	bio->bi_private = priv->orig_private;
@@ -181,19 +185,30 @@ void iomap_my_dio_bio_end_io(struct bio *bio)
 		priv->orig_end_io(bio);
 	}
 
-	if (ctx){
+	if (ctx && ctx->magic == MY_CTX_MAGIC){
+		//trace_printk("[bio_end_io] [ctx: %px] old_nr_pages: %d\n", ctx, ctx->old_nr_pages);
 		for(int i = 0; i < ctx->old_nr_pages; i++){
 			struct page *page = ctx->old_pages[i];
-			if (page){
-				if (unlikely(!is_pp_page(page))){
-					pr_info("iomap_my_dio_bio_end_io: page is not a page pool page\n");
-					continue;
-				}
+			if (unlikely(!page)){
+				continue;
+			}
+			if (unlikely(!is_pp_page(page))){
+				pr_info("[bio_end_io] [page: %px], is not pp page\n", page);
 				put_page(page);
+			}
+			else{
+				//trace_printk("[bio_end_io] [page: %px] ref count: %d, pp_ref count: %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+				if (page_ref_count(page) > 1){
+					put_page(page);
+				}
+				if (unlikely(page_ref_count(page) > 1)){
+					//trace_printk("[bio_end_io] [page: %px], ref count: %d, pp_ref count: %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+				}
 				page_pool_put_full_page(page->pp, page, false);
 			}
 			ctx->old_pages[i] = NULL;
 		}
+		ctx->old_nr_pages = 0;
 		free_my_ctx(ctx);
 	}
 	
@@ -316,7 +331,6 @@ static inline blk_opf_t iomap_dio_bio_opflags(struct iomap_dio *dio,
 	return opflags;
 }
 
-
 static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 		struct iomap_dio *dio)
 {
@@ -434,17 +448,22 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 		bio->bi_end_io = iomap_dio_bio_end_io;
 
 		// syeon
-		if (!(dio->flags & IOMAP_DIO_WRITE)){
+		if ( !(dio->flags & IOMAP_DIO_WRITE)){
 			priv = kmalloc(sizeof(struct my_bio_private), GFP_KERNEL);
 			if (priv){
 				priv->magic = MY_BIO_PRIVATE_MAGIC;
-				priv->orig_private = dio;
-				priv->orig_end_io = iomap_dio_bio_end_io;
+				priv->orig_private = bio->bi_private;
+				priv->orig_end_io = bio->bi_end_io;
 				nr_pages = DIV_ROUND_UP(iov_iter_count(dio->submit.iter), PAGE_SIZE);
 				priv->ctx = init_my_ctx(priv, nr_pages, current->mm);
 				bio->bi_private = priv;
 				bio->bi_end_io = iomap_my_dio_bio_end_io;
-				zcopy_try_register();
+				ret = zcopy_try_register(current->mm);
+				if (ret < 0){
+					pr_info("iomap_dio_bio_iter: zcopy_try_register failed\n");
+					//kfree(priv);
+					//priv = NULL;
+				}
 			}
 			else {
 				pr_info("iomap_dio_bio_iter: kmalloc failed\n");
@@ -487,7 +506,7 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 			if (priv && priv->magic == MY_BIO_PRIVATE_MAGIC ){
 				if (priv->ctx  && priv->ctx->magic == MY_CTX_MAGIC){
 					priv->ctx->total_bytes = n;
-					trace_printk("[final] [iomap_dio_bio_iter] total_bytes: %zu, nr_pages: %d\n", priv->ctx->total_bytes, priv->ctx->index);
+					//trace_printk("[final] [iomap_dio_bio_iter] total_bytes: %zu, nr_pages: %d\n", priv->ctx->total_bytes, priv->ctx->index);
 					priv->ctx->nr_pages = priv->ctx->index;
 				
 				}

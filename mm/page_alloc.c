@@ -1049,6 +1049,7 @@ __always_inline bool free_pages_prepare(struct page *page,
 	
 	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
 		pr_info("[syeon] ***** is_pp_page : %px, refcount : %d, pp_count : %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+		trace_printk("[syeon] ***** is_pp_page : %px, refcount : %d, pp_count : %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
 		return false;
 	}
 	trace_mm_page_free(page, order);

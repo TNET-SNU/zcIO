@@ -1546,6 +1546,7 @@ static ssize_t iov_iter_extract_kvec_pages(struct iov_iter *i,
 /* rx-zcopy*/
 static bool set_user_address_page(struct page **page, unsigned long first_addr, unsigned long addr, int page_count)
 {
+
 	// store user address to page
 	// 1. page is pp_page : page->_pp_mapping_pad
 	// 2. page is not pp_page : page->private
@@ -1623,9 +1624,9 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
 		return res;
 	maxsize = min_t(size_t, maxsize, res * PAGE_SIZE - offset);
 	/* rx-zcopy*/
-	if (i->data_source == ITER_DEST && offset != 0){
+	//if (i->data_source == ITER_DEST && offset != 0){
 		//pr_info("[syeon] user address page offset is not zero, offset = %zu\n", offset);
-	}
+	//}
 
 	set_user_address_page(*pages, first_addr, addr, res);
 

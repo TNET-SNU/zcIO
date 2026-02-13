@@ -24,6 +24,7 @@
 #include <linux/zcopy_ctx.h>
 #include <linux/zcopy_mem.h>
 
+
 static inline struct inode *bdev_file_inode(struct file *file)
 {
 	return file->f_mapping->host;
@@ -178,7 +179,6 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 	loff_t pos = iocb->ki_pos;
 	int ret = 0;
 
-	//pr_info("[syeon] __blkdev_direct_IO: \n");
 	if (iocb->ki_flags & IOCB_ALLOC_CACHE)
 		opf |= REQ_ALLOC_CACHE;
 	bio = bio_alloc_bioset(bdev, nr_pages, opf, GFP_KERNEL,
@@ -358,6 +358,8 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	loff_t pos = iocb->ki_pos;
 	int ret = 0;
 	struct my_bio_private *priv = NULL;
+	//bool enable_zc = READ_ONCE(enable_zerocopy);
+	//printk_ratelimited(KERN_INFO, "direct-io: enable_zc: %d\n", enable_zc);
 
 	if (iocb->ki_flags & IOCB_ALLOC_CACHE)
 		opf |= REQ_ALLOC_CACHE;
@@ -383,10 +385,11 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 			priv->orig_end_io = bio->bi_end_io;
 			bio->bi_private = priv;
 			bio->bi_end_io = blkdev_my_bio_end_io_async;
-			zcopy_try_register();
+			zcopy_try_register(current->mm);
 		}
 	}
-
+	
+	
 	if (iov_iter_is_bvec(iter)) {
 		/*
 		 * Users don't rely on the iterator being in any particular
@@ -401,7 +404,7 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 			if (is_read && priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
 				struct my_ctx *ctx = priv->ctx;
 				if (ctx && ctx->magic == MY_CTX_MAGIC){
-					trace_printk("[failed] bio_iov_iter_get_pages: bio: %px\n", bio);
+					//trace_printk("[failed] bio_iov_iter_get_pages: bio: %px\n", bio);
 					free_my_ctx(ctx);
 					ctx = NULL;
 				}
