@@ -460,11 +460,14 @@ static void nvmet_tcp_zc_swap_sg_pages(struct nvmet_tcp_cmd *cmd){
 	for_each_sg(cmd->req.sg, sg, cmd->req.sg_cnt, i){
 		if (!sg)
 			break;
-		if (sg->length != bv[i].bv_len){
-			pr_err("[nvmet_tcp_zc_swap_sg_pages] sg length mismatch: %d != %d\n", sg->length, bv[i].bv_len);
-			//continue;
+		
+		struct page *page = bv[i].bv_page;
+		if (is_pp_page(page)){
+			if (sg->length != bv[i].bv_len){
+				pr_err("[nvmet_tcp_zc_swap_sg_pages] sg length mismatch: %d != %d\n", sg->length, bv[i].bv_len);
+			}
+			sg_set_page(sg, page, sg->length, sg->offset);
 		}
-		sg_set_page(sg, bv[i].bv_page, sg->length, sg->offset);
 	}
 
 }

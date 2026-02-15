@@ -15,13 +15,18 @@ bool can_zerocopy(struct sock *sk, struct msghdr *msg){
     if (!enable_zerocopy)
         return false;
 
-    if (!iov_iter_is_bvec(&msg->msg_iter))
+    if (!iov_iter_is_bvec(&msg->msg_iter)){
+		pr_info("[can_zerocopy] not bvec\n");
         return false;
+	}
 
-    if (!sk->sk_user_data || *(u32 *)sk->sk_user_data != NVMET_TCP_MAGIC)
+    if (!sk->sk_user_data || *(u32 *)sk->sk_user_data != 
+	NVMET_TCP_MAGIC){
+		pr_info("[can_zerocopy] not nvmet_tcp_magic\n");
         return false;
+	}
 
-    return false;
+    return true;
 }
 
 /*
@@ -181,7 +186,7 @@ static void tcp_iter_bvec_do_swap_4k(struct iov_iter *iter, struct page *newp)
 	}
 	page_pool_ref_page(newp);
 
-    trace_printk("[tcp_iter_bvec_do_swap_4k] new page: %px, page ref count: %d, page_pool ref count: %ld\n", newp, page_ref_count(newp), atomic_long_read(&newp->pp_ref_count));
+    pr_info("[tcp_iter_bvec_do_swap_4k] new page: %px, page ref count: %d, page_pool ref count: %ld\n", newp, page_ref_count(newp), atomic_long_read(&newp->pp_ref_count));
 
 	//sg_set_page(sg, newp, sg->length, sg->offset);
     // do i have to free old page of bvec?
@@ -273,9 +278,9 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, struc
 
 	//if (offset & ZC_PG_MASK)
 	//	return 0;
-
+	pr_info("[do_zerocopy] iter: %px\n", iter);
 	if (!iov_iter_is_bvec(iter)){
-		trace_printk("not bvec\n");
+		trace_printk("[do_zerocopy] not bvec\n");
 		return 0;
 	}
 
@@ -283,6 +288,7 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, struc
     size_t want = (size_t)iov_iter_count(iter);
     want &= ~((size_t)ZC_PG_MASK);
     if (!want){
+		pr_info("want is 0\n");
         return 0;
 	}
 
@@ -297,7 +303,7 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, struc
 
 		frag = &skb_shinfo(skb)->frags[frag_index];
 		// check frag's alignment
-		trace_printk("[do_zerocopy] frag index : %d, size : %d, off : %d\n", frag_index, skb_frag_size(frag), skb_frag_off(frag));
+		pr_info("[do_zerocopy] frag index : %d, size : %d, off : %d\n", frag_index, skb_frag_size(frag), skb_frag_off(frag));
 		/* clean 4K frag만 */
         if (skb_frag_size(frag) != ZC_PG_SZ)
             break;
@@ -320,7 +326,7 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, struc
         want -= ZC_PG_SZ;
         //idx++;
     }
-	trace_printk("[do_zerocopy] done : %zu\n", done);
+	pr_info("[do_zerocopy] done : %zu\n", done);
 	return done;
 }
 
