@@ -3,6 +3,9 @@
 #define _LINUX_NVMET_TCP_ZC_H
 
 #include <linux/bvec.h>
+
+#define NVMET_TCP_MAGIC 0x4E564D45  /* "NVME"의 헥사값 */
+
 enum zc_policy {
 	ZC_DISABLED = 0,
 	ZC_ENABLED = 1,

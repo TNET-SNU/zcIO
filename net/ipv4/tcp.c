@@ -285,8 +285,7 @@
 #include <trace/events/tcp.h>
 #include <net/rps.h>
 
-#include <linux/nvmet_tcp_zc.h>
-#include <net/page_pool.h>
+#include "tcp_zc.h"
 
 /* Track pending CMSGs. */
 enum {
@@ -2320,172 +2319,6 @@ static int tcp_inq_hint(struct sock *sk)
 	return inq;
 }
 
-//syeon 
-
-/* rx-zcopy start */
-#define ZC_PG_SZ   4096U
-#define ZC_PG_MASK (ZC_PG_SZ - 1)
-
-static bool find_frag_index(const struct sk_buff *skb,
-                                       u32 off_in_frags,
-                                       int *out_idx,
-                                       u32 *out_inner)
-{
-    const skb_frag_t *frags = skb_shinfo(skb)->frags;
-    int i, nr = skb_shinfo(skb)->nr_frags;
-    u32 cur = 0;
-
-    for (i = 0; i < nr; i++) {
-        u32 flen = skb_frag_size(&frags[i]);
-
-        if (off_in_frags < cur + flen) {
-            *out_idx = i;
-            *out_inner = off_in_frags - cur;
-            return true;
-        }
-        cur += flen;
-    }
-    return false;
-}
-
-
-static bool tcp_iter_bvec_can_swap_4k(struct iov_iter *iter, struct page **oldp_out)
-{
-
-    if (!iov_iter_is_bvec(iter))
-        return false;
-
-    /* 남은 길이가 4K 이상 */
-    if (iov_iter_count(iter) < ZC_PG_SZ)
-        return false;
-
-    /*
-     * - iter->bvec : current bvec pointer
-     * - iter->iov_offset : current bvec offset
-     */
-    if (!iter->bvec)
-        return false;
-
-    if (iter->iov_offset != 0)
-        return false;
-
-    if (iter->bvec->bv_offset != 0)
-        return false;
-
-    if (iter->bvec->bv_len != ZC_PG_SZ)
-        return false;
-
-    if (!iter->bvec->bv_page)
-        return false;
-
-    *oldp_out = iter->bvec->bv_page;
-    return true;
-}
-
-static void tcp_iter_bvec_do_swap_4k(struct iov_iter *iter, struct page *newp)
-{
-	struct nvmet_tcp_zc_bvec *zb;
-	struct scatterlist *sg;
-	struct page *oldp;
-
-	zb = container_of(iter->bvec, struct nvmet_tcp_zc_bvec, bv);
-	sg = zb->sg;
-	if (!sg)
-		return;
-
-	oldp = sg_page(sg);
-	
-	if (!get_page_unless_zero(newp)){
-		pr_info("failed to get newp\n");
-		return ;
-	}
-	page_pool_ref_page(newp);
-
-	sg_set_page(sg, newp, sg->length, sg->offset);
-	pr_info("swap 4K frag : %d, %d, %d\n", idx, sg->length, sg->offset);
-
-	iter->bvec->bv_page = newp;
-
-    /* 원래 목적지로 쓰려던 alloc 페이지는 더 이상 필요 없음 */
-//	pr_info("get old_page refcount : %d\n", page_ref_count(oldp));
-    put_page(oldp);
-
-    /* iter 전진 */
-    iov_iter_advance(iter, ZC_PG_SZ);
-}
-
-extern bool enable_zcopy;
-static size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_t used, size_t flags){
-	struct iov_iter *iter = &msg->msg_iter;
-	size_t done = 0;
-	u32 headlen, off_in_frags, inner;
-	int idx, nr;
-
-	if (!enable_zcopy)
-		return 0;
-
-	if (flags & (MSG_PEEK | MSG_TRUNC | MSG_OOB))
-		return 0;
-
-	if (offset & ZC_PG_MASK)
-		return 0;
-
-	if (!iov_iter_is_bvec(iter))
-		return 0;
-
-	headlen = skb_headlen(skb);
-	if (offset < headlen)
-		return 0;
-
-	off_in_frags = offset - headlen;
-	if (!find_frag_index(skb, off_in_frags, &idx, &inner))
-		return 0;
-
-	if (inner != 0)
-		return 0;
-
-	//want 4K 배수만 처리
-    want = min(want, (size_t)iov_iter_count(iter));
-    want &= ~((size_t)ZC_PG_MASK);
-    if (!want)
-        return 0;
-	nr = skb_shinfo(skb) -> nr_frags;
-
-	while (want >= ZC_PG_SZ) {
-		skb_frag_t *frag;
-		struct page *newp, *oldp;
-
-		if (idx >= nr)
-			break;
-
-		frag = &skb_shinfo(skb)->frags[idx];
-		pr_info("frag index : %d, size : %d, off : %d\n", idx, skb_frag_size(frag), skb_frag_off(frag));
-		/* clean 4K frag만 */
-        if (skb_frag_size(frag) != ZC_PG_SZ)
-            break;
-        if (skb_frag_off(frag) != 0)
-            break;
-
-        newp = skb_frag_page(frag);
-        if (!newp)
-            break;
-
-        if (!tcp_iter_bvec_can_swap_4k(iter, &oldp)){
-			pr_info("failed to swap 4K frag\n");
-            break;
-		}
-
-        tcp_iter_bvec_do_swap_4k(iter, newp);
-
-        done += ZC_PG_SZ;
-        want -= ZC_PG_SZ;
-        idx++;
-    }
-	return done;
-}
-/* rx-zcopy end */
-
-
 /*
  *	This routine copies from a sock struct into the user buffer.
  *
@@ -2676,18 +2509,40 @@ found_ok_skb:
 					used = urg_offset;
 			}
 		}
-		/*
 
 		if (!(flags & MSG_TRUNC)) {
-			err = skb_copy_datagram_msg(skb, offset, msg, used);
-			if (err) {
-				// Exception. Bailout! 
-				if (!copied)
-					copied = -EFAULT;
-				break;
+			// syeon
+			if (can_zerocopy(sk, msg)) {	
+				size_t done = 0;
+				size_t zc_done = do_zerocopy(skb, offset, msg, sk);
+				done += zc_done;
+
+				// copy the rest of the data
+				if (zc_done < used) {
+					err = skb_copy_datagram_msg(skb, offset + zc_done, msg, used - zc_done);
+					if (err) {
+						/* Exception. Bailout! */
+						if (!copied)
+							copied = -EFAULT;
+						break;
+					}
+					done += used - zc_done;
+				}
+				if (done != used) {
+					pr_err("[tcp_recvmsg_locked] done != used: %zu != %zu\n", done, used);
+				}
+				
+			}
+			else {
+				err = skb_copy_datagram_msg(skb, offset, msg, used);
+				if (err) {
+					// Exception. Bailout! 
+					if (!copied)
+						copied = -EFAULT;
+					break;
+				}
 			}
 		}
-
 		WRITE_ONCE(*seq, *seq + used);
 		copied += used;
 		len -= used;
@@ -2696,51 +2551,6 @@ found_ok_skb:
 		else
 			sk_peek_offset_bwd(sk, used);
 		tcp_rcv_space_adjust(sk);
-		*/
-		if (!(flags & MSG_TRUNC)) {
-			size_t done = 0;
-			size_t zc_done = do_zerocopy(skb, offset, msg, used, flags);
-			done += zc_done;
-
-			// copy the rest of the data
-			if (zc_done < used) {
-				err = skb_copy_datagram_msg(skb, offset + zc_done, msg, 
-					used - zc_done);
-				if (err) {
-					/* Exception. Bailout! */
-					if (!copied)
-						copied = -EFAULT;
-					break;
-				}
-				done += used - zc_done;
-			}
-			WRITE_ONCE(*seq, *seq + done);
-			copied += done;
-			len -= done;
-
-			if(flags & MSG_PEEK){
-				sk_peek_offset_fwd(sk, done);
-			}
-			else {
-				sk_peek_offset_bwd(sk, done);
-			}
-
-			tcp_rcv_space_adjust(sk);
-		}
-		else {
-			WRITE_ONCE(*seq, *seq + used);
-			copied += used;
-			len -= used;
-
-			if(flags & MSG_PEEK){
-				sk_peek_offset_fwd(sk, used);
-			}
-			else {
-				sk_peek_offset_bwd(sk, used);
-			}
-
-			tcp_rcv_space_adjust(sk);
-		}
 
 skip_copy:
 		if (unlikely(tp->urg_data) && after(tp->copied_seq, tp->urg_seq)) {
