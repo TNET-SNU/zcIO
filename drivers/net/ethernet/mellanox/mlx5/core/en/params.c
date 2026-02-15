@@ -439,7 +439,11 @@ u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
 	if (params->xdp_prog)
 		return PAGE_SHIFT;
 
-	return MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev);
+//	pr_info("[mlx5e_mpwqe_get_log_stride_size] enable_zerocopy: %d\n", enable_zerocopy);
+//	if (enable_zerocopy)
+	return PAGE_SHIFT;
+
+//	return MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev);
 }
 
 u8 mlx5e_mpwqe_get_log_num_strides(struct mlx5_core_dev *mdev,
