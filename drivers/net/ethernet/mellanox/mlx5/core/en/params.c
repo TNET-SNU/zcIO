@@ -428,6 +428,7 @@ u8 mlx5e_shampo_get_log_pkt_per_rsrv(struct mlx5_core_dev *mdev,
 	return order_base_2(DIV_ROUND_UP(resrv_size, params->sw_mtu));
 }
 
+extern bool enable_zerocopy;
 u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
 				   struct mlx5e_params *params,
 				   struct mlx5e_xsk_param *xsk)
@@ -440,10 +441,10 @@ u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
 		return PAGE_SHIFT;
 
 //	pr_info("[mlx5e_mpwqe_get_log_stride_size] enable_zerocopy: %d\n", enable_zerocopy);
-//	if (enable_zerocopy)
-	return PAGE_SHIFT;
+	if (enable_zerocopy)
+		return PAGE_SHIFT;
 
-//	return MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev);
+	return MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev);
 }
 
 u8 mlx5e_mpwqe_get_log_num_strides(struct mlx5_core_dev *mdev,
