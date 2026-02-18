@@ -2,7 +2,7 @@
 VERSION = 6
 PATCHLEVEL = 11
 SUBLEVEL = 0
-EXTRAVERSION =-doff-only
+EXTRAVERSION =-target-zc
 NAME = Baby Opossum Posse
 
 # *DOCUMENTATION*

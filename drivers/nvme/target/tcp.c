@@ -27,7 +27,7 @@
 
 extern bool enable_zerocopy;
 
-#define NVMET_TCP_DEF_INLINE_DATA_SIZE	(4 * PAGE_SIZE)
+#define NVMET_TCP_DEF_INLINE_DATA_SIZE	4 * PAGE_SIZE
 #define NVMET_TCP_MAXH2CDATA		0x400000 /* 16M arbitrary limit */
 #define NVMET_TCP_BACKLOG 128
 
@@ -145,6 +145,10 @@ struct nvmet_tcp_cmd {
 	/* rx zcopy */
 	enum zc_policy zc_policy;
 	enum zc_reason zc_reason;
+	int zc_total_page_count;
+	struct page *old_pages[ZC_DATA_MAX_PAGES];
+	int old_page_count;
+	struct zc_data zc_data;
 };
 
 enum nvmet_tcp_queue_state {
@@ -371,17 +375,36 @@ static int cleanup_zc_pages(struct nvmet_tcp_cmd *cmd)
 	struct scatterlist *sg;
 	struct page *page;
 
+	for (i = 0; i < cmd->old_page_count; i++){
+		if (cmd->old_pages[i]){
+			//__free_page(cmd->old_pages[i]);
+			if (!PageSlab(cmd->old_pages[i])){
+				//pr_info("[cleanup_zc_pages] free page %px, ref count %d\n", cmd->old_pages[i], page_ref_count(cmd->old_pages[i]));
+//				__free_page(cmd->old_pages[i]);
+				put_page(cmd->old_pages[i]);
+			}
+			cmd->old_pages[i] = NULL;
+		}
+	}
+
 	for_each_sg(sgl, sg, cmd->req.sg_cnt, i){
-		if (!sg)
-			break;
+		if (!sg){
+			pr_err("[cleanup_zc_pages] sg is NULL\n");
+			continue;
+		}
 		page = sg_page(sg);
-		trace_printk("[cleanup_zc_pages] page %px, page ref count %d, page_pool ref count %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+		if (page == NULL){
+			pr_err("[cleanup_zc_pages] page is NULL\n");
+			continue;
+		}
 		if (is_pp_page(page)){
             if (page_ref_count(page) > 0){
 		        put_page(page);
             }
             
 		    page_pool_put_full_page(page->pp, page,false);
+			
+			//pr_info("[cleanup_zc_pages] page %px, page ref count %d, page_pool ref count %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
         }
 		else {
 			__free_pages(page, 0);
@@ -397,79 +420,158 @@ static int cleanup_zc_pages(struct nvmet_tcp_cmd *cmd)
 #define ZC_PG_SZ PAGE_SIZE
 #define ZC_PG_MASK (ZC_PG_SZ - 1)
 
-static bool nvmet_tcp_zc_precheck(struct nvmet_tcp_cmd *cmd, u32 data_offset, u32 pdu_len){
+static bool nvmet_tcp_zc_precheck(struct nvmet_tcp_queue *queue, struct nvmet_tcp_cmd *cmd, u32 data_offset, u32 pdu_len){
 	cmd->zc_policy = ZC_DISABLED;
 	cmd->zc_reason = ZCR_OK;
 
+	if (cmd->zc_policy == ZC_ENABLED){
+		return true;
+	}
+
 	if (!enable_zerocopy){
 		cmd->zc_reason = ZCR_GLOB_OFF;
-		return false;
+		goto error;
 	}
 
 	if (!nvme_is_write(cmd->req.cmd)){
 		cmd->zc_reason = ZCR_NOT_WRITE;
-		return false;
+		goto error;
 	}
 
-	if (nvmet_tcp_has_inline_data(cmd)){
-		cmd->zc_reason = ZCR_INLINE;
-		return false;
+	if (!queue || queue->state != NVMET_TCP_Q_LIVE){
+		cmd->zc_reason = ZCR_QUEUE_NOT_LIVE;
+		goto error;
 	}
+
+	if (queue->nvme_sq.qid == 0){
+		cmd->zc_reason = ZCR_QUEUE_QID_0;
+		goto error;
+	}
+
+/*	if (nvmet_tcp_has_inline_data(cmd)){
+		cmd->zc_reason = ZCR_INLINE;
+		goto error;
+	}*/
 
 	if (pdu_len & ZC_PG_MASK){
-        pr_info("[nvmet_tcp_zc_precheck] pdu_len: %d\n", pdu_len);
 		cmd->zc_reason = ZCR_PDU_LEN_NOT_4K;
-		return false;
+		goto error;
 	}
 
 	if (data_offset & ZC_PG_MASK){
-        pr_info("[nvmet_tcp_zc_precheck] data_offset: %d\n", data_offset);
 		cmd->zc_reason = ZCR_PDU_OFF_NOT_4K;
-		return false;
+		goto error;
 	}
 
 	if (cmd->req.transfer_len & ZC_PG_MASK){
-        pr_info("[nvmet_tcp_zc_precheck] transfer_len: %zu\n", cmd->req.transfer_len);
 		cmd->zc_reason = ZCR_XFER_NOT_4K;
-		return false;
+		goto error;
 	}
 
 	if (cmd->rbytes_done & ZC_PG_MASK){
-        pr_info("[nvmet_tcp_zc_precheck] rbytes_done: %d\n", cmd->rbytes_done);
 		cmd->zc_reason = ZCR_RBYTES_NOT_4K;
-		return false;
+		goto error;
 	}
 
 	if (!cmd->req.sg || cmd->req.sg_cnt == 0){
 		cmd->zc_reason = ZCR_SG_BAD;
-		return false;
+		goto error;
 	}
 
-	cmd->zc_policy = ZC_ENABLED;
+	struct sock *sk = queue->sock->sk;
+	if (!sk || !sk->sk_user_data || *(u32 *)sk->sk_user_data != NVMET_TCP_MAGIC){
+		cmd->zc_reason = ZCR_SK_BAD;
+		goto error;
+	}
 
+	//pr_info("[nvmet_tcp_zc_precheck] zc_policy: ZC_ENABLED\n");
+	cmd->zc_policy = ZC_ENABLED;
+	cmd->zc_total_page_count = 0;
+
+	cmd->old_page_count = 0;
+	cmd->old_pages[0] = NULL;
+
+	cmd->zc_data.page_count = 0;
+	cmd->recv_msg.msg_control = &cmd->zc_data;
+	cmd->zc_data.page[0] = NULL;
+	cmd->recv_msg.msg_controllen = sizeof(cmd->zc_data);
 	return true;
+
+error:
+	pr_info("[nvmet_tcp_zc_precheck] zc_reason: %d\n", cmd->zc_reason);
+	return false;
 }
 
 static void nvmet_tcp_zc_swap_sg_pages(struct nvmet_tcp_cmd *cmd){
 	struct scatterlist *sg;
-	struct bio_vec *bv = (struct bio_vec *)cmd->recv_msg.msg_iter.bvec;
+	//struct bio_vec *bv;
 	int i;
-	if (!bv)
-		return;
 
-	for_each_sg(cmd->req.sg, sg, cmd->req.sg_cnt, i){
-		if (!sg)
-			break;
-		
-		struct page *page = bv[i].bv_page;
-		if (is_pp_page(page)){
-			if (sg->length != bv[i].bv_len){
-				pr_err("[nvmet_tcp_zc_swap_sg_pages] sg length mismatch: %d != %d\n", sg->length, bv[i].bv_len);
-			}
-			sg_set_page(sg, page, sg->length, sg->offset);
-		}
+	if (!iov_iter_is_bvec(&cmd->recv_msg.msg_iter)) {
+		pr_err("[nvmet_tcp_zc_swap_sg_pages] iter is not bvec! type: %d\n", 
+				iov_iter_type(&cmd->recv_msg.msg_iter));
+		return;
 	}
 
+	//bv = (struct bio_vec *)cmd->recv_msg.msg_iter.bvec;
+	//if (!bv)
+	//	return;
+
+	int stored_zc_page_count, zc_page_count = 0;
+	struct zc_data *zc_data = (struct zc_data *)cmd->recv_msg.msg_control;
+//	int start_sg_idx = cmd->zc_total_page_count;
+	stored_zc_page_count = zc_data->page_count;
+	int remaining_sg_cnt = cmd->req.sg_cnt ;//- start_sg_idx;
+
+	//pr_info("[nvmet_tcp_zc_swap_sg_pages] stored_zc_page_count: %d, start_sg_idx: %d, remaining_sg_cnt: %d, req.sg_cnt: %d\n", stored_zc_page_count, start_sg_idx, remaining_sg_cnt, cmd->req.sg_cnt);
+
+	if (zc_data->page == NULL){
+		pr_err("[nvmet_tcp_zc_swap_sg_pages] zc_data->page is NULL\n");
+		return;
+	}
+
+	if (zc_data->page_count == 0){
+		pr_err("[nvmet_tcp_zc_swap_sg_pages] zc_data->page_count is 0\n");
+		return;
+	}
+
+	int limit = min(remaining_sg_cnt, stored_zc_page_count);
+	//for_each_sg(cmd->req.sg + start_sg_idx, sg, limit, i){
+	for_each_sg(cmd->req.sg, sg, limit, i){
+		if (!sg){
+			pr_err("[nvmet_tcp_zc_swap_sg_pages] sg is NULL\n");
+			break;
+		}
+		struct page *new_page = zc_data->page[zc_page_count++];// bv[i].bv_page;
+		if (new_page == NULL || !is_pp_page(new_page)){
+			pr_err("[nvmet_tcp_zc_swap_sg_pages] bv_page is NULL\n");
+			continue;
+		}
+		struct page *old_page = sg_page(sg);
+		if (old_page == NULL){
+			pr_err("[nvmet_tcp_zc_swap_sg_pages] old_page is NULL\n");
+			continue;
+		}
+		//pr_info("[nvmet_tcp_zc_swap_sg_pages] sg: %px, new_page: %px, old_page: %px\n", sg, new_page, old_page);
+		
+		if (is_pp_page(new_page) && (new_page != old_page)){
+		//	pr_info("[nvmet_tcp_zc_swap_sg_pages] start swap page\n");
+			if (sg->length != PAGE_SIZE){
+				pr_info("[nvmet_tcp_zc_swap_sg_pages] sg length mismatch: %d != %ld\n", sg->length, PAGE_SIZE);
+			}	
+			sg_set_page(sg, new_page, sg->length, sg->offset);
+			if (old_page){
+				//pr_info("[nvmet_tcp_zc_swap_sg_pages] add old page %px, ref count %d\n", old_page, page_ref_count(old_page));
+				cmd->old_pages[cmd->old_page_count++] = old_page;
+				//__free_page(old_page);
+			}
+		}
+		cmd->zc_total_page_count++;
+	}
+
+	if (stored_zc_page_count != zc_page_count){
+		pr_err("[nvmet_tcp_zc_swap_sg_pages] zc_page_count mismatch: %d != %d\n", stored_zc_page_count, zc_page_count);
+	}
 }
 
 /* If cmd buffers are NULL, no operation is performed */
@@ -516,6 +618,7 @@ static void nvmet_tcp_build_pdu_iovec(struct nvmet_tcp_cmd *cmd)
 
 	iov_iter_bvec(&cmd->recv_msg.msg_iter, ITER_DEST, cmd->iov,
 		      nr_pages, cmd->pdu_len);
+	//pr_info("[nvmet_tcp_build_pdu_iovec] iov: %px, nr_pages: %d, pdu_len: %d\n", cmd->iov, nr_pages, cmd->pdu_len);
 }
 
 static void nvmet_tcp_fatal_error(struct nvmet_tcp_queue *queue)
@@ -1151,9 +1254,9 @@ static int nvmet_tcp_handle_h2c_data_pdu(struct nvmet_tcp_queue *queue)
 	cmd->pdu_recv = 0;
 
 	//syeon
-	bool zc_enabled = nvmet_tcp_zc_precheck(cmd, le32_to_cpu(data->data_offset), cmd->pdu_len);
+	bool zc_enabled = nvmet_tcp_zc_precheck(queue, cmd, le32_to_cpu(data->data_offset), cmd->pdu_len);
     if (!zc_enabled) {
-		trace_printk("[cmd: %p] zc_enabled: %d\n", cmd, zc_enabled);
+		pr_info("[cmd: %p] zc_enabled: %d, zc_reason: %d\n", cmd, zc_enabled, cmd->zc_reason);
 	}
 
 	nvmet_tcp_build_pdu_iovec(cmd);
@@ -1236,6 +1339,12 @@ static int nvmet_tcp_done_recv_pdu(struct nvmet_tcp_queue *queue)
 
 	if (nvmet_tcp_need_data_in(queue->cmd)) {
 		if (nvmet_tcp_has_inline_data(queue->cmd)) {
+			//syeon
+			pr_info("[nvmet_tcp_done_recv_pdu] has inline data\n");
+			bool zc_enabled = nvmet_tcp_zc_precheck(queue, queue->cmd, 0, queue->cmd->pdu_len);
+			if (!zc_enabled) {
+				pr_info("[nvmet_tcp_done_recv_pdu] zc_enabled: %d, zc_reason: %d\n", zc_enabled, queue->cmd->zc_reason);
+			}
 			queue->rcv_state = NVMET_TCP_RECV_DATA;
 			nvmet_tcp_build_pdu_iovec(queue->cmd);
 			return 0;
@@ -1413,11 +1522,14 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
 		return 0;
 	}
 
+	
 	if (cmd->rbytes_done == cmd->req.transfer_len){
-		if (enable_zerocopy) {
+		if (cmd->zc_policy == ZC_ENABLED) {
 			nvmet_tcp_zc_swap_sg_pages(cmd);
+			//pr_info("[nvmet_tcp_try_recv_data] zc_total_page_count: %d, rbytes_done: %d\n", cmd->zc_total_page_count, cmd->rbytes_done);
 		}
 		nvmet_tcp_execute_request(cmd);
+
 	}
 
 	nvmet_prepare_receive_pdu(queue);

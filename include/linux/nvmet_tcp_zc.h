@@ -5,6 +5,7 @@
 #include <linux/bvec.h>
 
 #define NVMET_TCP_MAGIC 0x4E564D45  /* "NVME"의 헥사값 */
+#define ZC_DATA_MAX_PAGES 256
 
 enum zc_policy {
 	ZC_DISABLED = 0,
@@ -21,12 +22,14 @@ enum zc_reason {
 	ZCR_XFER_NOT_4K,
 	ZCR_RBYTES_NOT_4K,
 	ZCR_SG_BAD,
+	ZCR_QUEUE_NOT_LIVE,
+	ZCR_QUEUE_QID_0,
+	ZCR_SK_BAD,
 };
 
-struct nvmet_tcp_zc_bvec {
-    struct bio_vec bv;              // iov_iter가 보는 부분
-    struct scatterlist *sg;         // 이 bv가 대응하는 sg
-//    struct page_pool *pp;           // (선택) 반환에 필요한 pool
+struct zc_data {
+	struct page *page[ZC_DATA_MAX_PAGES];
+	size_t page_count;
 };
 
 #endif

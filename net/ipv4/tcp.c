@@ -2512,13 +2512,15 @@ found_ok_skb:
 
 		if (!(flags & MSG_TRUNC)) {
 			// syeon
-			if (can_zerocopy(sk, msg)) {	
+			if (can_zerocopy(sk, msg)) {
+				//pr_info("[tcp_recvmsg_locked] start zc, used: %zu\n", used);	
 				size_t done = 0;
-				size_t zc_done = do_zerocopy(skb, offset, msg, sk);
+				size_t zc_done = do_zerocopy(skb, offset, msg, used, sk);
 				done += zc_done;
 
 				// copy the rest of the data
 				if (zc_done < used) {
+					pr_info("[tcp_recvmsg_locked] fallback to copy rest of the data, zc_done: %zu, offset: %zu, copy data size: %zu\n", zc_done, offset + zc_done, used - zc_done);
 					err = skb_copy_datagram_msg(skb, offset + zc_done, msg, used - zc_done);
 					if (err) {
 						/* Exception. Bailout! */

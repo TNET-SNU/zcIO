@@ -20,5 +20,5 @@ struct zc_skb_cursor {
 
 bool can_zerocopy(struct sock *sk, struct msghdr *msg);
 __always_inline bool is_pp_page(struct page *page);
-size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, struct sock *sk);
+size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_t used, struct sock *sk);
 #endif /* _TCP_ZC_H */

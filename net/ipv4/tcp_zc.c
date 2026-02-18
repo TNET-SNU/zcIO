@@ -16,7 +16,7 @@ bool can_zerocopy(struct sock *sk, struct msghdr *msg){
         return false;
 
     if (!iov_iter_is_bvec(&msg->msg_iter)){
-		pr_info("[can_zerocopy] not bvec\n");
+	//	pr_info("[can_zerocopy] not bvec\n");
         return false;
 	}
 
@@ -146,39 +146,44 @@ static int zc_find_next_4k_stateful(struct nvmet_tcp_queue *q,
 }
 */
 
-static bool tcp_iter_bvec_can_swap_4k(struct iov_iter *iter, struct page **oldp_out)
+static bool tcp_iter_bvec_can_swap_4k(struct iov_iter *iter)
 {
     /*
      * - iter->bvec : current bvec pointer
      * - iter->iov_offset : current bvec offset
      */
-    if (!iter->bvec && !iov_iter_is_bvec(iter))
+    if (!iter->bvec && !iov_iter_is_bvec(iter)){
+		pr_info("[tcp_iter_bvec_can_swap_4k] not bvec\n");
         return false;
+	}
 
    // if (iter->iov_offset != 0)
    //     return false;
 
-    if (iter->bvec->bv_offset != 0)
+    if (iter->bvec->bv_offset != 0){
+		pr_info("[tcp_iter_bvec_can_swap_4k] bv_offset != 0\n");
         return false;
+	}
 
     if (iter->bvec->bv_len != ZC_PG_SZ)
+	{
+		pr_info("[tcp_iter_bvec_can_swap_4k] bv_len != 4K\n");
         return false;
+	}
 
     if (!iter->bvec->bv_page)
+	{
+		pr_info("[tcp_iter_bvec_can_swap_4k] bv_page is NULL\n");
         return false;
-
-    *oldp_out = iter->bvec->bv_page;
+	}
     return true;
 }
 
-static void tcp_iter_bvec_do_swap_4k(struct iov_iter *iter, struct page *newp)
+static void tcp_zc_store_4k_frag_page(struct msghdr *msg, struct page *newp)
 {
+	struct iov_iter *iter = &msg->msg_iter;
 	struct bio_vec *bvec_curr = (struct bio_vec *)iter->bvec;
-    struct page *oldp = bvec_curr->bv_page;
-
-    if (oldp){
-        __free_page(oldp);
-    }
+	struct zc_data *zc_data = (struct zc_data *)msg->msg_control;
 
 	if (!get_page_unless_zero(newp)){
 		pr_info("failed to get newp\n");
@@ -186,14 +191,17 @@ static void tcp_iter_bvec_do_swap_4k(struct iov_iter *iter, struct page *newp)
 	}
 	page_pool_ref_page(newp);
 
-    pr_info("[tcp_iter_bvec_do_swap_4k] new page: %px, page ref count: %d, page_pool ref count: %ld\n", newp, page_ref_count(newp), atomic_long_read(&newp->pp_ref_count));
 
 	//sg_set_page(sg, newp, sg->length, sg->offset);
     // do i have to free old page of bvec?
 	bvec_curr->bv_page = newp;
-
-	// advance iter will change iter->bvec, iter->iov_offset, iov_iter_count
-    iov_iter_advance(iter, ZC_PG_SZ);
+	if (zc_data && zc_data->page_count < ZC_DATA_MAX_PAGES){
+		//pr_info("[tcp_zc_store_4k_frag_page] store page to zc_data, page_count: %zu, new page: %px, page ref count: %d, page_pool ref count: %zu\n", zc_data->page_count, newp, page_ref_count(newp), atomic_long_read(&newp->pp_ref_count));
+		
+		zc_data->page[zc_data->page_count] = newp;
+		zc_data->page_count++;
+	}
+	return;
 }
 
 static __always_inline bool zc_is_full_4k_page_frag(const skb_frag_t *f)
@@ -240,6 +248,7 @@ static int zc_find_page_stateless(struct sk_buff *root_skb,
                     *out_frag_idx = i;    // 그 SKB 안의 i번째 조각
                     return 0; 
                 }
+				pr_info("[zc_find_page_stateless] not full 4K frag, offset: %u, frag_idx: %d\n", offset, i);
                 return -ENOENT; // 조건 안 맞음
             }
             offset -= len; // 다음 frag 검사를 위해 뺌
@@ -261,49 +270,51 @@ static int zc_find_page_stateless(struct sk_buff *root_skb,
             curr = curr->next;
         }
     }
-
+	pr_info("[zc_find_page_stateless] not found 4K frag, offset: %u\n", offset);
     return -ENOENT; // 끝까지 뒤져도 없음
 }
 
-size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, struct sock *sk){
-	//struct nvmet_tcp_queue *queue = sk->sk_user_data;
-//	struct nvmet_tcp_cmd *cmd = queue->recv_cmd;
+size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_t used, struct sock *sk){
 	struct iov_iter *iter = &msg->msg_iter;
 	size_t done = 0;
     struct sk_buff *owner = NULL;
     int frag_index = -1;
 
-	//if (flags & (MSG_PEEK | MSG_TRUNC | MSG_OOB))
-	//	return 0;
-
-	//if (offset & ZC_PG_MASK)
-	//	return 0;
-	pr_info("[do_zerocopy] iter: %px\n", iter);
+	//pr_info("[do_zerocopy] iter: %px\n", iter);
 	if (!iov_iter_is_bvec(iter)){
-		trace_printk("[do_zerocopy] not bvec\n");
+		pr_info("[do_zerocopy] not bvec\n");
 		return 0;
 	}
 
 	//want 4K 배수만 처리
-    size_t want = (size_t)iov_iter_count(iter);
-    want &= ~((size_t)ZC_PG_MASK);
+    size_t total_size = iov_iter_count(iter);
+	size_t avail = min_t(size_t, total_size, used);
+    size_t want = avail & ~((size_t)ZC_PG_MASK);
     if (!want){
-		pr_info("want is 0\n");
+		pr_info("want is 0, real data size: %zu\n", iov_iter_count(iter));
         return 0;
 	}
-
+  //  pr_info("[do_zerocopy] available: %zu / %zu -- real data size: %zu\n", avail, total_size, want);
 	while (want >= ZC_PG_SZ) {
+	//	pr_info("----> want: %zu\n", want);
 		skb_frag_t *frag;
-		struct page *newp, *oldp;
+		struct page *newp;
+		
+		// check bv page 's alignment
+        if (!tcp_iter_bvec_can_swap_4k(iter)){
+			pr_info("--- unableto swap 4K frag, offset: %zu, done: %zu\n", offset + done, done);
+            return done;
+		}
 
-        if (zc_find_page_stateless(skb, offset, &owner, &frag_index)){
-            pr_info("failed to find 4K frag\n");
-            return 0;
+        if (zc_find_page_stateless(skb, offset + done, &owner, &frag_index)){
+			skb_dump(KERN_INFO, skb, true);
+            pr_info("failed to find 4K frag, offset: %zu, done: %zu\n", offset + done, done);
+            return done;
         }
 
-		frag = &skb_shinfo(skb)->frags[frag_index];
+		frag = &skb_shinfo(owner)->frags[frag_index];
 		// check frag's alignment
-		pr_info("[do_zerocopy] frag index : %d, size : %d, off : %d\n", frag_index, skb_frag_size(frag), skb_frag_off(frag));
+	//	pr_info("[do_zerocopy] frag index : %d, size : %d, off : %d\n", frag_index, skb_frag_size(frag), skb_frag_off(frag));
 		/* clean 4K frag만 */
         if (skb_frag_size(frag) != ZC_PG_SZ)
             break;
@@ -314,19 +325,15 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, struc
         if (!newp)
             break;
 
-		// check bv page 's alignment
-        if (!tcp_iter_bvec_can_swap_4k(iter, &oldp)){
-			pr_info("failed to swap 4K frag\n");
-            break;
-		}
 		// swap 4K frag
-        tcp_iter_bvec_do_swap_4k(iter, newp);
+        tcp_zc_store_4k_frag_page(msg, newp);
 
+		iov_iter_advance(iter, ZC_PG_SZ);
         done += ZC_PG_SZ;
         want -= ZC_PG_SZ;
         //idx++;
     }
-	pr_info("[do_zerocopy] done : %zu\n", done);
+	//pr_info("[do_zerocopy] done : %zu\n", done);
 	return done;
 }
 
