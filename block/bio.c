@@ -1332,7 +1332,7 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 
 		len = min_t(size_t, PAGE_SIZE - offset, left);
 		if (len != PAGE_SIZE){
-			trace_printk("---[ctx: %px] len: %d - not PAGE_SIZE - offset: %zu\n", ctx, len, offset);
+			//trace_printk("---[ctx: %px] len: %d - not PAGE_SIZE - offset: %zu\n", ctx, len, offset);
 		}
 		if (bio_op(bio) == REQ_OP_ZONE_APPEND) {
 			ret = bio_iov_add_zone_append_page(bio, page, len,

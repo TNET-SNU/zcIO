@@ -186,7 +186,7 @@ void iomap_my_dio_bio_end_io(struct bio *bio)
 	}
 
 	if (ctx && ctx->magic == MY_CTX_MAGIC){
-		//trace_printk("[bio_end_io] [ctx: %px] old_nr_pages: %d\n", ctx, ctx->old_nr_pages);
+		//trace_printk("[iomap_my_dio_bio_end_io] [ctx: %px] old_nr_pages: %d\n", ctx, ctx->old_nr_pages);
 		for(int i = 0; i < ctx->old_nr_pages; i++){
 			struct page *page = ctx->old_pages[i];
 			if (unlikely(!page)){
@@ -194,22 +194,24 @@ void iomap_my_dio_bio_end_io(struct bio *bio)
 			}
 			if (unlikely(!is_pp_page(page))){
 				pr_info("[bio_end_io] [page: %px], is not pp page\n", page);
-				put_page(page);
+				//put_page(page);
 			}
 			else{
-				//trace_printk("[bio_end_io] [page: %px] ref count: %d, pp_ref count: %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+				//trace_printk("[iomap_my_dio_bio_end_io] [page: %px] ref count: %d, pp_ref count: %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
 				if (page_ref_count(page) > 1){
 					put_page(page);
 				}
-				if (unlikely(page_ref_count(page) > 1)){
-					//trace_printk("[bio_end_io] [page: %px], ref count: %d, pp_ref count: %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
-				}
-				page_pool_put_full_page(page->pp, page, false);
+			//	if (page_ref_count(page) == 1){
+					page_pool_put_full_page(page->pp, page, false);
+				//}
 			}
 			ctx->old_pages[i] = NULL;
 		}
 		ctx->old_nr_pages = 0;
 		free_my_ctx(ctx);
+	}
+	else {
+		//pr_info("[iomap_my_dio_bio_end_io] [ctx: %px] is not my_ctx\n", ctx);
 	}
 	
 	kfree(priv);

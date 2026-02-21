@@ -1231,6 +1231,7 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 							ctx->old_nr_pages, ctx->nr_pages);
 				} else {
 					if (unlikely(!is_pp_page(old_page))){
+//						pr_info("[batch_remap_pages] old_page is not pp page: %px, ref count: %d\n", old_page, page_ref_count(old_page));
 						put_page(old_page);
 					}
 					else {
@@ -1463,7 +1464,7 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	unsigned int cur_off = offset;
 
 	chunk_base = page_idx;
-	trace_printk("**** do_zerocopy: consumed: %zu , total_bytes: %zu, page_idx: %zu, chunk_base: %zu\n", consumed, ctx->total_bytes, page_idx, chunk_base);
+//	trace_printk("**** do_zerocopy: consumed: %zu , total_bytes: %zu, page_idx: %zu, chunk_base: %zu\n", consumed, ctx->total_bytes, page_idx, chunk_base);
 	if ((consumed & (PAGE_SIZE - 1)) != 0) {
    		trace_printk("ZC forbid: consumed not aligned: %zu\n", consumed);
 	 //return -1;
@@ -1519,9 +1520,6 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
             pr_info("failed to get_page: %px\n", fp);
             goto error;
         }
-		else {
-			//trace_printk("get_page: %px, ref count: %d, pp_ref count: %ld\n", fp, page_ref_count(fp), atomic_long_read(&fp->pp_ref_count));
-		}
 
         page_pool_ref_page(fp);
 		/* main change: new_pages is passed as an argument*/
@@ -1896,7 +1894,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		nvme_cid_to_rq(nvme_tcp_tagset(queue), pdu->command_id);
 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
 	int zcopy_len = 0;
-	trace_printk("---------[0]nvme_tcp_recv_data: start - len: %zu\n", *len);
+	//trace_printk("---------[0]nvme_tcp_recv_data: start - len: %zu\n", *len);
 	while (true) {
 		int recv_len, ret, zc_recv_len;
 		// 이번 pdu에서 필요한 만큼 
@@ -1923,23 +1921,23 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		/* we can read only from what is left in this bio */
 		recv_len = min_t(size_t, recv_len,
 				iov_iter_count(&req->iter));
-		trace_printk("[1] nvme_tcp_recv_data: recv_len: %d, iov_iter_count: %zu, queue->data_remaining: %zu\n", recv_len, iov_iter_count(&req->iter), queue->data_remaining);
+		//trace_printk("[1] nvme_tcp_recv_data: recv_len: %d, iov_iter_count: %zu, queue->data_remaining: %zu\n", recv_len, iov_iter_count(&req->iter), queue->data_remaining);
 		// set recv_len to PAGE_SIZE aligned
 		zc_recv_len = recv_len & ~(PAGE_SIZE - 1);
-		trace_printk("[2]nvme_tcp_recv_data: zc_recv_len: %d\n", zc_recv_len);
+		//trace_printk("[2]nvme_tcp_recv_data: zc_recv_len: %d\n", zc_recv_len);
 	
 		if (queue->data_digest){
 			ret = skb_copy_and_hash_datagram_iter(skb, *offset,
 				&req->iter, recv_len, queue->rcv_hash);
 		}
 		else if (!can_use_zerocopy(queue, req, recv_len)){
-			trace_printk("[3] [nvme_tcp_recv_data] can_use_zerocopy, recv_len: %d\n", recv_len);
+			//trace_printk("[3] [nvme_tcp_recv_data] can_use_zerocopy, recv_len: %d\n", recv_len);
 			ret = skb_copy_datagram_iter(skb, *offset,
 					&req->iter, recv_len);
 		}
 		else if (zc_recv_len == 0)
 		{
-			trace_printk("[4] [nvme_tcp_recv_data] zc_recv_len == 0, recv_len: %d\n", recv_len);
+			//trace_printk("[4] [nvme_tcp_recv_data] zc_recv_len == 0, recv_len: %d\n", recv_len);
 			// zc_recv_len == 0 means that the data is not aligned to PAGE_SIZE
 			// so we need to copy the data to req->iter
 			ret = skb_copy_datagram_iter(skb, *offset,
@@ -1953,7 +1951,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			// remap/queueing done; completion is deferred (do not copy)
 			if (zcopy_len ==0) 
 			{
-				trace_printk("[4] [nvme_tcp_recv_data] zcopy_len == 0\n");
+				//trace_printk("[4] [nvme_tcp_recv_data] zcopy_len == 0\n");
 				iov_iter_advance(&req->iter, recv_len);
 				ret = 0;
 			}
