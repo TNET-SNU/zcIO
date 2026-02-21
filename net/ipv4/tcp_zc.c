@@ -287,11 +287,12 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_
 	}
 
 	//want 4K 배수만 처리
-    size_t total_size = iov_iter_count(iter);
-	size_t avail = min_t(size_t, total_size, used);
+    //size_t total_size = iov_iter_count(iter);
+	//size_t avail = min_t(size_t, total_size, used);
+	size_t avail = used;
     size_t want = avail & ~((size_t)ZC_PG_MASK);
     if (!want){
-		pr_info("want is 0, real data size: %zu\n", iov_iter_count(iter));
+		pr_info("want is %zu real data size: %zu\n",want, iov_iter_count(iter));
         return 0;
 	}
   //  pr_info("[do_zerocopy] available: %zu / %zu -- real data size: %zu\n", avail, total_size, want);

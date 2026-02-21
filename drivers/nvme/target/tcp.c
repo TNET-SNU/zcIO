@@ -504,7 +504,6 @@ error:
 
 static void nvmet_tcp_zc_swap_sg_pages(struct nvmet_tcp_cmd *cmd){
 	struct scatterlist *sg;
-	//struct bio_vec *bv;
 	int i;
 
 	if (!iov_iter_is_bvec(&cmd->recv_msg.msg_iter)) {
@@ -513,13 +512,8 @@ static void nvmet_tcp_zc_swap_sg_pages(struct nvmet_tcp_cmd *cmd){
 		return;
 	}
 
-	//bv = (struct bio_vec *)cmd->recv_msg.msg_iter.bvec;
-	//if (!bv)
-	//	return;
-
 	int stored_zc_page_count, zc_page_count = 0;
 	struct zc_data *zc_data = (struct zc_data *)cmd->recv_msg.msg_control;
-//	int start_sg_idx = cmd->zc_total_page_count;
 	stored_zc_page_count = zc_data->page_count;
 	int remaining_sg_cnt = cmd->req.sg_cnt ;//- start_sg_idx;
 
@@ -536,13 +530,12 @@ static void nvmet_tcp_zc_swap_sg_pages(struct nvmet_tcp_cmd *cmd){
 	}
 
 	int limit = min(remaining_sg_cnt, stored_zc_page_count);
-	//for_each_sg(cmd->req.sg + start_sg_idx, sg, limit, i){
 	for_each_sg(cmd->req.sg, sg, limit, i){
 		if (!sg){
 			pr_err("[nvmet_tcp_zc_swap_sg_pages] sg is NULL\n");
 			break;
 		}
-		struct page *new_page = zc_data->page[zc_page_count++];// bv[i].bv_page;
+		struct page *new_page = zc_data->page[zc_page_count++];
 		if (new_page == NULL || !is_pp_page(new_page)){
 			pr_err("[nvmet_tcp_zc_swap_sg_pages] bv_page is NULL\n");
 			continue;

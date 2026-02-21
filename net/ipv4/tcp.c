@@ -2380,7 +2380,7 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 	}
 
 	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
-
+pr_info("[tcp_recvmsg_locked] len: %ld\n", len);
 	do {
 		u32 offset;
 
@@ -2513,17 +2513,22 @@ found_ok_skb:
 		if (!(flags & MSG_TRUNC)) {
 			// syeon
 			if (can_zerocopy(sk, msg)) {
-				//pr_info("[tcp_recvmsg_locked] start zc, used: %zu\n", used);	
+				pr_info("[tcp_recvmsg_locked] start zc, used: %ld, offset: %d\n", used, offset);	
 				size_t done = 0;
 				size_t zc_done = do_zerocopy(skb, offset, msg, used, sk);
 				done += zc_done;
 
 				// copy the rest of the data
 				if (zc_done < used) {
+					pr_info("[tcp_recvmsg_locked] used is not 4k aligned, used: %zu, zc_done: %zu\n", used, zc_done);
+
+					used = zc_done;
+				}
+
+					/*
 					pr_info("[tcp_recvmsg_locked] fallback to copy rest of the data, zc_done: %zu, offset: %zu, copy data size: %zu\n", zc_done, offset + zc_done, used - zc_done);
 					err = skb_copy_datagram_msg(skb, offset + zc_done, msg, used - zc_done);
 					if (err) {
-						/* Exception. Bailout! */
 						if (!copied)
 							copied = -EFAULT;
 						break;
@@ -2534,6 +2539,7 @@ found_ok_skb:
 					pr_err("[tcp_recvmsg_locked] done != used: %zu != %zu\n", done, used);
 				}
 				
+				*/
 			}
 			else {
 				err = skb_copy_datagram_msg(skb, offset, msg, used);
@@ -2545,6 +2551,7 @@ found_ok_skb:
 				}
 			}
 		}
+		
 		WRITE_ONCE(*seq, *seq + used);
 		copied += used;
 		len -= used;
