@@ -207,9 +207,9 @@ static int zcopy_mn_invalidate_range_start(struct mmu_notifier *mn, const struct
   //      range->event, mmu_notifier_range_blockable(range),
   //      range->start, range->end, current->pid, current->comm);
 
-  if (!(range->event == 0) /*MMU_NOTIFY_UNMAP*/
-  || !(range->event == 1) /*MMU_NOTIFY_CLEAR*/
-  || !mmu_notifier_range_blockable(range))
+ if ((range->event != MMU_NOTIFY_UNMAP &&
+     range->event != MMU_NOTIFY_CLEAR) ||
+    !mmu_notifier_range_blockable(range))
     return 0;
   
   unsigned long start = range->start & PAGE_MASK;
