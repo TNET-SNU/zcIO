@@ -526,6 +526,11 @@ struct sock {
 				sk_txtime_unused : 6;
 
 	void			*sk_user_data;
+/*----------------------------------------------------------------------------*/
+#if 1 // NVME_TCP_PDU_ALIGN
+	void 			*sk_l5_data; /* Layer 5 protocol data */
+#endif
+/*----------------------------------------------------------------------------*/
 #ifdef CONFIG_SECURITY
 	void			*sk_security;
 #endif
