@@ -1,6 +1,7 @@
 #include "tcp_zc.h"
 #include <net/page_pool/helpers.h>
 #include <net/sock.h>
+#include <net/inet_sock.h>
 #include <linux/nvmet_tcp_zc.h>
 
 
@@ -12,6 +13,10 @@ MODULE_PARM_DESC(enable_zerocopy, "enable zcopy");
 
 
 bool can_zerocopy(struct sock *sk, struct msghdr *msg){
+	struct inet_sock *inet = inet_sk(sk);
+	if ((inet->inet_num) != 4420){
+		return false;
+	}
     if (!enable_zerocopy)
         return false;
 
@@ -292,7 +297,7 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_
 	size_t avail = used;
     size_t want = avail & ~((size_t)ZC_PG_MASK);
     if (!want){
-		pr_info("want is %zu real data size: %zu\n",want, iov_iter_count(iter));
+		pr_info("want is %zu real data size: %zu out of length :%zu\n",want, used, iov_iter_count(iter));
         return 0;
 	}
   //  pr_info("[do_zerocopy] available: %zu / %zu -- real data size: %zu\n", avail, total_size, want);
