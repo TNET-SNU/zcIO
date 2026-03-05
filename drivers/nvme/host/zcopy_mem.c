@@ -21,35 +21,68 @@ static inline bool batch_contains_page(struct zcopy_inv_batch *b, struct page *p
 }
 
 
-static void zcopy_free_inv_range(struct zcopy_inv_range *ir){
+static void zcopy_free_inv_range(struct zcopy_inv_range *ir, struct zcopy_ctx *ctx){
   struct zcopy_inv_batch *b, *bn;
   int return_nr = 0;
   list_for_each_entry_safe(b, bn, &ir->batches, node) {
-    //trace_printk("[zcopy_free_inv_range] ZeroCopy: batch: %px, nr: %d\n", b, b->nr);
     for (int i = 0; i < b->nr; i++) {
       struct page *page = b->pages[i];
       if (!page) {
         continue;
       }
       if (unlikely(!is_pp_page(page))) {
-//        pr_info("ZeroCopy: Page is not page pool page: %px\n", page);
         continue;
       }
-     // pr_info("[zcopy_free_inv_range] ZeroCopy: page: %px, ref count: %d, pp_ref count: %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+//      int cur_ref = page_ref_dec_return(page);
+ //     if (cur_ref == 2) {
+  //      put_page(page);
+//      if (atomic_cmpxchg(&page->_refcount, 2 , 1 ) == 2) {
+
+      spin_lock(&ctx->lock);
+      pr_info("[0]FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+    //  if (page_ref_count(page) > 2) {
+     //   put_page(page);
+     // }
       if (page_ref_count(page) > 1) {
         put_page(page);
+        pr_info("[1]FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+        if (page->pp) {
+          page_pool_put_full_page(page->pp, page, false);
+        }
       }
-      // 0219
-      //if (page_ref_count(page) == 1) {
+      pr_info("[2]FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+      spin_unlock(&ctx->lock);
+      b->pages[i] = NULL;
+      /*
+      case1: 
+      if (page_ref_dec_return(page) == 1){
+      //  put_page(page);
+        if (page->pp){
+          page_pool_put_full_page(page->pp, page, false);
+        }
+      }*/
+      /*
+      case2:
+      if (page_ref_dec_return(page) == 2){
+        put_page(page);
+        if (page->pp){
+          page_pool_put_full_page(page->pp, page, false);
+        }
+      }
+      */
+      /*
+      if (page_ref_count(page) > 1) {
+        trace_printk("FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld] [before put_page]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+        put_page(page);
         page_pool_put_full_page(page->pp, page, false);
-
- //     }
+      }
+      trace_printk("FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld] [after put_page]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+      */
       return_nr++;
     }
     list_del(&b->node);
     kfree(b);
   }
- // trace_printk("[zcopy_free_inv_range] ZeroCopy: free inv range: %px, return_nr: %d\n", ir, return_nr);
   kfree(ir);
 }
 
@@ -128,10 +161,20 @@ static void zcopy_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
   mmap_read_unlock(mm);
 */
     
-    /* 2. 해시 테이블에서 제거 */
+    /* 2. 해시 테이블에서 제거 
     spin_lock(&zcopy_ctx_lock);
     if (!hlist_unhashed(&ctx->node))
       hlist_del_rcu(&ctx->node);
+    spin_unlock(&zcopy_ctx_lock);
+    */
+
+    /* 1. 해시에서 안전하게 제거 (중복 방지) */
+    spin_lock(&zcopy_ctx_lock);
+    if (hlist_unhashed(&ctx->node)) {
+        spin_unlock(&zcopy_ctx_lock);
+        return;
+    }
+    hlist_del_init_rcu(&ctx->node);
     spin_unlock(&zcopy_ctx_lock);
 
     spin_lock(&ctx->lock);
@@ -141,7 +184,7 @@ static void zcopy_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
     while (!list_empty(&tmp)) {
       struct zcopy_inv_range *ir = list_first_entry(&tmp, struct zcopy_inv_range, node);
       list_del(&ir->node);
-      zcopy_free_inv_range(ir);
+      zcopy_free_inv_range(ir, ctx);
     }
 
     /* 3. 구 조체 해제 (RCU 안전 해제) */
@@ -184,11 +227,10 @@ static struct page *zcopy_peek_pp_page_get(struct mm_struct *mm, unsigned long a
   if (pte_present(*pte)) {
     page = pte_page(*pte);
     if (page && is_pp_page(page)) {
-      // 0219
-     // get_page(page);
-      //page_pool_ref_page(page);
-      ret_page = page;
-     // pr_info("[zcopy_peek_pp_page_get] ZeroCopy: peek & get pp page: %px, ref count: %d, pp_ref count: %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+      if (get_page_unless_zero(page)) {
+        pr_info("[peek_pp_page_get] [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+        ret_page = page;
+      }
     }
     else {
       ret_page = NULL;
@@ -207,8 +249,9 @@ static int zcopy_mn_invalidate_range_start(struct mmu_notifier *mn, const struct
   //      range->event, mmu_notifier_range_blockable(range),
   //      range->start, range->end, current->pid, current->comm);
 
- if ((range->event != MMU_NOTIFY_UNMAP &&
-     range->event != MMU_NOTIFY_CLEAR) ||
+ if ((range->event != MMU_NOTIFY_UNMAP )
+     //&& range->event != MMU_NOTIFY_CLEAR) 
+     ||
     !mmu_notifier_range_blockable(range))
     return 0;
   
@@ -224,10 +267,10 @@ static int zcopy_mn_invalidate_range_start(struct mmu_notifier *mn, const struct
     struct page *page = zcopy_peek_pp_page_get(mm, addr);
     if (!page) 
       continue;
-    //if (batch_contains_page(b, page)){
-     // pr_info("[zcopy_mn_invalidate_range_start] ZeroCopy: batch contains page: %px\n", page);
+//    if (batch_contains_page(b, page)){
+ //     pr_info("[zcopy_mn_invalidate_range_start] ZeroCopy: batch contains page: %px\n", page);
      // put_page(page);
-      //continue;
+   //   continue;
    // }
     if (!ir){
       ir = kmalloc(sizeof(*ir), GFP_KERNEL);
@@ -252,6 +295,7 @@ static int zcopy_mn_invalidate_range_start(struct mmu_notifier *mn, const struct
     }
 
     b->pages[b->nr++] = page;
+    trace_printk("INVALIDATE_RANGE_START: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
 
     if (b->nr == ZC_INV_BATCH) {
 //      pr_info("ZeroCopy: add batch: %px\n", b);
@@ -291,7 +335,7 @@ static void zcopy_mn_invalidate_range_end(struct mmu_notifier *mn,
   spin_unlock(&ctx->lock);
 
   if (found) {
-    zcopy_free_inv_range(found);
+    zcopy_free_inv_range(found, ctx);
   }
   else {
     //pr_info("[zcopy_mn_invalidate_range_end] ZeroCopy: not found: %px\n", range);
@@ -303,6 +347,7 @@ static const struct mmu_notifier_ops zcopy_mn_ops = {
     .invalidate_range_start = zcopy_mn_invalidate_range_start,
     .invalidate_range_end = zcopy_mn_invalidate_range_end,
 };
+
 
 
 int zcopy_try_register(struct mm_struct *mm) {
@@ -336,14 +381,13 @@ int zcopy_try_register(struct mm_struct *mm) {
     new_ctx->mm = mm;
     new_ctx->mn.ops = &zcopy_mn_ops;
 
-    /* 3. Notifier 등록 시도 */
+    /* 3. Notifier 등록 시도 
     ret = mmu_notifier_register(&new_ctx->mn, mm);
     if (ret) {
       kfree(new_ctx);
       return -1;
     }
-    
-    /* 4. Critical Section 진입 */
+    */
     spin_lock(&zcopy_ctx_lock);
 
     /* ★ [수정 핵심] Double-Check 시에도 RCU Lock 필수! ★
@@ -364,7 +408,7 @@ int zcopy_try_register(struct mm_struct *mm) {
       /* 이미 누가 등록함! 내껀 취소하고 나가야 함 */
       spin_unlock(&zcopy_ctx_lock);
 
-      mmu_notifier_unregister(&new_ctx->mn, mm);
+    //  mmu_notifier_unregister(&new_ctx->mn, mm);
       if (new_ctx){
         kfree(new_ctx);
       }
@@ -376,6 +420,16 @@ int zcopy_try_register(struct mm_struct *mm) {
     /* 진짜 없을 때만 추가 */
     hash_add_rcu(zcopy_ctx_hash, &new_ctx->node, (unsigned long)mm);
     spin_unlock(&zcopy_ctx_lock);
+
+    
+    ret = mmu_notifier_register(&new_ctx->mn, mm);
+    if (ret) {
+      spin_lock(&zcopy_ctx_lock);
+      hlist_del_init_rcu(&new_ctx->node);
+      spin_unlock(&zcopy_ctx_lock);
+      kfree_rcu(new_ctx, rcu);
+      return ret;
+    }
     //trace_printk("[zcopy_try_register] ZeroCopy: try_register: %px\n", new_ctx);
     return 0;
 }
