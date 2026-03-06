@@ -50,7 +50,7 @@
 #include <trace/events/tcp.h>
 /*----------------------------------------------------------------------------*/
 #define NVME_TCP_PDU_ALIGN 1
-#define DOFF_INCREASE (NVME_TCP_PDU_ALIGN && 0)
+#define DOFF_INCREASE (NVME_TCP_PDU_ALIGN && 1)
 #define NVME_TCP_DEBUG (NVME_TCP_PDU_ALIGN && 0)
 #if NVME_TCP_PDU_ALIGN
 /*----------------------------------------------------------------------------*/
@@ -1618,8 +1618,8 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 
 /*----------------------------------------------------------------------------*/
 #if DOFF_INCREASE
-	// if (sk->sk_l5_data && TCP_SKB_CB(skb)->has_l5_hdr) {
-	if (sk->sk_l5_data && (skb->len - tcp_header_size) % 512 == 24) {
+	// if (sk->sk_l5_data && TCP_SKB_CB(skb)->has_l5_hdr)
+	if (sk->sk_l5_data && (skb->len - tcp_header_size) % 512 == 24)
 		/* if it has PDU header, increase doff */
 		*(((__be16 *)th) + 6) = htons((((tcp_header_size + 24) >> 2) << 12) |
 						tcb->tcp_flags);
