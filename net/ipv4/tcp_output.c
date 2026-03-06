@@ -50,7 +50,7 @@
 #include <trace/events/tcp.h>
 /*----------------------------------------------------------------------------*/
 #define NVME_TCP_PDU_ALIGN 1
-#define DOFF_INCREASE (NVME_TCP_PDU_ALIGN && 1)
+#define DOFF_INCREASE (NVME_TCP_PDU_ALIGN && 0)
 #define NVME_TCP_DEBUG (NVME_TCP_PDU_ALIGN && 0)
 #if NVME_TCP_PDU_ALIGN
 /*----------------------------------------------------------------------------*/
@@ -153,18 +153,14 @@ nvme_tcp_destruct_shim(struct sock *sk)
  * return : moved byte count
  */
 static unsigned int
-pull_frags_into_head(struct sock *sk,
-                     struct sk_buff *head,
+pull_frags_into_head(struct sk_buff *head,
                      struct sk_buff *next,
-                     unsigned int need)
+                     unsigned int target)
 {
     struct skb_shared_info *h, *n;
 	skb_frag_t part, *src;
 	unsigned int h_nr, n_nr, cap, sz, moved_bytes, moved_frags, i;
-	unsigned int take;
-#if NVME_TCP_DEBUG
-	pr_info("%s [start]\n", __func__);
-#endif
+	unsigned int take, need = target - head->len;
 	if (!need)
 		return 0;
 
@@ -257,6 +253,7 @@ pull_frags_into_head(struct sock *sk,
     head->data_len += moved_bytes;
     head->len += moved_bytes;
     TCP_SKB_CB(head)->end_seq += moved_bytes;
+	head->truesize += moved_bytes;
 
     /* 3) Remove fully moved frags from next (shift remaining to front) */
     if (i) {
@@ -274,16 +271,7 @@ pull_frags_into_head(struct sock *sk,
     next->data_len -= moved_bytes;
     next->len -= moved_bytes;
     TCP_SKB_CB(next)->seq += moved_bytes;
-
-	/* 5) Free next if fully consumed */
-    // if (TCP_SKB_CB(next)->seq == TCP_SKB_CB(next)->end_seq) {
-	// 	tcp_unlink_write_queue(next, sk);
-	// 	tcp_wmem_free_skb(sk, next);
-	// 	/* 'next' is invalid beyond this point */
-    // }
-#if NVME_TCP_DEBUG
-	pr_info("%s [end]\n", __func__);
-#endif
+	next->truesize -= moved_bytes;
 
     return moved_bytes;
 }
@@ -1537,14 +1525,6 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	struct tcphdr *th;
 	u64 prior_wstamp;
 	int err;
-/*----------------------------------------------------------------------------*/
-// #if DOFF_INCREASE
-// 	const struct skb_shared_info *shinfo;
-// 	const skb_frag_t *f;
-// 	void *vaddr;
-// 	u16 *payload;
-// #endif
-/*----------------------------------------------------------------------------*/
 
 	BUG_ON(!skb || !tcp_skb_pcount(skb));
 	tp = tcp_sk(sk);
@@ -1620,16 +1600,6 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	skb_orphan(skb);
 	skb->sk = sk;
 	skb->destructor = skb_is_tcp_pure_ack(skb) ? __sock_wfree : tcp_wfree;
-/*----------------------------------------------------------------------------*/
-#if NVME_TCP_PDU_ALIGN
-	if (unlikely((int)sk->sk_wmem_alloc.refs.counter < 0 || skb->truesize > (1<<20))) {
-		pr_info("wmem old=%d add=%u skb=%p len=%u data_len=%u headlen=%u nr_frags=%u destruct=%ps\n",
-				refcount_read(&sk->sk_wmem_alloc), skb->truesize, skb,
-				skb->len, skb->data_len, skb_headlen(skb),
-				skb_shinfo(skb)->nr_frags, skb->destructor);
-	}
-#endif
-/*----------------------------------------------------------------------------*/
 	refcount_add(skb->truesize, &sk->sk_wmem_alloc);
 
 	skb_set_dst_pending_confirm(skb, READ_ONCE(sk->sk_dst_pending_confirm));
@@ -1648,31 +1618,11 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 
 /*----------------------------------------------------------------------------*/
 #if DOFF_INCREASE
-	if (sk->sk_l5_data) {
-		// if (TCP_SKB_CB(skb)->has_l5_hdr) {
-		if ((skb->len - tcp_header_size) % 512 == 24) {
-			// if (skb_headlen(skb) > tcp_header_size) {
-			// 	/* it should not happen */
-			// 	pr_info("[%s] nvme-tcp skb_headlen=%u, len=%u\n",
-			// 			__func__, skb_headlen(skb), skb->len - tcp_header_size);
-			// }
-			// shinfo = skb_shinfo(skb);
-			// f = &shinfo->frags[0];
-			// vaddr = kmap_local_page(skb_frag_page(f));
-			// payload = (u16 *)((u8 *)vaddr + skb_frag_off(f));
-			// if ((*payload == htons(0x0604)) || 
-			// 	(*payload == htons(0x060c)) ||
-			// 	(*payload == htons(0x0400)) || // for in-capsule data (capsule cmd)
-			// 	(*payload == htons(0x0704)) || 
-			// 	(*payload == htons(0x070c)) || 
-			// 	(*payload == htons(0x0500))) { /* nvme-tcp H2Cdata, C2Hdata, or CQE */
-				/* if it has PDU header, increase doff */
-				*(((__be16 *)th) + 6) = htons((((tcp_header_size + 24) >> 2) << 12) |
-								tcb->tcp_flags);
-			// }
-			// kunmap_local(vaddr);
-		}
-	}
+	// if (sk->sk_l5_data && TCP_SKB_CB(skb)->has_l5_hdr) {
+	if (sk->sk_l5_data && (skb->len - tcp_header_size) % 512 == 24) {
+		/* if it has PDU header, increase doff */
+		*(((__be16 *)th) + 6) = htons((((tcp_header_size + 24) >> 2) << 12) |
+						tcb->tcp_flags);
 #endif
 /*----------------------------------------------------------------------------*/
 
@@ -1901,11 +1851,11 @@ int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,
 /*----------------------------------------------------------------------------*/
 #if NVME_TCP_PDU_ALIGN
 	if (sk->sk_l5_data) {
-		// if (TCP_SKB_CB(skb)->has_l5_hdr)
-		if (skb->len % 512 == 24)
+		// if (TCP_SKB_CB(skb)->has_l5_hdr) {
+		if (skb->len % 512)
 			len = skb->len;
-		else
-			len = round_down(len, PAGE_SIZE * 2);
+		else if (skb->len > PAGE_SIZE)
+			len = round_down(len, PAGE_SIZE);
 	}
 #endif
 /*----------------------------------------------------------------------------*/
@@ -1966,7 +1916,7 @@ int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,
 #if NVME_TCP_PDU_ALIGN
 	/* if 8K page-aligned skb, set 8K TSO */
 	// if (sk->sk_l5_data && !TCP_SKB_CB(skb)->has_l5_hdr)
-	if (sk->sk_l5_data && !(skb->len % 512))
+	if (sk->sk_l5_data && !(skb->len % 512) && (skb->len > PAGE_SIZE * 2))
 		tcp_set_skb_tso_segs(skb, PAGE_SIZE * 2);
 	else
 #endif
@@ -2358,12 +2308,6 @@ static unsigned int tcp_mss_split_point(const struct sock *sk,
 					const struct sk_buff *skb,
 					unsigned int mss_now,
 					unsigned int max_segs,
-/*----------------------------------------------------------------------------*/
-#if NVME_TCP_PDU_ALIGN
-					bool *is_rwnd_limited,
-					bool *is_cwnd_limited,
-#endif
-/*----------------------------------------------------------------------------*/
 					int nonagle)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
@@ -2374,7 +2318,7 @@ static unsigned int tcp_mss_split_point(const struct sock *sk,
 	const struct inet_sock *inet;
 	struct sk_buff *next;
 	u32 target_len, cum_target_len;
-	unsigned int have, moved, more_pdu = 0;
+	bool more_pdu;
 	int diff;
 #endif
 /*----------------------------------------------------------------------------*/
@@ -2383,27 +2327,14 @@ static unsigned int tcp_mss_split_point(const struct sock *sk,
 	max_len = mss_now * max_segs;
 /*----------------------------------------------------------------------------*/
 #if NVME_TCP_PDU_ALIGN
-	if (sk->sk_l5_data)
-	{
-#if NVME_TCP_DEBUG
-		pr_info("%s [start]\n", __func__);
-#endif
-		inet = inet_sk(sk);
+	if (sk->sk_l5_data) {
 		l5_flow = (struct nvme_tcp_flow *)sk->sk_l5_data;
 		cum_target_len = 0;
 More_PDU:
 		diff = (TCP_SKB_CB(skb)->seq + cum_target_len) - l5_flow->pdu_start_seq;
-#if NVME_TCP_DEBUG
-		pr_info("[0] (%pI4:%u -> %pI4:%u) "
-				"pdu_start_seq=%u skb_seq=%u cum_target_len=%u skb_end_seq=%u diff=%d "
-				"headlen=%u pdu_len=%u offset=%u hdr_len=%u\n",
-				&inet->inet_saddr, inet->inet_num, &inet->inet_daddr, ntohs(inet->inet_dport),
-				l5_flow->pdu_start_seq, TCP_SKB_CB(skb)->seq, cum_target_len, TCP_SKB_CB(skb)->end_seq, diff,
-				skb_headlen(skb), l5_flow->pdu_len, l5_flow->offset_on_pdu, l5_flow->pdu_hdr_len);
-#endif
-		/* only log abnormal cases */
-		if (diff < 0)
-		{
+		/* log abnormal cases */
+		if (diff < 0) {
+			inet = inet_sk(sk);
 			pr_info("[-1] (%pI4:%u -> %pI4:%u) "
 					"skb_seq is before current PDU, "
 					"pdu_start_seq=%u skb_seq=%u cum_target_len=%u skb_end_seq=%u diff=%d "
@@ -2414,23 +2345,16 @@ More_PDU:
 			/* this packet starts before current PDU */
 			return cum_target_len;
 		}
+
 		/* check whether found NVMe/TCP header start point */
 		if (!diff) {
-			/* parse NVMe/TCP header */
-			if (!nvmetcp_peek_hdr(sk, skb, &l5_flow->pdu_hdr_len, &l5_flow->pdu_len)) {
-#if NVME_TCP_DEBUG
-				pr_info("[1] (%pI4:%u -> %pI4:%u) "
-						"not enough NVMe/TCP header, "
-						"l5_flow->pdu_start_seq: %u\n",
-						&inet->inet_saddr, inet->inet_num, &inet->inet_daddr, ntohs(inet->inet_dport),
-						l5_flow->pdu_start_seq);
-				skb_dump(KERN_WARNING, skb, 1);
-#endif
+			/* if so, parse NVMe/TCP header */
+			if (!nvmetcp_peek_hdr(sk, skb, &l5_flow->pdu_hdr_len, &l5_flow->pdu_len))
 				return cum_target_len; /* header fields not ready */
-			}
 		}
+
 		/* get target len */
-		more_pdu = 0;
+		more_pdu = false;
 		target_len = l5_flow->pdu_len - (l5_flow->offset_on_pdu + cum_target_len);
 		/* check if remaining pdu_len is larger than iMTU */
 		if (target_len > (PAGE_SIZE * 2 + l5_flow->pdu_hdr_len)) {
@@ -2439,78 +2363,33 @@ More_PDU:
 			if (l5_flow->offset_on_pdu == 0)
 				target_len += l5_flow->pdu_hdr_len;
 			else 
-				more_pdu = 1;
+				more_pdu = true;
 		}
 
 		/* check if target_len exceeds rwnd or cwnd */
-		if ((cum_target_len + target_len) > window) {
-			*is_rwnd_limited = true;
+		if ((cum_target_len + target_len) > max_t(u32, window, max_len))
 			return cum_target_len;
-		}
-		if ((cum_target_len + target_len) > max_len) {
-			*is_cwnd_limited = true;
-			return cum_target_len;
-		}
-		if ((cum_target_len + target_len) > skb->len) {
-			/* check whether we can pull data from next skb(s) */
-			if (skb == tcp_write_queue_tail(sk)) {
-#if NVME_TCP_DEBUG
-				pr_info("[2] (%pI4:%u -> %pI4:%u) "
-						"not enough block data, "
-						"cum_target_len=%u, target_len=%u, have=%u\n",
-						&inet->inet_saddr, inet->inet_num, &inet->inet_daddr, ntohs(inet->inet_dport),
-						cum_target_len, target_len, skb->len);
-#endif
+
+		/* check whether we can pull data from next skb(s) */
+		while ((cum_target_len + target_len) > skb->len) {
+			if (skb == tcp_write_queue_tail(sk))
 				return cum_target_len;
-			}
-
-			/* try to pull data from next skb(s) */
-			have = skb->len;
-			while (have < (cum_target_len + target_len)) {
-				/* No next skb: skb is last in write queue */
-				if (skb == tcp_write_queue_tail(sk))
-					break;
-
-				next = skb_queue_next(&sk->sk_write_queue, skb);
-
-				/* check orphan skbs */
-				if (unlikely(skb->destructor || next->destructor)) {
-					pr_info("[3] (%pI4:%u -> %pI4:%u) "
-							"skip merge: head=%p destruct=%ps len=%u data_len=%u headlen=%u nr=%u "
-							"next=%p destruct=%ps len=%u data_len=%u headlen=%u nr=%u\n",
-							&inet->inet_saddr, inet->inet_num, &inet->inet_daddr, ntohs(inet->inet_dport),
-							skb, skb->destructor, skb->len, skb->data_len, skb_headlen(skb), skb_shinfo(skb)->nr_frags,
-							next, next->destructor, next->len, next->data_len, skb_headlen(next), skb_shinfo(next)->nr_frags);
-					break;
-				}
-
-				moved = pull_frags_into_head((struct sock *)sk,
-											 (struct sk_buff *)skb,
-											 next,
-											 (cum_target_len + target_len) - have);
-				if (!moved)
-					break;
-				have += moved;
-				/* do NOT follow 'next' pointer */
-			}
-			if (have < (cum_target_len + target_len)) {
-#if NVME_TCP_DEBUG
-				pr_info("[4] (%pI4:%u -> %pI4:%u) "
-						"still not enough data, "
-						"cum_target_len=%u, target_len=%u, have=%u\n",
-						&inet->inet_saddr, inet->inet_num, &inet->inet_daddr, ntohs(inet->inet_dport),
-						cum_target_len, target_len, have);
-#endif
+			next = skb_queue_next(&sk->sk_write_queue, skb);
+			if (!pull_frags_into_head((struct sk_buff *)skb, next,
+									  cum_target_len + target_len))
 				return cum_target_len;
+
+			/* free next if fully consumed */
+			if (TCP_SKB_CB(next)->seq == TCP_SKB_CB(next)->end_seq) {
+				tcp_unlink_write_queue(next, (struct sock *)sk);
+				tcp_wmem_free_skb((struct sock *)sk, next);
 			}
 		}
+
+		/* accumulate and try more if needed */
 		cum_target_len += target_len;
-
 		if (more_pdu)
 			goto More_PDU;
-#if NVME_TCP_DEBUG
-		pr_info("%s [end]\n", __func__);
-#endif
 
 		return cum_target_len;
 	}
@@ -3228,11 +3107,9 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		int missing_bytes;
 /*----------------------------------------------------------------------------*/
 #if NVME_TCP_PDU_ALIGN
-		if (is_nvme_tcp(sk))
-		{
+		if (is_nvme_tcp(sk)) {
 			l5_flow = (struct nvme_tcp_flow *)sk->sk_l5_data;
-			if (!l5_flow)
-			{
+			if (!l5_flow) {
 				sk->sk_l5_data = kzalloc(sizeof(struct nvme_tcp_flow), GFP_ATOMIC);
 				l5_flow = (struct nvme_tcp_flow *)sk->sk_l5_data;
 				if (!l5_flow) {
@@ -3255,7 +3132,6 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 				pr_info("[%s] flow allocated isn=%u pdu_start_seq=%u\n",
 						__func__, l5_flow->isn, l5_flow->pdu_start_seq);
 			}
-			limit = 0;
 		}
 #endif
 /*----------------------------------------------------------------------------*/
@@ -3308,35 +3184,24 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 /*----------------------------------------------------------------------------*/
 #if NVME_TCP_PDU_ALIGN
 		if (l5_flow || (tso_segs > 1 && !tcp_urg_mode(tp)))
-			limit = tcp_mss_split_point(sk, skb, mss_now,
-						    min_t(unsigned int,
-							  cwnd_quota,
-							  max_segs),
-							&is_rwnd_limited,
-							&is_cwnd_limited,
-						    nonagle);
 #else
-/*----------------------------------------------------------------------------*/
 		if (tso_segs > 1 && !tcp_urg_mode(tp))
-			limit = tcp_mss_split_point(sk, skb, mss_now,
-						    cwnd_quota,
-						    nonagle);
-/*----------------------------------------------------------------------------*/
 #endif
+/*----------------------------------------------------------------------------*/
+			limit = tcp_mss_split_point(sk, skb, mss_now,
+										cwnd_quota,
+										nonagle);
+/*----------------------------------------------------------------------------*/
 #if NVME_TCP_PDU_ALIGN
 		if (!limit)
 			break;
 		if (l5_flow && l5_flow->offset_on_pdu) {
 			/* enable TSO with segsz of PAGE_SIZE * 2 */
 			if (skb->len > limit &&
-				unlikely(tso_fragment(sk, skb, limit, PAGE_SIZE * 2, gfp))) {
-				pr_info("[%s] tso_fragment failed\n", __func__);
+				unlikely(tso_fragment(sk, skb, limit, PAGE_SIZE * 2, gfp)))
 				break;
-			}
-			/* TSO for PAGE_SIZE * 2 sub-PDUs */
 			if (skb->len == limit)
 				tcp_set_skb_tso_segs(skb, PAGE_SIZE * 2);
-			goto Skip_tsq;
 		}
 		else
 #endif
@@ -3349,11 +3214,6 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		if (tcp_small_queue_check(sk, skb, 0))
 			break;
 
-/*----------------------------------------------------------------------------*/
-#if NVME_TCP_PDU_ALIGN
-Skip_tsq:
-#endif
-/*----------------------------------------------------------------------------*/
 		/* Argh, we hit an empty skb(), presumably a thread
 		 * is sleeping in sendmsg()/sk_stream_wait_memory().
 		 * We do not want to send a pure-ack packet and have
@@ -3361,17 +3221,6 @@ Skip_tsq:
 		 */
 		if (TCP_SKB_CB(skb)->end_seq == TCP_SKB_CB(skb)->seq)
 			break;
-
-/*----------------------------------------------------------------------------*/
-#if NVME_TCP_PDU_ALIGN
-		if (unlikely(skb->len > 200000 || skb->data_len > 200000 ||
-					 skb_shinfo(skb)->nr_frags > MAX_SKB_FRAGS)) {
-			pr_info("BAD skb: len=%u data_len=%u headlen=%u nr_frags=%u truesize=%u destructor=%ps\n",
-					skb->len, skb->data_len, skb_headlen(skb),
-					skb_shinfo(skb)->nr_frags, skb->truesize, skb->destructor);
-		}
-#endif
-/*----------------------------------------------------------------------------*/
 
 		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
 			break;
@@ -3940,7 +3789,7 @@ start:
 /*----------------------------------------------------------------------------*/
 #if NVME_TCP_PDU_ALIGN
 		// if (sk->sk_l5_data && !TCP_SKB_CB(skb)->has_l5_hdr)
-		if (sk->sk_l5_data && !(skb->len % 512))
+		if (sk->sk_l5_data && !(skb->len % 512) && (skb->len > PAGE_SIZE * 2))
 			tcp_set_skb_tso_segs(skb, PAGE_SIZE * 2);
 		else
 #endif
