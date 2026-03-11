@@ -1525,6 +1525,12 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	struct tcphdr *th;
 	u64 prior_wstamp;
 	int err;
+#if DOFF_INCREASE
+	const struct skb_shared_info *shinfo;
+	const skb_frag_t *f;
+	void *vaddr;
+	u16 *payload;
+#endif
 
 	BUG_ON(!skb || !tcp_skb_pcount(skb));
 	tp = tcp_sk(sk);
@@ -1617,12 +1623,38 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	th->urg_ptr		= 0;
 
 /*----------------------------------------------------------------------------*/
+// #if DOFF_INCREASE
+// 	// if (sk->sk_l5_data && TCP_SKB_CB(skb)->has_l5_hdr)
+// 	if (sk->sk_l5_data && (skb->len - tcp_header_size) % 512 == 24)
+// 		/* if it has PDU header, increase doff */
+// 		*(((__be16 *)th) + 6) = htons((((tcp_header_size + 24) >> 2) << 12) |
+// 						tcb->tcp_flags);
+// #endif
 #if DOFF_INCREASE
-	// if (sk->sk_l5_data && TCP_SKB_CB(skb)->has_l5_hdr)
-	if (sk->sk_l5_data && (skb->len - tcp_header_size) % 512 == 24)
-		/* if it has PDU header, increase doff */
-		*(((__be16 *)th) + 6) = htons((((tcp_header_size + 24) >> 2) << 12) |
-						tcb->tcp_flags);
+	if (sk->sk_l5_data) {
+		if ((skb->len - tcp_header_size) % 512 == 24) {
+			/* ToDo: make it more strict */
+			if (skb_headlen(skb) > tcp_header_size) {
+				/* it should not happen */
+				pr_info("[__tcp_transmit_skb] nvme-tcp skb_headlen=%u, len=%u\n",
+					skb_headlen(skb), skb->len - tcp_header_size);
+			}
+			shinfo = skb_shinfo(skb);
+			f = &shinfo->frags[0];
+			vaddr = kmap_local_page(skb_frag_page(f));
+			payload = (u16 *)((u8 *)vaddr + skb_frag_off(f));
+			if ((*payload == htons(0x0704)) || 
+				(*payload == htons(0x070c)) ||
+				(*payload == htons(0x0604)) || 
+				(*payload == htons(0x060c))) { /* nvme-tcp C2Hdata or H2Cdata */
+				// pr_info("[__tcp_transmit_skb] found C2HData or CQE, len=%u\n", skb->len - tcp_header_size);
+				/* if it has PDU header, increase doff */
+				*(((__be16 *)th) + 6) = htons((((tcp_header_size + 24) >> 2) << 12) |
+								tcb->tcp_flags);
+			}
+			kunmap_local(vaddr);
+		}
+	}
 #endif
 /*----------------------------------------------------------------------------*/
 
@@ -3132,6 +3164,7 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 				pr_info("[%s] flow allocated isn=%u pdu_start_seq=%u\n",
 						__func__, l5_flow->isn, l5_flow->pdu_start_seq);
 			}
+			limit = 0;
 		}
 #endif
 /*----------------------------------------------------------------------------*/
