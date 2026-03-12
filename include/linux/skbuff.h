@@ -3910,6 +3910,21 @@ static inline int pskb_trim_rcsum(struct sk_buff *skb, unsigned int len)
 {
 	if (likely(len >= skb->len))
 		return 0;
+
+	/*------------------------------------------------------------*/
+	unsigned int real_len = skb->len - skb_network_offset(skb);
+	if (real_len > 0xFFFF) {
+		pr_info("TRIM overflow skb: skb->len=%u target=%u noff=%u "
+		        "gso_segs=%u gso_size=%u gso_type=0x%x\n",
+		        skb->len,
+		        len,
+		        skb_network_offset(skb),
+		        skb_shinfo(skb)->gso_segs,
+		        skb_shinfo(skb)->gso_size,
+		        skb_shinfo(skb)->gso_type);
+	}
+	/*------------------------------------------------------------*/
+
 	return pskb_trim_rcsum_slow(skb, len);
 }
 

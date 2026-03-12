@@ -1322,8 +1322,11 @@ static void mlx5e_shampo_update_hdr(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
 
 	if (is_ipv4) {
 		int nhoff = rq->hw_gro_data->fk.control.thoff - sizeof(struct iphdr);
+	/*------------------------------------------------------------*/
 		struct iphdr *ipv4 = (struct iphdr *)(skb->data + nhoff);
-		__be16 newlen = htons(skb->len - nhoff);
+		// __be16 newlen = htons(skb->len - nhoff);
+		__be16 newlen = ((skb->len - nhoff) > 0xFFFF) ? 0 : htons(skb->len - nhoff);
+	/*------------------------------------------------------------*/
 
 		csum_replace2(&ipv4->check, ipv4->tot_len, newlen);
 		ipv4->tot_len = newlen;
@@ -2262,6 +2265,7 @@ mlx5e_shampo_flush_skb(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe, bool match)
 	} else {
 		skb_shinfo(skb)->gso_size = 0;
 	}
+
 	napi_gro_receive(rq->cq.napi, skb);
 	rq->hw_gro_data->skb = NULL;
 }
@@ -2378,11 +2382,13 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 		
 		// syeon
 		if (head_size == rx_zcopy_head_size) {
-			if (!zc_rollback_tcp_doff_24B(*skb)) {
+			u8 * th_off = (*skb)->data + 14 + 20 +12;
+			*th_off = (*th_off & 0x0F) | (8 << 4);
+			/*if (!zc_rollback_tcp_doff_24B(*skb)) {
 				pr_info("[mlx5e_zcopy] zc_rollback_tcp_doff_24B failed - choose another method\n");
 				u8 * th_off = (*skb)->data + 14 + 20 +12;
 				*th_off = (*th_off & 0x0F) | (8 << 4);
-			}
+			}*/
 		}
 
 		if (head_size == rx_zcopy_head_size) {

@@ -31,17 +31,20 @@ static inline struct iphdr *ipip_hdr(const struct sk_buff *skb)
 	return (struct iphdr *)skb_transport_header(skb);
 }
 
-static inline unsigned int ip_transport_len(const struct sk_buff *skb)
-{
-	return ntohs(ip_hdr(skb)->tot_len) - skb_network_header_len(skb);
-}
-
 static inline unsigned int iph_totlen(const struct sk_buff *skb, const struct iphdr *iph)
 {
 	u32 len = ntohs(iph->tot_len);
 
 	return (len || !skb_is_gso(skb) || !skb_is_gso_tcp(skb)) ?
 	       len : skb->len - skb_network_offset(skb);
+}
+
+static inline unsigned int ip_transport_len(const struct sk_buff *skb)
+{
+	/*------------------------------------------------------------*/
+	// return ntohs(ip_hdr(skb)->tot_len) - skb_network_header_len(skb);
+	return iph_totlen(skb, ip_hdr(skb)) - skb_network_header_len(skb);
+	/*------------------------------------------------------------*/
 }
 
 static inline unsigned int skb_ip_totlen(const struct sk_buff *skb)

@@ -18,6 +18,7 @@ struct zc_skb_cursor {
 	int frag;               /* 현재 skb에서 다음으로 볼 frag index */
 };
 
+void set_zc_data_frozen(struct msghdr *msg);
 bool can_zerocopy(struct sock *sk, struct msghdr *msg);
 __always_inline bool is_pp_page(struct page *page);
 size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_t used, struct sock *sk);

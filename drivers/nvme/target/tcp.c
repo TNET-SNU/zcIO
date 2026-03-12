@@ -421,7 +421,7 @@ static int cleanup_zc_pages(struct nvmet_tcp_cmd *cmd)
 #define ZC_PG_MASK (ZC_PG_SZ - 1)
 
 static bool nvmet_tcp_zc_precheck(struct nvmet_tcp_queue *queue, struct nvmet_tcp_cmd *cmd, u32 data_offset, u32 pdu_len){
-	cmd->zc_policy = ZC_DISABLED;
+	//cmd->zc_policy = ZC_DISABLED;
 	cmd->zc_reason = ZCR_OK;
 
 	if (cmd->zc_policy == ZC_ENABLED){
@@ -485,20 +485,23 @@ static bool nvmet_tcp_zc_precheck(struct nvmet_tcp_queue *queue, struct nvmet_tc
 	}
 
 	//pr_info("[nvmet_tcp_zc_precheck] zc_policy: ZC_ENABLED\n");
-	cmd->zc_policy = ZC_ENABLED;
-	cmd->zc_total_page_count = 0;
+	if (data_offset  == 0 )
+	{
+		cmd->zc_policy = ZC_ENABLED;
+		cmd->zc_total_page_count = 0;
 
-	cmd->old_page_count = 0;
-	cmd->old_pages[0] = NULL;
+		cmd->old_page_count = 0;
+		cmd->old_pages[0] = NULL;
 
-	cmd->zc_data.page_count = 0;
-	cmd->recv_msg.msg_control = &cmd->zc_data;
-	cmd->zc_data.page[0] = NULL;
-	cmd->recv_msg.msg_controllen = sizeof(cmd->zc_data);
+		cmd->zc_data.page_count = 0;
+		cmd->recv_msg.msg_control = &cmd->zc_data;
+		cmd->zc_data.page[0] = NULL;
+		cmd->recv_msg.msg_controllen = sizeof(cmd->zc_data);
+    }
 	return true;
 
 error:
-	pr_info("[nvmet_tcp_zc_precheck] zc_reason: %d\n", cmd->zc_reason);
+	//pr_info("[nvmet_tcp_zc_precheck] zc_reason: %d\n", cmd->zc_reason);
 	return false;
 }
 
@@ -1249,7 +1252,7 @@ static int nvmet_tcp_handle_h2c_data_pdu(struct nvmet_tcp_queue *queue)
 	//syeon
 	bool zc_enabled = nvmet_tcp_zc_precheck(queue, cmd, le32_to_cpu(data->data_offset), cmd->pdu_len);
     if (!zc_enabled) {
-		pr_info("[cmd: %p] zc_enabled: %d, zc_reason: %d\n", cmd, zc_enabled, cmd->zc_reason);
+		//pr_info("[cmd: %p] zc_enabled: %d, zc_reason: %d\n", cmd, zc_enabled, cmd->zc_reason);
 	}
 
 	nvmet_tcp_build_pdu_iovec(cmd);
@@ -1514,7 +1517,6 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
 		nvmet_tcp_prep_recv_ddgst(cmd);
 		return 0;
 	}
-
 	
 	if (cmd->rbytes_done == cmd->req.transfer_len){
 		if (cmd->zc_policy == ZC_ENABLED) {

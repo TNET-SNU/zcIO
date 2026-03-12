@@ -2510,19 +2510,13 @@ found_ok_skb:
 		}
 
 		if (!(flags & MSG_TRUNC)) {
-			// syeon
 			if (can_zerocopy(sk, msg)) {
-				//pr_info("[tcp_recvmsg_locked] start zc, used: %ld, offset: %d\n", used, offset);	
 				size_t done = 0;
 				size_t zc_done = do_zerocopy(skb, offset, msg, used, sk);
 				done += zc_done;
 
 				// copy the rest of the data
 				if (zc_done < used) {
-//					pr_info("[tcp_recvmsg_locked] used is not 4k aligned, used: %zu, zc_done: %zu\n", used, zc_done);
-
-//					used = zc_done;
-		//		}
 					pr_info("[tcp_recvmsg_locked] fallback to copy rest of the data, zc_done: %zu, offset: %zu, copy data size: %zu, len: %zu\n", zc_done, offset + zc_done, used - zc_done, len);
 					err = skb_copy_datagram_msg(skb, offset + zc_done, msg, used - zc_done);
 					if (err) {
@@ -2530,6 +2524,8 @@ found_ok_skb:
 							copied = -EFAULT;
 						break;
 					}
+					// freeze the zc_data to prevent further zerocopy of rest of the data in this cmd 
+					set_zc_data_frozen(msg);
 					done += used - zc_done;
 				}
 				if (done != used) {

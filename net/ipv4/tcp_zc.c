@@ -11,7 +11,10 @@ EXPORT_SYMBOL(enable_zerocopy);
 module_param(enable_zerocopy, bool, 0644);
 MODULE_PARM_DESC(enable_zerocopy, "enable zcopy");
 
-
+void set_zc_data_frozen(struct msghdr *msg){
+	struct zc_data *zc_data = (struct zc_data *)msg->msg_control;
+	zc_data->frozen = true;
+}
 bool can_zerocopy(struct sock *sk, struct msghdr *msg){
 	struct inet_sock *inet = inet_sk(sk);
 	if ((inet->inet_num) != 4420){
@@ -29,6 +32,11 @@ bool can_zerocopy(struct sock *sk, struct msghdr *msg){
 	NVMET_TCP_MAGIC){
 		pr_info("[can_zerocopy] not nvmet_tcp_magic\n");
         return false;
+	}
+
+	if (((struct zc_data *)msg->msg_control)->frozen){
+		pr_info("[can_zerocopy] frozen\n");
+		return false;
 	}
 
     return true;
@@ -201,10 +209,12 @@ static void tcp_zc_store_4k_frag_page(struct msghdr *msg, struct page *newp)
     // do i have to free old page of bvec?
 	bvec_curr->bv_page = newp;
 	if (zc_data && zc_data->page_count < ZC_DATA_MAX_PAGES){
-		//pr_info("[tcp_zc_store_4k_frag_page] store page to zc_data, page_count: %zu, new page: %px, page ref count: %d, page_pool ref count: %zu\n", zc_data->page_count, newp, page_ref_count(newp), atomic_long_read(&newp->pp_ref_count));
 		
 		zc_data->page[zc_data->page_count] = newp;
 		zc_data->page_count++;
+	}
+	else {
+		pr_info("[tcp_zc_store_4k_frag_page] zc_data is full or not initialized, page_count: %zu, new page: %px\n", zc_data->page_count, newp);
 	}
 	return;
 }
@@ -219,7 +229,6 @@ static int zc_find_page_stateless(struct sk_buff *root_skb,
                                   struct sk_buff **out_skb,
                                   int *out_frag_idx)
 {
-    /* [질문하신 변수 선언] curr는 현재 검사 중인 skb를 가리킴 */
     struct sk_buff *curr = root_skb;
     struct skb_shared_info *si;
     int i;
@@ -246,7 +255,6 @@ static int zc_find_page_stateless(struct sk_buff *root_skb,
             unsigned int len = skb_frag_size(frag);
 
             if (offset < len) {
-                // Bingo! 위치 찾음. 
                 // (단, offset이 0이고 4K 정렬된 경우만 성공)
                 if (offset == 0 && likely(zc_is_full_4k_page_frag(frag))) {
                     *out_skb = curr;      // 현재 보고 있는 그 SKB
@@ -259,7 +267,7 @@ static int zc_find_page_stateless(struct sk_buff *root_skb,
             offset -= len; // 다음 frag 검사를 위해 뺌
         }
 
-        /* --- 3. 다음 SKB로 이동 로직 (질문하신 부분) --- */
+        /* --- 3. 다음 SKB로 이동 로직 --- */
         if (curr == root_skb) {
             /* * 맨 처음(Head)이었다면, 이제 꼬리(frag_list)로 진입!
              * frag_list가 없으면(NULL) 루프 종료.
@@ -285,24 +293,20 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_
     struct sk_buff *owner = NULL;
     int frag_index = -1;
 
-	//pr_info("[do_zerocopy] iter: %px\n", iter);
 	if (!iov_iter_is_bvec(iter)){
 		pr_info("[do_zerocopy] not bvec\n");
 		return 0;
 	}
 
 	//want 4K 배수만 처리
-    //size_t total_size = iov_iter_count(iter);
-	//size_t avail = min_t(size_t, total_size, used);
 	size_t avail = used;
     size_t want = avail & ~((size_t)ZC_PG_MASK);
     if (!want){
 		pr_info("want is %zu real data size: %zu out of length :%zu\n",want, used, iov_iter_count(iter));
         return 0;
 	}
-  //  pr_info("[do_zerocopy] available: %zu / %zu -- real data size: %zu\n", avail, total_size, want);
+
 	while (want >= ZC_PG_SZ) {
-	//	pr_info("----> want: %zu\n", want);
 		skb_frag_t *frag;
 		struct page *newp;
 		
@@ -312,34 +316,24 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_
             return done;
 		}
 
+		// find 4K frag
         if (zc_find_page_stateless(skb, offset + done, &owner, &frag_index)){
 			skb_dump(KERN_INFO, skb, true);
-            pr_info("failed to find 4K frag, offset: %zu, done: %zu\n", offset + done, done);
             return done;
         }
 
 		frag = &skb_shinfo(owner)->frags[frag_index];
-		// check frag's alignment
-	//	pr_info("[do_zerocopy] frag index : %d, size : %d, off : %d\n", frag_index, skb_frag_size(frag), skb_frag_off(frag));
-		/* clean 4K frag만 */
-        if (skb_frag_size(frag) != ZC_PG_SZ)
-            break;
-        if (skb_frag_off(frag) != 0)
-            break;
-
         newp = skb_frag_page(frag);
         if (!newp)
             break;
 
-		// swap 4K frag
+		// store 4K frag page to zc_data for further zerocopy
         tcp_zc_store_4k_frag_page(msg, newp);
 
 		iov_iter_advance(iter, ZC_PG_SZ);
         done += ZC_PG_SZ;
         want -= ZC_PG_SZ;
-        //idx++;
     }
-	//pr_info("[do_zerocopy] done : %zu\n", done);
 	return done;
 }
 

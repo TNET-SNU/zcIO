@@ -15,6 +15,7 @@ enum zc_policy {
 enum zc_reason {
 	ZCR_OK = 0,
 	ZCR_GLOB_OFF,
+	ZCR_FROZEN,
 	ZCR_NOT_WRITE,
 	ZCR_INLINE,
 	ZCR_PDU_LEN_NOT_4K,
@@ -30,6 +31,7 @@ enum zc_reason {
 struct zc_data {
 	struct page *page[ZC_DATA_MAX_PAGES];
 	size_t page_count;
+	bool frozen;
 };
 
 #endif
