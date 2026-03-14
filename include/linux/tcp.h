@@ -13,6 +13,10 @@
 #ifndef _LINUX_TCP_H
 #define _LINUX_TCP_H
 
+/*----------------------------------------------------------------------------*/
+#define NVME_PDU_ALIGN 1
+#define NVME_DEBUG (NVME_PDU_ALIGN && 0)
+/*----------------------------------------------------------------------------*/
 
 #include <linux/skbuff.h>
 #include <linux/win_minmax.h>
@@ -501,6 +505,11 @@ struct tcp_sock {
 	 */
 	struct request_sock __rcu *fastopen_rsk;
 	struct saved_syn *saved_syn;
+/*----------------------------------------------------------------------------*/
+#if NVME_PDU_ALIGN
+	void 			*nvme_flow; /* Layer 5 protocol data */
+#endif
+/*----------------------------------------------------------------------------*/
 };
 
 enum tsq_enum {

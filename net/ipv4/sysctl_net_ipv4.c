@@ -1573,6 +1573,17 @@ static struct ctl_table ipv4_net_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ONE,
 	},
+/*----------------------------------------------------------------------------*/
+#if NVME_PDU_ALIGN
+	{
+        .procname       = "nvme_pdu_align",
+        .data           = &sysctl_nvme_pdu_align,
+        .maxlen         = sizeof(int),
+        .mode           = 0644,
+        .proc_handler   = proc_dointvec,
+    },
+#endif
+/*----------------------------------------------------------------------------*/
 };
 
 static __net_init int ipv4_sysctl_init_net(struct net *net)
