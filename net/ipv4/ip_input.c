@@ -513,22 +513,23 @@ static struct sk_buff *ip_rcv_core(struct sk_buff *skb, struct net *net)
 
 	len = iph_totlen(skb, iph);
 		
-	/*------------------------------------------------------------*/
-	unsigned int real_len = skb->len - skb_network_offset(skb);
-	if (real_len > 0xFFFF &&
-		(!skb_is_gso(skb) || !skb_is_gso_tcp(skb) || len != real_len)) {
-		pr_info("ip_rcv_core overflow: skb->len=%u real_len=%u tot_len=%u "
-				"gso_segs=%u gso_size=%u gso_type=0x%x is_gso=%d is_gso_tcp=%d\n",
-				skb->len,
-				real_len,
-				ntohs(iph->tot_len),
-				skb_shinfo(skb)->gso_segs,
-				skb_shinfo(skb)->gso_size,
-				skb_shinfo(skb)->gso_type,
-				skb_is_gso(skb),
-				skb_is_gso_tcp(skb));
-	}
-	/*------------------------------------------------------------*/
+	// /*------------------------------------------------------------*/
+	// // NVME_TCP_PDU_ALIGN
+	// unsigned int real_len = skb->len - skb_network_offset(skb);
+	// if (real_len > 0xFFFF &&
+	// 	(!skb_is_gso(skb) || !skb_is_gso_tcp(skb) || len != real_len)) {
+	// 	pr_info("ip_rcv_core overflow: skb->len=%u real_len=%u tot_len=%u "
+	// 			"gso_segs=%u gso_size=%u gso_type=0x%x is_gso=%d is_gso_tcp=%d\n",
+	// 			skb->len,
+	// 			real_len,
+	// 			ntohs(iph->tot_len),
+	// 			skb_shinfo(skb)->gso_segs,
+	// 			skb_shinfo(skb)->gso_size,
+	// 			skb_shinfo(skb)->gso_type,
+	// 			skb_is_gso(skb),
+	// 			skb_is_gso_tcp(skb));
+	// }
+	// /*------------------------------------------------------------*/
 
 	if (skb->len < len) {
 		drop_reason = SKB_DROP_REASON_PKT_TOO_SMALL;

@@ -19,7 +19,7 @@ struct zc_skb_cursor {
 };
 
 void set_zc_data_frozen(struct msghdr *msg);
-bool can_zerocopy(struct sock *sk, struct msghdr *msg);
+bool can_zerocopy(struct sock *sk, struct msghdr *msg, size_t len);
 __always_inline bool is_pp_page(struct page *page);
 size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_t used, struct sock *sk);
 #endif /* _TCP_ZC_H */

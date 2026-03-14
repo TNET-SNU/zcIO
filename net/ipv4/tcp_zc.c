@@ -11,11 +11,21 @@ EXPORT_SYMBOL(enable_zerocopy);
 module_param(enable_zerocopy, bool, 0644);
 MODULE_PARM_DESC(enable_zerocopy, "enable zcopy");
 
+bool is_zc_first = true;
+EXPORT_SYMBOL(is_zc_first);
+
+int fallback_count = 0;
+EXPORT_SYMBOL(fallback_count);
+
+struct iov_iter *prev_iov_iter = NULL;
+EXPORT_SYMBOL(prev_iov_iter);
+
+
 void set_zc_data_frozen(struct msghdr *msg){
 	struct zc_data *zc_data = (struct zc_data *)msg->msg_control;
 	zc_data->frozen = true;
 }
-bool can_zerocopy(struct sock *sk, struct msghdr *msg){
+bool can_zerocopy(struct sock *sk, struct msghdr *msg, size_t len){
 	struct inet_sock *inet = inet_sk(sk);
 	if ((inet->inet_num) != 4420){
 		return false;
@@ -27,6 +37,8 @@ bool can_zerocopy(struct sock *sk, struct msghdr *msg){
 	//	pr_info("[can_zerocopy] not bvec\n");
         return false;
 	}
+	// check if msg_iter is page size aligned
+
 
     if (!sk->sk_user_data || *(u32 *)sk->sk_user_data != 
 	NVMET_TCP_MAGIC){
@@ -34,9 +46,12 @@ bool can_zerocopy(struct sock *sk, struct msghdr *msg){
         return false;
 	}
 
-	if (((struct zc_data *)msg->msg_control)->frozen){
-		pr_info("[can_zerocopy] frozen\n");
-		return false;
+
+	if (msg->msg_control){
+		if (!((struct zc_data *)msg->msg_control)->zc_policy){
+			pr_info("[can_zerocopy] zc_policy is not enabled\n");
+			return false;
+		}
 	}
 
     return true;
@@ -198,24 +213,31 @@ static void tcp_zc_store_4k_frag_page(struct msghdr *msg, struct page *newp)
 	struct bio_vec *bvec_curr = (struct bio_vec *)iter->bvec;
 	struct zc_data *zc_data = (struct zc_data *)msg->msg_control;
 
+	if (!bvec_curr){
+		pr_info("bvec_curr is NULL\n");
+		return;
+	}
+	if (!zc_data){
+		pr_info("zc_data is NULL\n");
+		return;
+	}
+	
+	if (zc_data->page_count >= ZC_DATA_MAX_PAGES){
+		pr_info("zc_data is full\n");
+		return;
+	}
+	
 	if (!get_page_unless_zero(newp)){
 		pr_info("failed to get newp\n");
 		return ;
 	}
 	page_pool_ref_page(newp);
-
-
-	//sg_set_page(sg, newp, sg->length, sg->offset);
-    // do i have to free old page of bvec?
+	
 	bvec_curr->bv_page = newp;
-	if (zc_data && zc_data->page_count < ZC_DATA_MAX_PAGES){
-		
-		zc_data->page[zc_data->page_count] = newp;
-		zc_data->page_count++;
-	}
-	else {
-		pr_info("[tcp_zc_store_4k_frag_page] zc_data is full or not initialized, page_count: %zu, new page: %px\n", zc_data->page_count, newp);
-	}
+
+	zc_data->page[zc_data->page_count] = newp;
+	zc_data->page_count++;
+	//pr_info("[store_4k_frag_page] page index: %zu, new page: %px\n", zc_data->page_count, newp);
 	return;
 }
 
@@ -287,6 +309,7 @@ static int zc_find_page_stateless(struct sk_buff *root_skb,
     return -ENOENT; // 끝까지 뒤져도 없음
 }
 
+
 size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_t used, struct sock *sk){
 	struct iov_iter *iter = &msg->msg_iter;
 	size_t done = 0;
@@ -302,7 +325,8 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_
 	size_t avail = used;
     size_t want = avail & ~((size_t)ZC_PG_MASK);
     if (!want){
-		pr_info("want is %zu real data size: %zu out of length :%zu\n",want, used, iov_iter_count(iter));
+		//pr_info("want is %zu real data size: %zu out of length :%zu\n",want, used, iov_iter_count(iter));
+		//skb_dump(KERN_INFO, skb, true);
         return 0;
 	}
 
@@ -318,9 +342,20 @@ size_t do_zerocopy(struct sk_buff *skb, size_t offset, struct msghdr *msg, size_
 
 		// find 4K frag
         if (zc_find_page_stateless(skb, offset + done, &owner, &frag_index)){
-			skb_dump(KERN_INFO, skb, true);
+			//skb_dump(KERN_INFO, skb, true);
             return done;
         }
+
+		if (!owner) {
+			pr_info("owner is NULL: offset=%zu done=%zu\n", offset, done);
+			return done;
+		}
+
+		if (frag_index < 0 || frag_index >= skb_shinfo(owner)->nr_frags) {
+			pr_info("bad frag_index=%d nr_frags=%u offset=%zu done=%zu\n",
+					frag_index, skb_shinfo(owner)->nr_frags, offset, done);
+			return done;
+		}
 
 		frag = &skb_shinfo(owner)->frags[frag_index];
         newp = skb_frag_page(frag);

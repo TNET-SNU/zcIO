@@ -32,6 +32,10 @@ struct zc_data {
 	struct page *page[ZC_DATA_MAX_PAGES];
 	size_t page_count;
 	bool frozen;
+	bool zc_policy;
 };
 
+extern struct iov_iter *prev_iov_iter;
+extern int fallback_count;
+extern bool is_zc_first;
 #endif

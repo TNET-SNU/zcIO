@@ -2,7 +2,7 @@
 VERSION = 6
 PATCHLEVEL = 11
 SUBLEVEL = 0
-EXTRAVERSION =-target-zc
+EXTRAVERSION =-target-zc-add-frozen
 NAME = Baby Opossum Posse
 
 # *DOCUMENTATION*

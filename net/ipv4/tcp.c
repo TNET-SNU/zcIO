@@ -287,6 +287,7 @@
 
 #include "tcp_zc.h"
 
+#include <linux/nvmet_tcp_zc.h>
 /* Track pending CMSGs. */
 enum {
 	TCP_CMSG_INQ = 1,
@@ -2510,14 +2511,19 @@ found_ok_skb:
 		}
 
 		if (!(flags & MSG_TRUNC)) {
-			if (can_zerocopy(sk, msg)) {
+			if (can_zerocopy(sk, msg, len)) {
+	    		//pr_info("[tcp_recvmsg_locked] used: %lu, len: %zu, skb->len: %d, offset: %d\n", used, len, skb->len, offset);
 				size_t done = 0;
 				size_t zc_done = do_zerocopy(skb, offset, msg, used, sk);
 				done += zc_done;
 
 				// copy the rest of the data
 				if (zc_done < used) {
-					pr_info("[tcp_recvmsg_locked] fallback to copy rest of the data, zc_done: %zu, offset: %zu, copy data size: %zu, len: %zu\n", zc_done, offset + zc_done, used - zc_done, len);
+					if (READ_ONCE(is_zc_first)) {
+						WRITE_ONCE(is_zc_first, false);
+						pr_info("[tcp_recvmsg_locked] is_zc_first: true===============================\n");
+						//skb_dump( KERN_INFO, skb, true);
+					}
 					err = skb_copy_datagram_msg(skb, offset + zc_done, msg, used - zc_done);
 					if (err) {
 						if (!copied)
@@ -2525,7 +2531,7 @@ found_ok_skb:
 						break;
 					}
 					// freeze the zc_data to prevent further zerocopy of rest of the data in this cmd 
-					set_zc_data_frozen(msg);
+					//set_zc_data_frozen(msg);
 					done += used - zc_done;
 				}
 				if (done != used) {
