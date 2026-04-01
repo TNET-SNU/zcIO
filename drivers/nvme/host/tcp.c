@@ -1293,6 +1293,214 @@ static inline bool zc_is_full_4k_page_frag(const skb_frag_t *f)
 	return skb_frag_size(f) == PAGE_SIZE && skb_frag_off(f) == 0;
 }
 
+/*
+ * Cached (buffered) I/O zerocopy support.
+ *
+ * For direct I/O, we remap NIC page-pool pages into the user's page table so
+ * the app sees the data without any kernel copy.  For buffered I/O there is no
+ * user VA to remap into, but we can still skip one copy by *swapping* the
+ * NIC frag page into the bio_vec in place of the kernel page-cache page that
+ * was originally there.  The data then lives directly in the frag page inside
+ * the page cache.  No page-table walk, no TLB flush, no mmap_lock – just a
+ * pointer swap inside the bio_vec array.
+ *
+ * Lifecycle of the swapped-in frag page:
+ *   1.  get_page() + page_pool_ref_page() while we hold it.
+ *   2.  Installed as bv_page in the bio.  Old cache page is put_page()'d.
+ *   3.  Bio completes: VFS end_io marks the page uptodate, unlocks it,
+ *       and calls put_page() – consuming the get_page() ref from step 1.
+ *   4.  Our wrapped end_io calls page_pool_unref_page() to release the
+ *       pool's in-flight accounting, then put_page() for the pool ref.
+ *
+ * Activated by enable_zerocopy == 2.
+ */
+
+#define MY_CACHED_ZC_MAGIC  0x63616368u   /* "cach" */
+
+struct nvme_tcp_cached_zc_priv {
+	u32		magic;		/* MY_CACHED_ZC_MAGIC */
+	u16		nr_frag_pages;
+	u16		max_frag_pages;
+	void		*orig_private;
+	bio_end_io_t	*orig_end_io;
+	struct page	*frag_pages[];	/* flexible array, allocated with struct */
+};
+
+static void nvme_tcp_cached_zc_bio_end_io(struct bio *bio)
+{
+	struct nvme_tcp_cached_zc_priv *priv = bio->bi_private;
+
+	/* Release pool refs for all frag pages we swapped into the bio. */
+	for (int i = 0; i < priv->nr_frag_pages; i++) {
+		struct page *p = priv->frag_pages[i];
+		if (p) {
+			page_pool_unref_page(p, 1);
+			put_page(p);
+		}
+	}
+
+	bio->bi_private = priv->orig_private;
+	bio->bi_end_io  = priv->orig_end_io;
+	kfree(priv);
+
+	if (bio->bi_end_io)
+		bio->bi_end_io(bio);
+}
+
+/*
+ * Attach (or return existing) nvme_tcp_cached_zc_priv to bio->bi_private.
+ * Called from softirq – GFP_ATOMIC only.
+ */
+static struct nvme_tcp_cached_zc_priv *
+nvme_tcp_cached_zc_ensure_priv(struct bio *bio, int max_pages)
+{
+	struct nvme_tcp_cached_zc_priv *priv = bio->bi_private;
+
+	/* Already installed by an earlier chunk for this bio. */
+	if (priv && priv->magic == MY_CACHED_ZC_MAGIC)
+		return priv;
+
+	/* Never wrap a direct-IO bio that already owns bi_private. */
+	if (priv) {
+		struct my_bio_private *dp = (struct my_bio_private *)priv;
+		if (dp->magic == MY_BIO_PRIVATE_MAGIC)
+			return NULL;
+	}
+
+	size_t sz = sizeof(*priv) + (size_t)max_pages * sizeof(struct page *);
+	priv = kmalloc(sz, GFP_ATOMIC);
+	if (!priv)
+		return NULL;
+
+	priv->magic		= MY_CACHED_ZC_MAGIC;
+	priv->nr_frag_pages	= 0;
+	priv->max_frag_pages	= max_pages;
+	priv->orig_private	= bio->bi_private;
+	priv->orig_end_io	= bio->bi_end_io;
+
+	bio->bi_private = priv;
+	bio->bi_end_io  = nvme_tcp_cached_zc_bio_end_io;
+
+	return priv;
+}
+
+static inline bool can_use_zerocopy_cached(struct nvme_tcp_queue *queue,
+					   struct nvme_tcp_request *req,
+					   int recv_len)
+{
+	if (!enable_zerocopy)
+		return false;
+	if (queue->data_digest)
+		return false;
+	if (!req->curr_bio || recv_len < PAGE_SIZE)
+		return false;
+
+	/*
+	 * Don't step on a bio already owned by the direct-IO zerocopy path.
+	 * Both wrappers put their magic as the first u32 of bi_private.
+	 */
+	u32 *magic = (u32 *)req->curr_bio->bi_private;
+	if (magic && *magic == MY_BIO_PRIVATE_MAGIC)
+		return false;
+
+	/* Iterator must sit at a page boundary. */
+	if (req->iter.iov_offset != 0)
+		return false;
+
+	return true;
+}
+
+/*
+ * Swap NIC page-pool frag pages into the bio_vec in-place, avoiding the
+ * NIC->page-cache memcpy entirely.
+ *
+ * Returns  0   on full success  – caller must advance req->iter by recv_len.
+ * Returns -1   on any failure   – caller falls back to skb_copy_datagram_iter.
+ */
+static int do_zerocopy_cached(struct nvme_tcp_queue *queue,
+			       struct sk_buff *skb,
+			       struct nvme_tcp_request *req,
+			       int recv_len, unsigned int offset)
+{
+	struct bio *bio	     = req->curr_bio;
+	int nr_pages         = recv_len >> PAGE_SHIFT;
+	unsigned int cur_off = offset;
+
+	/*
+	 * bio->bi_iter.bi_size is the bio's original transfer size and is not
+	 * decremented during receive processing, so it gives the true page
+	 * count for the frag_pages[] array bound.
+	 */
+	int max_pages = DIV_ROUND_UP(bio->bi_iter.bi_size, PAGE_SIZE);
+	struct nvme_tcp_cached_zc_priv *priv =
+		nvme_tcp_cached_zc_ensure_priv(bio, max_pages);
+	if (!priv)
+		return -1;
+
+	/*
+	 * req->iter.bvec points directly into bio->bi_io_vec[].  The array is
+	 * writable; the const qualifier is just an iov_iter API guard.  Cast
+	 * it away so we can swap bv_page in-place.
+	 */
+	struct bio_vec *bv = (struct bio_vec *)req->iter.bvec;
+
+	for (int i = 0; i < nr_pages; i++) {
+		/* Every slot must be exactly one full unshifted page. */
+		if (unlikely(bv[i].bv_len != PAGE_SIZE || bv[i].bv_offset != 0))
+			goto error;
+
+		/* Locate the matching 4K page-pool frag in the SKB. */
+		struct sk_buff *owner = NULL;
+		int frag_index = -1;
+		unsigned int page_off = 0;
+
+		if (zc_find_next_4k_stateful(queue, skb, cur_off,
+					     &owner, &frag_index, &page_off))
+			goto error;
+		if (unlikely(page_off != cur_off))
+			goto error;
+
+		skb_frag_t *frag = &skb_shinfo(owner)->frags[frag_index];
+		if (unlikely(skb_frag_size(frag) != PAGE_SIZE ||
+			     skb_frag_off(frag)  != 0))
+			goto error;
+
+		struct page *fp = skb_frag_page(frag);
+		if (unlikely(!is_pp_page(fp)))
+			goto error;
+
+		/*
+		 * Two references on the frag page:
+		 *   get_page()           – keeps the page alive until the VFS
+		 *                          end_io's put_page() runs.
+		 *   page_pool_ref_page() – prevents the pool from reclaiming the
+		 *                          page when the SKB drops its own frag
+		 *                          reference before our end_io fires.
+		 */
+		if (!get_page_unless_zero(fp))
+			goto error;
+		page_pool_ref_page(fp);
+
+		/* Evict the old cache page and install the frag page. */
+		struct page *old_page = bv[i].bv_page;
+		bv[i].bv_page = fp;
+		put_page(old_page);
+
+		/* Track fp so end_io can release both refs. */
+		if (likely(priv->nr_frag_pages < priv->max_frag_pages))
+			priv->frag_pages[priv->nr_frag_pages++] = fp;
+
+		cur_off += PAGE_SIZE;
+	}
+
+	ZC_LOG("cached zc: bio=%px swapped %d pages\n", bio, nr_pages);
+	return 0;
+
+error:
+	zc_cursor_invalidate(queue);
+	return -1;
+}
+
 static __always_inline void zc_cursor_reset(struct nvme_tcp_queue *q,
 					    struct sk_buff *root)
 {
@@ -1932,8 +2140,25 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		}
 		else if (!can_use_zerocopy(queue, req, recv_len)){
 			//trace_printk("[3] [nvme_tcp_recv_data] can_use_zerocopy, recv_len: %d\n", recv_len);
-			ret = skb_copy_datagram_iter(skb, *offset,
-					&req->iter, recv_len);
+			/* Try cached (buffered) zerocopy before falling back to copy. */
+			if (zc_recv_len > 0 &&
+			    can_use_zerocopy_cached(queue, req, recv_len)) {
+				recv_len = zc_recv_len;
+				int rc = do_zerocopy_cached(queue, skb, req,
+							    recv_len, *offset);
+				if (rc == 0) {
+					iov_iter_advance(&req->iter, recv_len);
+					ret = 0;
+				} else {
+					ZC_LOG_RL("cached zc fallback, recv_len=%d\n",
+						  recv_len);
+					ret = skb_copy_datagram_iter(skb, *offset,
+							&req->iter, recv_len);
+				}
+			} else {
+				ret = skb_copy_datagram_iter(skb, *offset,
+						&req->iter, recv_len);
+			}
 		}
 		else if (zc_recv_len == 0)
 		{
