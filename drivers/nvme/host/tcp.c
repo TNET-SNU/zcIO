@@ -28,6 +28,7 @@
 /* rx-zcopy */
 #include <linux/rmap.h>
 #include <net/page_pool/helpers.h>
+#include <linux/swap.h>		/* folio_add_lru */
 #include <linux/hugetlb.h>
 #include <linux/zcopy_ctx.h>
 #include <linux/mm.h>
@@ -1317,30 +1318,113 @@ static inline bool zc_is_full_4k_page_frag(const skb_frag_t *f)
 
 #define MY_CACHED_ZC_MAGIC  0x63616368u   /* "cach" */
 
+/*
+ * One entry per page-slot swapped during cached zerocopy receive.
+ * We need both pointers in end_io to perform the xarray folio replacement.
+ */
+struct nvme_tcp_cached_zc_swap {
+	struct page	*frag_page;	/* NIC pool page installed in bio_vec */
+	struct page	*old_page;	/* original cache page displaced */
+};
+
 struct nvme_tcp_cached_zc_priv {
 	u32		magic;		/* MY_CACHED_ZC_MAGIC */
-	u16		nr_frag_pages;
-	u16		max_frag_pages;
+	u16		nr_swaps;
+	u16		max_swaps;
 	void		*orig_private;
 	bio_end_io_t	*orig_end_io;
-	struct page	*frag_pages[];	/* flexible array, allocated with struct */
+	struct nvme_tcp_cached_zc_swap swaps[];	/* flexible array */
 };
 
 static void nvme_tcp_cached_zc_bio_end_io(struct bio *bio)
 {
 	struct nvme_tcp_cached_zc_priv *priv = bio->bi_private;
 
-	/* Release pool refs for all frag pages we swapped into the bio. */
-	for (int i = 0; i < priv->nr_frag_pages; i++) {
-		struct page *p = priv->frag_pages[i];
-		if (p) {
-			page_pool_unref_page(p, 1);
-			put_page(p);
+	/*
+	 * Step 1: Atomically replace each displaced cache folio in the
+	 * address_space xarray with its frag folio.  This must happen before
+	 * orig_end_io (iomap_read_end_io) runs, because that function walks
+	 * bio_for_each_folio_all() and expects each bv_page to be the live
+	 * locked cache folio for its file offset.
+	 */
+	for (int i = 0; i < priv->nr_swaps; i++) {
+		struct page  *frag_page  = priv->swaps[i].frag_page;
+		struct page  *old_page   = priv->swaps[i].old_page;
+		struct folio *frag_folio = page_folio(frag_page);
+		struct folio *old_folio  = page_folio(old_page);
+
+		/*
+		 * Take an extra ref on old_folio before calling
+		 * replace_page_cache_folio(), which internally drops the
+		 * page-cache ref via folio_put().  Without this extra ref
+		 * the folio would be freed before we could unlock it.
+		 */
+		folio_get(old_folio);
+
+		/*
+		 * Lock the frag folio — required by replace_page_cache_folio()
+		 * (VM_BUG_ON_FOLIO) and by folio_end_read() called later from
+		 * iomap_read_end_io.  This is a fresh pool page unknown to any
+		 * other thread, so trylock must always succeed.
+		 */
+		if (WARN_ON_ONCE(!folio_trylock(frag_folio))) {
+			folio_put(old_folio);
+			continue;
 		}
+
+		/*
+		 * Atomically swap old_folio out of the xarray and install
+		 * frag_folio in its place.  After this call:
+		 *   - frag_folio->mapping and ->index are set
+		 *   - old_folio->mapping is cleared
+		 *   - page-cache ref: old loses one (folio_put inside),
+		 *     new gains one (folio_get inside)
+		 *   - a_ops->free_folio(old) is called, cleaning up folio->private
+		 *     (iomap_folio_state) if present
+		 */
+		replace_page_cache_folio(old_folio, frag_folio);
+
+		/*
+		 * Add frag_folio to the LRU so the kernel can reclaim it
+		 * when memory pressure requires it.
+		 */
+		folio_add_lru(frag_folio);
+
+		/*
+		 * Unlock old_folio — it has been locked since readahead set
+		 * up the read IO and nobody has unlocked it.  Safe here because
+		 * we still hold our extra ref from folio_get() above.
+		 */
+		folio_unlock(old_folio);
+
+		/*
+		 * Release our extra ref.  old_folio->mapping is already NULL,
+		 * refcount drops to zero, and the folio is freed normally.
+		 */
+		folio_put(old_folio);
 	}
 
+	/*
+	 * Step 2: Restore the bio's original end_io chain and call it.
+	 * iomap_read_end_io iterates bio_for_each_folio_all(), finds each
+	 * frag_folio (now locked and installed in the xarray), and calls
+	 * folio_end_read() which marks it uptodate and unlocks it.
+	 */
 	bio->bi_private = priv->orig_private;
 	bio->bi_end_io  = priv->orig_end_io;
+
+	/*
+	 * Step 3: Release the two extra refs taken per frag page in
+	 * do_zerocopy_cached (get_page_unless_zero + page_pool_ref_page).
+	 * The page-cache ref from replace_page_cache_folio keeps the folio
+	 * alive in the cache.
+	 */
+	for (int i = 0; i < priv->nr_swaps; i++) {
+		struct page *p = priv->swaps[i].frag_page;
+		page_pool_unref_page(p, 1);
+		put_page(p);
+	}
+
 	kfree(priv);
 
 	if (bio->bi_end_io)
@@ -1367,14 +1451,14 @@ nvme_tcp_cached_zc_ensure_priv(struct bio *bio, int max_pages)
 			return NULL;
 	}
 
-	size_t sz = sizeof(*priv) + (size_t)max_pages * sizeof(struct page *);
+	size_t sz = sizeof(*priv) + (size_t)max_pages * sizeof(struct nvme_tcp_cached_zc_swap);
 	priv = kmalloc(sz, GFP_ATOMIC);
 	if (!priv)
 		return NULL;
 
 	priv->magic		= MY_CACHED_ZC_MAGIC;
-	priv->nr_frag_pages	= 0;
-	priv->max_frag_pages	= max_pages;
+	priv->nr_swaps		= 0;
+	priv->max_swaps		= max_pages;
 	priv->orig_private	= bio->bi_private;
 	priv->orig_end_io	= bio->bi_end_io;
 
@@ -1409,6 +1493,15 @@ static inline bool can_use_zerocopy_cached(struct nvme_tcp_queue *queue,
 
 	return true;
 }
+
+/* Forward declarations for helpers defined later in this file. */
+static __always_inline void zc_cursor_invalidate(struct nvme_tcp_queue *q);
+static int zc_find_next_4k_stateful(struct nvme_tcp_queue *q,
+				    struct sk_buff *root,
+				    unsigned int cur_off,
+				    struct sk_buff **owner,
+				    int *frag_idx,
+				    unsigned int *page_off);
 
 /*
  * Swap NIC page-pool frag pages into the bio_vec in-place, avoiding the
@@ -1477,18 +1570,33 @@ static int do_zerocopy_cached(struct nvme_tcp_queue *queue,
 		 *                          page when the SKB drops its own frag
 		 *                          reference before our end_io fires.
 		 */
+		/* Verify capacity before taking any refs for this slot. */
+		if (WARN_ON_ONCE(priv->nr_swaps >= priv->max_swaps))
+			goto error;
+
+		/*
+		 * Two references on the frag page:
+		 *   get_page()           – keeps the page alive until the VFS
+		 *                          end_io's put_page() runs.
+		 *   page_pool_ref_page() – prevents the pool from reclaiming the
+		 *                          page when the SKB drops its own frag
+		 *                          reference before our end_io fires.
+		 */
 		if (!get_page_unless_zero(fp))
 			goto error;
 		page_pool_ref_page(fp);
 
-		/* Evict the old cache page and install the frag page. */
+		/*
+		 * Install the frag page into the bio_vec.  Do NOT put_page the
+		 * old cache page here — it is still locked and still lives in
+		 * the xarray.  Save both pointers so end_io can do the xarray
+		 * replacement and unlock/free the old folio correctly.
+		 */
 		struct page *old_page = bv[i].bv_page;
 		bv[i].bv_page = fp;
-		put_page(old_page);
-
-		/* Track fp so end_io can release both refs. */
-		if (likely(priv->nr_frag_pages < priv->max_frag_pages))
-			priv->frag_pages[priv->nr_frag_pages++] = fp;
+		priv->swaps[priv->nr_swaps].frag_page = fp;
+		priv->swaps[priv->nr_swaps].old_page  = old_page;
+		priv->nr_swaps++;
 
 		cur_off += PAGE_SIZE;
 	}
