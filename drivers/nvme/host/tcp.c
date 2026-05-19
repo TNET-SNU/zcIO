@@ -29,6 +29,7 @@
 #include <linux/rmap.h>
 #include <net/page_pool/helpers.h>
 #include <linux/swap.h>		/* folio_add_lru */
+#include <linux/folio_pp_release.h>
 #include <linux/hugetlb.h>
 #include <linux/zcopy_ctx.h>
 #include <linux/mm.h>
@@ -1385,6 +1386,24 @@ static void nvme_tcp_cached_zc_bio_end_io(struct bio *bio)
 		replace_page_cache_folio(old_folio, frag_folio);
 
 		/*
+		 * Attach a folio_pp_release descriptor to frag_folio->private
+		 * while the folio is still locked.  When the folio is later
+		 * evicted from the page cache, ifs_free() will call
+		 * folio_pp_release_run() which returns the frag page to its
+		 * pool via page_pool_unref_page() + put_page().
+		 *
+		 * This must happen before orig_end_io / iomap_finish_folio_read
+		 * runs, because that function reads folio->private; the magic
+		 * check there will see FOLIO_PP_RELEASE_MAGIC and skip ifs
+		 * handling, falling straight through to folio_end_read().
+		 */
+		struct folio_pp_release *fpr = kmalloc(sizeof(*fpr), GFP_KERNEL);
+		if (!WARN_ON_ONCE(!fpr)) {
+			folio_pp_release_init(fpr, frag_page);
+			folio_attach_private(frag_folio, fpr);
+		}
+
+		/*
 		 * Add frag_folio to the LRU so the kernel can reclaim it
 		 * when memory pressure requires it.
 		 */
@@ -1412,18 +1431,6 @@ static void nvme_tcp_cached_zc_bio_end_io(struct bio *bio)
 	 */
 	bio->bi_private = priv->orig_private;
 	bio->bi_end_io  = priv->orig_end_io;
-
-	/*
-	 * Step 3: Release the two extra refs taken per frag page in
-	 * do_zerocopy_cached (get_page_unless_zero + page_pool_ref_page).
-	 * The page-cache ref from replace_page_cache_folio keeps the folio
-	 * alive in the cache.
-	 */
-	for (int i = 0; i < priv->nr_swaps; i++) {
-		struct page *p = priv->swaps[i].frag_page;
-		page_pool_unref_page(p, 1);
-		put_page(p);
-	}
 
 	kfree(priv);
 
@@ -1540,6 +1547,14 @@ static int do_zerocopy_cached(struct nvme_tcp_queue *queue,
 	for (int i = 0; i < nr_pages; i++) {
 		/* Every slot must be exactly one full unshifted page. */
 		if (unlikely(bv[i].bv_len != PAGE_SIZE || bv[i].bv_offset != 0))
+			goto error;
+
+		/*
+		 * Only swap order-0 folios.  Large folios (e.g. 64 KB on arm64
+		 * or when readahead upgrades folio order) cannot be replaced by
+		 * a single 4 KB pool page.  Fall back to memcpy for those.
+		 */
+		if (unlikely(folio_order(page_folio(bv[i].bv_page)) != 0))
 			goto error;
 
 		/* Locate the matching 4K page-pool frag in the SKB. */

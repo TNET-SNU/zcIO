@@ -5,6 +5,7 @@
  */
 #include <linux/module.h>
 #include <linux/compiler.h>
+#include <linux/folio_pp_release.h>
 #include <linux/fs.h>
 #include <linux/iomap.h>
 #include <linux/pagemap.h>
@@ -217,10 +218,23 @@ static struct iomap_folio_state *ifs_alloc(struct inode *inode,
 
 static void ifs_free(struct folio *folio)
 {
-	struct iomap_folio_state *ifs = folio_detach_private(folio);
+	void *priv = folio_detach_private(folio);
 
-	if (!ifs)
+	if (!priv)
 		return;
+
+	/*
+	 * A page-pool backed folio (e.g. NVMe/TCP cached zerocopy) stores a
+	 * folio_pp_release descriptor as folio->private instead of an
+	 * iomap_folio_state.  Detect it by magic and return the frag page to
+	 * its pool rather than trying to free it as an iomap_folio_state.
+	 */
+	if (*(u32 *)priv == FOLIO_PP_RELEASE_MAGIC) {
+		folio_pp_release_run((struct folio_pp_release *)priv);
+		return;
+	}
+
+	struct iomap_folio_state *ifs = priv;
 	WARN_ON_ONCE(ifs->read_bytes_pending != 0);
 	WARN_ON_ONCE(atomic_read(&ifs->write_bytes_pending));
 	WARN_ON_ONCE(ifs_is_fully_uptodate(folio, ifs) !=
@@ -295,6 +309,16 @@ static void iomap_finish_folio_read(struct folio *folio, size_t off,
 	struct iomap_folio_state *ifs = folio->private;
 	bool uptodate = !error;
 	bool finished = true;
+
+	/*
+	 * A page-pool backed folio (NVMe/TCP cached zerocopy) stores a
+	 * folio_pp_release descriptor in folio->private instead of an
+	 * iomap_folio_state.  Detect it by magic and treat it as having
+	 * no ifs — the folio covers exactly one full page so whole-folio
+	 * completion via folio_end_read() below is correct.
+	 */
+	if (ifs && *(u32 *)ifs == FOLIO_PP_RELEASE_MAGIC)
+		ifs = NULL;
 
 	if (ifs) {
 		unsigned long flags;
