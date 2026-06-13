@@ -2314,6 +2314,31 @@ static int set_pflag_tx_port_ts(struct net_device *netdev, bool enable)
 	return err;
 }
 
+/* zcIO: toggle 4K (PAGE_SIZE) RX MPWQE stride for RX zero-copy.
+ * Stride size is decided at RQ creation, so flipping this safely reopens
+ * the channels via mlx5e_safe_switch_params(..., reset=true).
+ * Shared by both initiator(host) and target(nvmet) RX zero-copy.
+ */
+static int set_pflag_rx_zc_stride(struct net_device *netdev, bool enable)
+{
+	struct mlx5e_priv *priv = netdev_priv(netdev);
+	struct mlx5_core_dev *mdev = priv->mdev;
+	struct mlx5e_params new_params;
+
+	/* 4K stride only applies to the striding (MPWQE) RQ path. */
+	if (enable && !MLX5E_GET_PFLAG(&priv->channels.params,
+				       MLX5E_PFLAG_RX_STRIDING_RQ)) {
+		netdev_warn(netdev,
+			    "rx_zc_stride needs rx_striding_rq enabled first\n");
+		return -EINVAL;
+	}
+
+	new_params = priv->channels.params;
+	MLX5E_SET_PFLAG(&new_params, MLX5E_PFLAG_RX_ZC_STRIDE, enable);
+
+	return mlx5e_safe_switch_params(priv, &new_params, NULL, NULL, true);
+}
+
 static const struct pflag_desc mlx5e_priv_flags[MLX5E_NUM_PFLAGS] = {
 	{ "rx_cqe_moder",        set_pflag_rx_cqe_based_moder },
 	{ "tx_cqe_moder",        set_pflag_tx_cqe_based_moder },
@@ -2323,6 +2348,7 @@ static const struct pflag_desc mlx5e_priv_flags[MLX5E_NUM_PFLAGS] = {
 	{ "xdp_tx_mpwqe",        set_pflag_xdp_tx_mpwqe },
 	{ "skb_tx_mpwqe",        set_pflag_skb_tx_mpwqe },
 	{ "tx_port_ts",          set_pflag_tx_port_ts },
+	{ "rx_zc_stride",        set_pflag_rx_zc_stride },
 };
 
 static int mlx5e_handle_pflag(struct net_device *netdev,

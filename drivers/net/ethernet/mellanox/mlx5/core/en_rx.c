@@ -2431,13 +2431,15 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 								  data_offset, page_idx);
 		if (unlikely(!*skb))
 			goto free_hd_entry;
-		/* zcIO: SHAMPO RX hack for PDU-aligned zero-copy. When the NIC
-		 * reports the 90B split header, rewrite the TCP data-offset nibble
-		 * back to 8 words and inflate gso_size by 24. (Made toggleable via
-		 * rq->mpwqe.zc_stride in a later commit.)
+		/* zcIO: with RX zero-copy stride active, the sender prepends a 24B
+		 * (6-word) PDU-alignment TCP option and the NIC reports a 90B split
+		 * header. Rewrite the TCP data-offset nibble back to 8 words and
+		 * inflate gso_size by 24 so the GRO/stack path stays consistent.
+		 * Gated by rq->mpwqe.zc_stride: with zero-copy OFF this block is
+		 * skipped and behaviour is byte-for-byte vanilla.
 		 */
 		NAPI_GRO_CB(*skb)->count = 1;
-		if (head_size == rx_zcopy_head_size) {
+		if (rq->mpwqe.zc_stride && head_size == rx_zcopy_head_size) {
 			u8 *th_off = (*skb)->data + 14 + 20 + 12;
 
 			*th_off = (*th_off & 0x0F) | (8 << 4);

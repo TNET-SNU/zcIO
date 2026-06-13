@@ -879,6 +879,8 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 			pool_size *= 2; /* additional page per packet for the linear part */
 
 		rq->mpwqe.log_stride_sz = mlx5e_mpwqe_get_log_stride_size(mdev, params, xsk);
+		/* zcIO: cache the RX zero-copy stride pflag for the hot RX path. */
+		rq->mpwqe.zc_stride = MLX5E_GET_PFLAG(params, MLX5E_PFLAG_RX_ZC_STRIDE);
 		rq->mpwqe.num_strides =
 			BIT(mlx5e_mpwqe_get_log_num_strides(mdev, params, xsk));
 		rq->mpwqe.min_wqe_bulk = mlx5e_mpwqe_get_min_wqe_bulk(wq_sz);

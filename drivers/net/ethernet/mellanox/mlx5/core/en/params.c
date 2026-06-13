@@ -434,18 +434,21 @@ u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
 				   struct mlx5e_xsk_param *xsk)
 {
 	if (mlx5e_rx_mpwqe_is_linear_skb(mdev, params, xsk))
-	{
-		//pr_info("linear skb\n");
 		return order_base_2(mlx5e_rx_get_linear_stride_sz(mdev, params, xsk, true));
-	}
+
 	/* XDP in mlx5e doesn't support multiple packets per page. */
 	if (params->xdp_prog)
 		return PAGE_SHIFT;
 
-	/* zcIO: force PAGE_SIZE (4K) MPWQE stride for RX zero-copy
-	 * (both initiator and target). Runtime toggle added in a later commit.
+	/* zcIO: when RX zero-copy stride is enabled, force a PAGE_SIZE (4K on
+	 * x86-64) MPWQE stride so each NIC stride maps 1:1 to a page that can
+	 * be swapped into the I/O / user buffer. Shared by host & target ZC.
+	 * When the pflag is off we fall back to the exact vanilla stride.
 	 */
-	return PAGE_SHIFT;
+	if (MLX5E_GET_PFLAG(params, MLX5E_PFLAG_RX_ZC_STRIDE))
+		return PAGE_SHIFT;
+
+	return MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev);
 }
 
 u8 mlx5e_mpwqe_get_log_num_strides(struct mlx5_core_dev *mdev,

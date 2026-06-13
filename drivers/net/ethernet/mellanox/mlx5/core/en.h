@@ -251,6 +251,7 @@ enum mlx5e_priv_flag {
 	MLX5E_PFLAG_XDP_TX_MPWQE,
 	MLX5E_PFLAG_SKB_TX_MPWQE,
 	MLX5E_PFLAG_TX_PORT_TS,
+	MLX5E_PFLAG_RX_ZC_STRIDE, /* zcIO: force 4K (PAGE_SIZE) RX MPWQE stride for RX zero-copy */
 	MLX5E_NUM_PFLAGS, /* Keep last */
 };
 
@@ -677,6 +678,7 @@ struct mlx5e_rq {
 			u8                     umr_wqebbs;
 			u8                     mtts_per_wqe;
 			u8                     umr_mode;
+			u8                     zc_stride; /* zcIO: RX zero-copy 4K stride active (cached MLX5E_PFLAG_RX_ZC_STRIDE) */
 			struct mlx5e_shampo_hd *shampo;
 		} mpwqe;
 	};
