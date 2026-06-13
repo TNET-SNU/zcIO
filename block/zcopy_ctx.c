@@ -2,7 +2,7 @@
 #include <linux/slab.h>
 
 
-extern int enable_zerocopy;
+extern int nvme_host_rx_zc;
 
 
 struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
@@ -12,7 +12,7 @@ struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
     struct my_ctx *ctx;
     gfp_t gfp = GFP_KERNEL;
 
-    if (!READ_ONCE(enable_zerocopy))
+    if (!READ_ONCE(nvme_host_rx_zc))
         return NULL;
 
 #ifdef __GFP_SKIP_ZERO
@@ -62,7 +62,7 @@ struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
 
 static struct my_ctx *init_my_ctx_inline(struct my_bio_private *priv, int nr_pages, struct mm_struct *mm)
 {
-    if (!READ_ONCE(enable_zerocopy))
+    if (!READ_ONCE(nvme_host_rx_zc))
         return NULL;
 
     struct my_ctx *ctx = &priv->inline_ctx;
@@ -83,7 +83,7 @@ static struct my_ctx *init_my_ctx_inline(struct my_bio_private *priv, int nr_pag
 
 struct my_ctx *init_my_ctx(struct my_bio_private *priv, int nr_pages, struct mm_struct *mm)
 {
-    if (!READ_ONCE(enable_zerocopy))
+    if (!READ_ONCE(nvme_host_rx_zc))
         return NULL;
 
     /* 작은 I/O는 inline으로: 4K/8K/16K(1/2/4 pages)에서 kvmalloc 제거 */

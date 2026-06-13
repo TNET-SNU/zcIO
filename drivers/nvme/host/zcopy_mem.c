@@ -5,7 +5,7 @@
 DEFINE_HASHTABLE(zcopy_ctx_hash, 8);
 DEFINE_SPINLOCK(zcopy_ctx_lock);
 
-extern bool enable_zerocopy;
+extern int nvme_host_rx_zc;
 
 static bool is_pp_page(struct page *page){
   return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
@@ -355,7 +355,7 @@ int zcopy_try_register(struct mm_struct *mm) {
     struct zcopy_ctx *new_ctx;
     int ret;
 
-    if (!READ_ONCE(enable_zerocopy))
+    if (!READ_ONCE(nvme_host_rx_zc))
         return 0;
 
     /* 1. Fast Path: Lock 없이 빠르게 확인 */

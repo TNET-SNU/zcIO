@@ -358,7 +358,7 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	loff_t pos = iocb->ki_pos;
 	int ret = 0;
 	struct my_bio_private *priv = NULL;
-	//bool enable_zc = READ_ONCE(enable_zerocopy);
+	//bool enable_zc = READ_ONCE(nvme_host_rx_zc);
 	//printk_ratelimited(KERN_INFO, "direct-io: enable_zc: %d\n", enable_zc);
 
 	if (iocb->ki_flags & IOCB_ALLOC_CACHE)

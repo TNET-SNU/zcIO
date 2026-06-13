@@ -70,10 +70,10 @@ MODULE_PARM_DESC(tls_handshake_timeout,
 #define ZC_MAX_STAGE_PAGES 64
 
 
-int enable_zerocopy = 0;
-module_param(enable_zerocopy, int, 0644);
-MODULE_PARM_DESC(enable_zerocopy, "Enable RX zerocopy");
-EXPORT_SYMBOL_GPL(enable_zerocopy); /* 여러 오브젝트에서 쓰면 export 필요 */
+int nvme_host_rx_zc = 0;
+module_param(nvme_host_rx_zc, int, 0644);
+MODULE_PARM_DESC(nvme_host_rx_zc, "Enable RX zerocopy");
+EXPORT_SYMBOL_GPL(nvme_host_rx_zc); /* 여러 오브젝트에서 쓰면 export 필요 */
 
 
 static bool nvme_tcp_rx_zc_batch_flush = false;
@@ -1824,7 +1824,7 @@ fallback_complete:
 }
 
 static inline bool can_use_zerocopy(struct nvme_tcp_queue *queue, struct nvme_tcp_request *req, int recv_len){
-	if (enable_zerocopy != 1)
+	if (nvme_host_rx_zc != 1)
 		return false;
 	struct my_bio_private *priv = req->curr_bio->bi_private;
 	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)){
@@ -1991,7 +1991,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			queue->ddgst_remaining = NVME_TCP_DIGEST_LENGTH;
 		} else {
 			if (pdu->hdr.flags & NVME_TCP_F_DATA_SUCCESS) {
-				if (!nvme_tcp_rx_zc_batch_flush || !enable_zerocopy /*|| req->zc_policy != ZC_ENABLED*/) {
+				if (!nvme_tcp_rx_zc_batch_flush || !nvme_host_rx_zc /*|| req->zc_policy != ZC_ENABLED*/) {
 					//trace_printk("==> [nvme_tcp_recv_data] end_request - req->status: %d\n", le16_to_cpu(req->status));
 
 					nvme_tcp_end_request(rq, le16_to_cpu(req->status));
@@ -2980,7 +2980,7 @@ static void __nvme_tcp_stop_queue(struct nvme_tcp_queue *queue)
 	nvme_tcp_restore_sock_ops(queue);
 	cancel_work_sync(&queue->io_work);
 
-	if (nvme_tcp_rx_zc_batch_flush && enable_zerocopy)
+	if (nvme_tcp_rx_zc_batch_flush && nvme_host_rx_zc)
 		nvme_tcp_zc_destroy_queue(queue);
 }
 
@@ -3043,7 +3043,7 @@ static void nvme_tcp_zc_init_queue(struct nvme_tcp_queue *queue)
 {
     u32 depth;
 
-    if (!nvme_tcp_rx_zc_batch_flush || !enable_zerocopy || !queue){
+    if (!nvme_tcp_rx_zc_batch_flush || !nvme_host_rx_zc || !queue){
         return;
 	}
 
@@ -3076,7 +3076,7 @@ static int nvme_tcp_start_queue(struct nvme_ctrl *nctrl, int idx)
 	int ret;
 
 	queue->rd_enabled = true;
-	if (idx && nvme_tcp_rx_zc_batch_flush && enable_zerocopy)
+	if (idx && nvme_tcp_rx_zc_batch_flush && nvme_host_rx_zc)
 		nvme_tcp_zc_prepare_queue(queue);
 	nvme_tcp_init_recv_ctx(queue);
 	nvme_tcp_setup_sock_ops(queue);
@@ -3089,7 +3089,7 @@ static int nvme_tcp_start_queue(struct nvme_ctrl *nctrl, int idx)
 	if (!ret) {
 		set_bit(NVME_TCP_Q_LIVE, &queue->flags);
 
-		if (idx && nvme_tcp_rx_zc_batch_flush && enable_zerocopy){
+		if (idx && nvme_tcp_rx_zc_batch_flush && nvme_host_rx_zc){
 			nvme_tcp_zc_init_queue(queue);
 		}
 	} else {
