@@ -25,7 +25,7 @@
 #include <linux/nvmet_tcp_zc.h>
 #include <net/page_pool/helpers.h>
 
-extern bool enable_zerocopy;
+extern bool nvmet_rx_zc;
 
 #define NVMET_TCP_DEF_INLINE_DATA_SIZE	4 * PAGE_SIZE
 #define NVMET_TCP_MAXH2CDATA		0x400000 /* 16M arbitrary limit */
@@ -531,7 +531,7 @@ static bool nvmet_tcp_zc_precheck(struct nvmet_tcp_queue *queue, struct nvmet_tc
 		return true;
 	}
 
-	if (!enable_zerocopy){
+	if (!nvmet_rx_zc){
 		cmd->zc_reason = ZCR_GLOB_OFF;
 		goto error;
 	}

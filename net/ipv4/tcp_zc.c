@@ -6,10 +6,10 @@
 
 
 /* rx zcopy */
-bool enable_zerocopy;
-EXPORT_SYMBOL(enable_zerocopy);
-module_param(enable_zerocopy, bool, 0644);
-MODULE_PARM_DESC(enable_zerocopy, "enable zcopy");
+bool nvmet_rx_zc;
+EXPORT_SYMBOL(nvmet_rx_zc);
+module_param(nvmet_rx_zc, bool, 0644);
+MODULE_PARM_DESC(nvmet_rx_zc, "enable zcopy");
 
 bool is_zc_first = true;
 EXPORT_SYMBOL(is_zc_first);
@@ -30,7 +30,7 @@ bool can_zerocopy(struct sock *sk, struct msghdr *msg, size_t len){
 	if ((inet->inet_num) != 4420){
 		return false;
 	}
-    if (!enable_zerocopy)
+    if (!nvmet_rx_zc)
         return false;
 
     if (!iov_iter_is_bvec(&msg->msg_iter)){
