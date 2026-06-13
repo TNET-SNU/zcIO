@@ -60,6 +60,11 @@
 #include "devlink.h"
 #include "en/devlink.h"
 
+/*rx-zcopy*/
+static int rx_zcopy_head_size = 90;
+module_param(rx_zcopy_head_size, int, 0644);
+MODULE_PARM_DESC(rx_zcopy_head_size, "RX Zcopy head size");
+
 static struct sk_buff *
 mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 				struct mlx5_cqe64 *cqe, u16 cqe_bcnt, u32 head_offset,
@@ -297,9 +302,11 @@ static void mlx5e_page_release_fragmented(struct mlx5e_rq *rq,
 {
 	u16 drain_count = MLX5E_PAGECNT_BIAS_MAX - frag_page->frags;
 	struct page *page = frag_page->page;
-
-	if (page_pool_unref_page(page, drain_count) == 0)
+	//trace_printk("[release] page: %px, drain_count: %d, pp_ref_count: %ld\n", page, drain_count, atomic_long_read(&page->pp_ref_count));
+	if (page_pool_unref_page(page, drain_count) == 0){
+		//trace_printk("[release] page_pool_put_unrefed_page: %px, drain_count: %d, pp_ref_count: %ld\n", page, drain_count, atomic_long_read(&page->pp_ref_count));
 		page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
+	}
 }
 
 static inline int mlx5e_get_rx_frag(struct mlx5e_rq *rq,
@@ -1614,6 +1621,7 @@ static void mlx5e_shampo_complete_rx_cqe(struct mlx5e_rq *rq,
 	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
 	skb_reset_network_header(skb);
 	if (!skb_flow_dissect_flow_keys(skb, &rq->hw_gro_data->fk, 0)) {
+		pr_info("flow keys failed to be obtained : %px\n", skb);
 		napi_gro_receive(rq->cq.napi, skb);
 		rq->hw_gro_data->skb = NULL;
 	}
@@ -1963,15 +1971,14 @@ mlx5e_shampo_fill_skb_data(struct sk_buff *skb, struct mlx5e_rq *rq,
 			   u32 data_bcnt, u32 data_offset)
 {
 	net_prefetchw(skb->data);
-
+	//pr_info("data_bcnt : %d, data_offset : %d\n", data_bcnt, data_offset);
 	do {
 		/* Non-linear mode, hence non-XSK, which always uses PAGE_SIZE. */
 		u32 pg_consumed_bytes = min_t(u32, PAGE_SIZE - data_offset, data_bcnt);
+	    //pr_info("-- data_bcnt : %d, data_offset : %d\n", data_bcnt, data_offset);
 		unsigned int truesize = pg_consumed_bytes;
-
 		mlx5e_add_skb_frag(rq, skb, frag_page, data_offset,
 				   pg_consumed_bytes, truesize);
-
 		data_bcnt -= pg_consumed_bytes;
 		data_offset = 0;
 		frag_page++;
@@ -2023,7 +2030,7 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
 		va = skb->head;
 		net_prefetchw(va); /* xdp_frame data area */
 		net_prefetchw(skb->data);
-
+		// 1. set headlen - packet header + 24bytes(if nvme )
 		frag_offset += headlen;
 		byte_cnt -= headlen;
 		linear_hr = skb_headroom(skb);
@@ -2198,6 +2205,7 @@ mlx5e_skb_from_cqe_shampo(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 	frag_size	= MLX5_SKB_FRAG_SZ(rx_headroom + head_size);
 
 	if (likely(frag_size <= BIT(MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE))) {
+		//pr_info("[mlx5e_skb_from_cqe_shampo] frag_size=%u\n", frag_size);
 		/* build SKB around header */
 		dma_sync_single_range_for_cpu(rq->pdev, head->addr, 0, frag_size, rq->buff.map_dir);
 		net_prefetchw(hdr);
@@ -2211,6 +2219,7 @@ mlx5e_skb_from_cqe_shampo(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 	} else {
 		/* allocate SKB and copy header for large header */
 		rq->stats->gro_large_hds++;
+		pr_info("alloc skb for large header\n");
 		skb = napi_alloc_skb(rq->cq.napi,
 				     ALIGN(head_size, sizeof(long)));
 		if (unlikely(!skb)) {
@@ -2251,8 +2260,9 @@ mlx5e_shampo_flush_skb(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe, bool match)
 	struct mlx5e_rq_stats *stats = rq->stats;
 	u16 gro_count = NAPI_GRO_CB(skb)->count;
 
-	if (likely(skb_shinfo(skb)->nr_frags))
+	if (likely(skb_shinfo(skb)->nr_frags)){
 		mlx5e_shampo_align_fragment(skb, rq->mpwqe.log_stride_sz);
+	}
 	if (gro_count > 1) {
 		stats->gro_skbs++;
 		stats->gro_packets += gro_count;
@@ -2262,6 +2272,7 @@ mlx5e_shampo_flush_skb(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe, bool match)
 	} else {
 		skb_shinfo(skb)->gso_size = 0;
 	}
+
 	napi_gro_receive(rq->cq.napi, skb);
 	rq->hw_gro_data->skb = NULL;
 }
@@ -2271,7 +2282,29 @@ mlx5e_hw_gro_skb_has_enough_space(struct sk_buff *skb, u16 data_bcnt)
 {
 	int nr_frags = skb_shinfo(skb)->nr_frags;
 
-	return PAGE_SIZE * nr_frags + data_bcnt <= GRO_LEGACY_MAX_SIZE;
+	//return PAGE_SIZE * nr_frags + data_bcnt <= GRO_LEGACY_MAX_SIZE;
+	if (PAGE_SIZE * nr_frags + data_bcnt <= GRO_LEGACY_MAX_SIZE){
+		return true;
+	} else {
+		//pr_info("skb has not enough space\n");
+		return false;
+	}
+}
+
+static bool mlx5e_flow_keys_equal(const struct flow_keys *a,
+                                  const struct flow_keys *b)
+{
+    if (a->basic.n_proto != b->basic.n_proto)
+        return false;
+    if (a->basic.ip_proto != b->basic.ip_proto)
+        return false;
+    if (a->addrs.v4addrs.src != b->addrs.v4addrs.src ||
+        a->addrs.v4addrs.dst != b->addrs.v4addrs.dst)
+        return false;
+    if (a->ports.src != b->ports.src ||
+        a->ports.dst != b->ports.dst)
+        return false;
+    return true;
 }
 
 static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
@@ -2287,7 +2320,7 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 	u16 head_size		= cqe->shampo.header_size;
 	struct sk_buff **skb	= &rq->hw_gro_data->skb;
 	bool flush		= cqe->shampo.flush;
-	bool match		= cqe->shampo.match;
+	bool match		= cqe->shampo.match; // 다 false로 들어옴
 	struct mlx5e_rq_stats *stats = rq->stats;
 	struct mlx5e_rx_wqe_ll *wqe;
 	struct mlx5e_mpw_info *wi;
@@ -2296,6 +2329,18 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 	wi = mlx5e_get_mpw_info(rq, wqe_id);
 	wi->consumed_strides += cstrides;
 
+
+//pr_info("---------------[packet : %d-----------------\n", wqe_offset);
+/*pr_info("HDS: head_size=%u cqe_bcnt=%u, data_bcnt=%u, data_offset=%u,cstrides=%u,stride_size=%u, match=%u flush=%u\n",
+        cqe->shampo.header_size,
+        mpwrq_get_cqe_byte_cnt(cqe),
+        data_bcnt,
+        data_offset,
+        cstrides,
+        rq->mpwqe.log_stride_sz,
+        cqe->shampo.match,
+        cqe->shampo.flush);
+*/
 	if (unlikely(MLX5E_RX_ERR_CQE(cqe))) {
 		mlx5e_handle_rx_err_cqe(rq, cqe);
 		goto mpwrq_cqe_out;
@@ -2307,11 +2352,23 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 		goto mpwrq_cqe_out;
 	}
 
+
+	/*if (*skb) {
+	struct flow_keys fk_new;
+	skb_flow_dissect_flow_keys(*skb, &fk_new, 0);
+	if (!mlx5e_flow_keys_equal(&rq->hw_gro_data->fk, &fk_new)) {
+		pr_info("flow keys are not equal : %px\n", skb);
+	}
+	}
+	*/
+
+
 	if (*skb && (!match || !(mlx5e_hw_gro_skb_has_enough_space(*skb, data_bcnt)))) {
+		//pr_info("match is false : %px\n", skb);
 		match = false;
 		mlx5e_shampo_flush_skb(rq, cqe, match);
 	}
-
+	
 	if (!*skb) {
 		if (likely(head_size))
 			*skb = mlx5e_skb_from_cqe_shampo(rq, wi, cqe, header_index);
@@ -2320,11 +2377,25 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 								  data_offset, page_idx);
 		if (unlikely(!*skb))
 			goto free_hd_entry;
+		/*syeon*/
+
+	
+				
+		if (head_size == rx_zcopy_head_size) {
+			u8 * th_off = (*skb)->data + 14 + 20 +12;
+			*th_off = (*th_off & 0x0F) | (8 << 4);
+		}
 
 		NAPI_GRO_CB(*skb)->count = 1;
-		skb_shinfo(*skb)->gso_size = cqe_bcnt - head_size;
+		if (head_size == rx_zcopy_head_size)
+			skb_shinfo(*skb)->gso_size = cqe_bcnt - head_size + 24; // syeon increased 24 for zcopy header
+		else
+			skb_shinfo(*skb)->gso_size = cqe_bcnt - head_size;
+		//skb_dump(KERN_INFO, *skb, false);
 	} else {
 		NAPI_GRO_CB(*skb)->count++;
+		//pr_info("NAPI_GRO_CB(*skb)->count: %d\n", NAPI_GRO_CB(*skb)->count);
+		
 		if (NAPI_GRO_CB(*skb)->count == 2 &&
 		    rq->hw_gro_data->fk.basic.n_proto == htons(ETH_P_IP)) {
 			void *hd_addr = mlx5e_shampo_get_packet_hd(rq, header_index);
@@ -2339,7 +2410,6 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 	if (likely(head_size)) {
 		if (data_bcnt) {
 			struct mlx5e_frag_page *frag_page;
-
 			frag_page = &wi->alloc_units.frag_pages[page_idx];
 			mlx5e_shampo_fill_skb_data(*skb, rq, frag_page, data_bcnt, data_offset);
 		} else {
@@ -2347,10 +2417,34 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 			stats->hds_nodata_bytes += head_size;
 		}
 	}
+	// dump skb if first frag page starts with "07 04 18 18"
+/*	
+	if (skb_shinfo(*skb)->nr_frags > 0) {
+		skb_frag_t *f = &skb_shinfo(*skb)->frags[0];
+
+		if (skb_frag_size(f) >= 4) {
+			struct page *page = skb_frag_page(f);
+			unsigned int off  = skb_frag_off(f);
+			void *va          = kmap_local_page(page);
+			const u8 *p       = (const u8 *)va + off;
+
+			if (p[0] == 0x07 && p[1] == 0x04 && p[2] == 0x18 && p[3] == 0x18) {
+				kunmap_local(va);
+				pr_info("[ohmycamisama]] skb: %px\n", *skb);
+				skb_dump(KERN_INFO, *skb, true);
+			} else {
+				kunmap_local(va);
+			}
+		}
+	}
+*/	
 
 	mlx5e_shampo_complete_rx_cqe(rq, cqe, cqe_bcnt, *skb);
-	if (flush && rq->hw_gro_data->skb)
+	// skb_dump(KERN_INFO, *skb, false);
+	if (flush && rq->hw_gro_data->skb){
+		//pr_info("flush and skb is not NULL\n");
 		mlx5e_shampo_flush_skb(rq, cqe, match);
+	}
 free_hd_entry:
 	if (likely(head_size))
 		mlx5e_free_rx_shampo_hd_entry(rq, header_index);

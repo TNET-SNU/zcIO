@@ -396,6 +396,7 @@ void tcp_gro_complete(struct sk_buff *skb)
 
 	if (th->cwr)
 		shinfo->gso_type |= SKB_GSO_TCP_ECN;
+
 }
 EXPORT_SYMBOL(tcp_gro_complete);
 

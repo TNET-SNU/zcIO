@@ -19,6 +19,12 @@
 #include <linux/module.h>
 #include "blk.h"
 
+/*rx-zcopy*/
+#include <net/page_pool/helpers.h>
+#include <linux/zcopy_ctx.h>
+#include <linux/zcopy_mem.h>
+
+
 static inline struct inode *bdev_file_inode(struct file *file)
 {
 	return file->f_mapping->host;
@@ -273,6 +279,48 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 	return ret;
 }
 
+/* rx-zcopy: Page pool 관련 함수들 */
+static inline bool is_pp_page(struct page *page)
+{
+	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
+}
+
+static void blkdev_my_bio_end_io_async(struct bio *bio)
+{
+	struct my_bio_private *priv = bio->bi_private;
+	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)) return;
+	struct my_ctx *ctx = priv->ctx;
+	bio->bi_private = priv->orig_private;
+	bio->bi_end_io = priv->orig_end_io;
+	// this should be called first 
+	// so frag page can be returned to the page pool not released
+	if (priv->orig_end_io){
+		priv->orig_end_io(bio);
+	}
+	
+	if (ctx){
+		// unref frag pages and return to the page pool when it is the last reference
+		//if (!ctx->zc_batch_mode) {
+            /* 기존 동작: old page release + free */
+		for (int i = 0; i < ctx->old_nr_pages; i++) {
+			struct page *page = ctx->old_pages[i];
+			if (!page) continue;
+			if (unlikely(!is_pp_page(page))) {
+				pr_info("page is not pp page: %px\n", page);
+				//put_page(page);
+			}
+			else {
+				put_page(page);
+				page_pool_put_full_page(page->pp, page, false);
+			}
+			ctx->old_pages[i] = NULL;
+		}
+		ctx->old_nr_pages = 0;
+		free_my_ctx(ctx);
+	}
+	kfree(priv);
+}
+
 static void blkdev_bio_end_io_async(struct bio *bio)
 {
 	struct blkdev_dio *dio = container_of(bio, struct blkdev_dio, bio);
@@ -309,6 +357,9 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	struct bio *bio;
 	loff_t pos = iocb->ki_pos;
 	int ret = 0;
+	struct my_bio_private *priv = NULL;
+	//bool enable_zc = READ_ONCE(enable_zerocopy);
+	//printk_ratelimited(KERN_INFO, "direct-io: enable_zc: %d\n", enable_zc);
 
 	if (iocb->ki_flags & IOCB_ALLOC_CACHE)
 		opf |= REQ_ALLOC_CACHE;
@@ -322,6 +373,23 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	bio->bi_end_io = blkdev_bio_end_io_async;
 	bio->bi_ioprio = iocb->ki_ioprio;
 
+	// syeon - create priv only for read
+	if (is_read)
+	{
+		priv = kmalloc(sizeof(struct my_bio_private), GFP_KERNEL);
+		if (priv){
+			//bio->bi_mm = current->mm;
+			priv->magic = MY_BIO_PRIVATE_MAGIC;
+			priv->ctx = init_my_ctx(priv, nr_pages, current->mm);
+			priv->orig_private = bio->bi_private;
+			priv->orig_end_io = bio->bi_end_io;
+			bio->bi_private = priv;
+			bio->bi_end_io = blkdev_my_bio_end_io_async;
+			zcopy_try_register(current->mm);
+		}
+	}
+	
+	
 	if (iov_iter_is_bvec(iter)) {
 		/*
 		 * Users don't rely on the iterator being in any particular
@@ -333,6 +401,17 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	} else {
 		ret = bio_iov_iter_get_pages(bio, iter);
 		if (unlikely(ret)) {
+			if (is_read && priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
+				struct my_ctx *ctx = priv->ctx;
+				if (ctx && ctx->magic == MY_CTX_MAGIC){
+					//trace_printk("[failed] bio_iov_iter_get_pages: bio: %px\n", bio);
+					free_my_ctx(ctx);
+					ctx = NULL;
+				}
+				bio->bi_private = priv->orig_private;
+				bio->bi_end_io = priv->orig_end_io;
+				kfree(priv);
+			}
 			bio_put(bio);
 			return ret;
 		}
@@ -343,6 +422,13 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 		if (user_backed_iter(iter)) {
 			dio->flags |= DIO_SHOULD_DIRTY;
 			bio_set_pages_dirty(bio);
+		}
+		// syeon
+		if (priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
+			if (priv->ctx && priv->ctx->magic == MY_CTX_MAGIC){
+				priv->ctx->total_bytes = bio->bi_iter.bi_size;
+				priv->ctx->nr_pages = priv->ctx->index;
+			}
 		}
 	} else {
 		task_io_account_write(bio->bi_iter.bi_size);

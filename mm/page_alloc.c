@@ -60,6 +60,10 @@
 #include "shuffle.h"
 #include "page_reporting.h"
 
+/*rx-zcopy*/
+#include <net/page_pool/helpers.h>
+#include <net/page_pool/types.h>
+
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
 typedef int __bitwise fpi_t;
 
@@ -1042,7 +1046,11 @@ __always_inline bool free_pages_prepare(struct page *page,
 	bool compound = PageCompound(page);
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
-
+	
+	if ( (page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
+		pr_info("[syeon] ***** is_pp_page : %px, refcount : %d, pp_count : %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+		return false;
+	}
 	trace_mm_page_free(page, order);
 	kmsan_free_page(page, order);
 
@@ -1205,7 +1213,7 @@ static void free_one_page(struct zone *zone, struct page *page,
 {
 	unsigned long flags;
 	int migratetype;
-
+	//pr_info("[************] free_one_page : %px\n", page);
 	spin_lock_irqsave(&zone->lock, flags);
 	migratetype = get_pfnblock_migratetype(page, pfn);
 	__free_one_page(page, pfn, zone, order, migratetype, fpi_flags);
@@ -2600,6 +2608,11 @@ static void free_unref_page_commit(struct zone *zone, struct per_cpu_pages *pcp,
 	}
 }
 
+static inline bool is_page_pool(struct page *page)
+{
+    // 보통 page->pp, page->pp_magic 등으로 pool page 여부 판단
+    return page && page->pp && ((page->pp_magic & ~0x3UL) == PP_SIGNATURE);
+}
 /*
  * Free a pcp page
  */
@@ -2618,7 +2631,7 @@ void free_unref_page(struct page *page, unsigned int order)
 
 	if (!free_pages_prepare(page, order))
 		return;
-
+	//trace_printk("[free_unref_page] page : %px - refcount : %d\n", page, page_ref_count(page));	
 	/*
 	 * We only track unmovable, reclaimable and movable on pcp lists.
 	 * Place ISOLATE pages on the isolated list because they are being

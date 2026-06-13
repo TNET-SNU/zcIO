@@ -4829,6 +4829,20 @@ static void tcp_sack_remove(struct tcp_sock *tp)
 	tp->rx_opt.num_sacks = num_sacks;
 }
 
+static bool is_nvme_tcp_recv_pdu(struct sk_buff *skb)
+{
+    if (!skb || !skb->data)
+        return false;
+
+    // NVMe-TCP PDU header magic은 0x0 or 0x1, type field 확인 (offset 0)
+    u8 pdu_type = skb->data[0];
+    if (pdu_type == 0x07 || pdu_type == 0x05){
+        return true;
+	}
+
+    return false;
+}
+
 /**
  * tcp_try_coalesce - try to merge skb to prior one
  * @sk: socket
@@ -4857,9 +4871,26 @@ static bool tcp_try_coalesce(struct sock *sk,
 
 	if (!tcp_skb_can_collapse_rx(to, from))
 		return false;
+	// if skb linear data is pdu header dont merge
+	if (is_nvme_tcp_recv_pdu(from)){
+		//pr_info("[skb linear data is pdu header dont merge]\n");
+		//pr_info("========== skb to: %px ==========\n", to);
+		//skb_dump(KERN_INFO, to, false);
+		//pr_info("========== skb from: %px ==========\n", from);
+		//skb_dump(KERN_INFO, from, false);
 
+		//return false;
+	}
+	// skb dump 
+	//pr_info("[tcp_try_coalesce] nr_frags: %d\n", skb_shinfo(to)->nr_frags);
 	if (!skb_try_coalesce(to, from, fragstolen, &delta))
 		return false;
+
+//	pr_info("[tcp_try_coalesce] success nr_frags: %d \n", skb_shinfo(to)->nr_frags);
+	//pr_info("========== skb from: %px ==========\n", from);
+	//skb_dump(KERN_INFO, from, true);
+	//pr_info("========== skb to: %px ==========\n", to);
+	//skb_dump(KERN_INFO, to, false);
 
 	atomic_add(delta, &sk->sk_rmem_alloc);
 	sk_mem_charge(sk, delta);
@@ -4915,6 +4946,9 @@ static void tcp_ofo_queue(struct sock *sk)
 	p = rb_first(&tp->out_of_order_queue);
 	while (p) {
 		skb = rb_to_skb(p);
+		//pr_info("========== tcp_ofo_queue skb: %px ==========\n", skb);
+	//	skb_dump(KERN_INFO, skb, true);
+		//pr_info("========== tcp_ofo_queue end ==========\n");
 		if (after(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
 			break;
 
@@ -4931,9 +4965,12 @@ static void tcp_ofo_queue(struct sock *sk)
 			tcp_drop_reason(sk, skb, SKB_DROP_REASON_TCP_OFO_DROP);
 			continue;
 		}
-
+		//pr_info_ratelimited("tcp_ofo_queue - skb data payload size: %d, total size: %d\n", skb->data_len, skb->len);
 		tail = skb_peek_tail(&sk->sk_receive_queue);
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
+		if (eaten) {
+			//pr_info("tcp_ofo_queue - coalesce success\n");
+		}
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
 		if (!eaten)
@@ -5111,6 +5148,10 @@ end:
 		/* For non sack flows, do not grow window to force DUPACK
 		 * and trigger fast retransmit.
 		 */
+		//pr_info("========== tcp_data_queue_ofo coalesce success ==========\n");
+		//pr_info("========== tcp_data_queue_ofo skb: %px ==========\n", skb);
+		//skb_dump(KERN_INFO, skb, true);
+		//pr_info("========== tcp_data_queue_ofo end ==========\n");
 		if (tcp_is_sack(tp))
 			tcp_grow_window(sk, skb, false);
 		skb_condense(skb);
@@ -6057,6 +6098,7 @@ reset:
  */
 void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 {
+
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	const struct tcphdr *th = (const struct tcphdr *)skb->data;
 	struct tcp_sock *tp = tcp_sk(sk);

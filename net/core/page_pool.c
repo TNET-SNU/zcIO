@@ -328,7 +328,8 @@ struct page_pool *page_pool_create(const struct page_pool_params *params)
 }
 EXPORT_SYMBOL(page_pool_create);
 
-static void page_pool_return_page(struct page_pool *pool, netmem_ref netmem);
+/* rx-zcopy */
+void page_pool_return_page(struct page_pool *pool, netmem_ref netmem);
 
 static noinline netmem_ref page_pool_refill_alloc_cache(struct page_pool *pool)
 {
@@ -452,7 +453,8 @@ unmap_failed:
 	return false;
 }
 
-static void page_pool_set_pp_info(struct page_pool *pool, netmem_ref netmem)
+/* rx-zcopy */
+void page_pool_set_pp_info(struct page_pool *pool, netmem_ref netmem)
 {
 	struct page *page = netmem_to_page(netmem);
 
@@ -469,6 +471,7 @@ static void page_pool_set_pp_info(struct page_pool *pool, netmem_ref netmem)
 	if (pool->has_init_callback)
 		pool->slow.init_callback(netmem, pool->slow.init_arg);
 }
+EXPORT_SYMBOL_GPL(page_pool_set_pp_info);
 
 static void page_pool_clear_pp_info(netmem_ref netmem)
 {
@@ -653,6 +656,8 @@ void page_pool_return_page(struct page_pool *pool, netmem_ref netmem)
 	 * __page_cache_release() call).
 	 */
 }
+/*rx-zcopy*/
+EXPORT_SYMBOL_GPL(page_pool_return_page);
 
 static bool page_pool_recycle_in_ring(struct page_pool *pool, netmem_ref netmem)
 {
@@ -692,6 +697,7 @@ static bool page_pool_recycle_in_cache(netmem_ref netmem,
 
 static bool __page_pool_page_can_be_recycled(netmem_ref netmem)
 {
+	//pr_info("**** __page_pool_page_can_be_recycled : page: %px, refcnt: %d, pfmemalloc: %d\n", netmem_to_page(netmem), page_ref_count(netmem_to_page(netmem)), page_is_pfmemalloc(netmem_to_page(netmem)));
 	return page_ref_count(netmem_to_page(netmem)) == 1 &&
 	       !page_is_pfmemalloc(netmem_to_page(netmem));
 }
@@ -707,7 +713,6 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 		     unsigned int dma_sync_size, bool allow_direct)
 {
 	lockdep_assert_no_hardirq();
-
 	/* This allocator is optimized for the XDP mode that uses
 	 * one-frame-per-page, but have fallbacks that act like the
 	 * regular page allocator APIs.
@@ -719,13 +724,16 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 	 */
 	if (likely(__page_pool_page_can_be_recycled(netmem))) {
 		/* Read barrier done in page_ref_count / READ_ONCE */
+		//trace_printk("**[1]** __page_pool_put_page : page: %px, dma_sync_size: %d, allow_direct: %d\n", netmem_to_page(netmem), dma_sync_size, allow_direct);
 
 		page_pool_dma_sync_for_device(pool, netmem, dma_sync_size);
-
-		if (allow_direct && page_pool_recycle_in_cache(netmem, pool))
+		if (allow_direct && page_pool_recycle_in_cache(netmem, pool)){
+			//trace_printk("**[2]** page direct recycled\n");
 			return 0;
+		}
 
 		/* Page found as candidate for recycling */
+		//trace_printk("**[3]** page recycle candidate\n");
 		return netmem;
 	}
 	/* Fallback/non-XDP mode: API user have elevated refcnt.
@@ -742,12 +750,13 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 	 * will be invoking put_page.
 	 */
 	recycle_stat_inc(pool, released_refcnt);
+	//trace_printk("**** page_pool_return_page : page: %px, allow_direct: %d\n", netmem_to_page(netmem), allow_direct);
 	page_pool_return_page(pool, netmem);
 
 	return 0;
 }
 
-static bool page_pool_napi_local(const struct page_pool *pool)
+bool page_pool_napi_local(const struct page_pool *pool)
 {
 	const struct napi_struct *napi;
 	u32 cpuid;
@@ -773,6 +782,7 @@ static bool page_pool_napi_local(const struct page_pool *pool)
 void page_pool_put_unrefed_netmem(struct page_pool *pool, netmem_ref netmem,
 				  unsigned int dma_sync_size, bool allow_direct)
 {
+	//pr_info(" ==== page_pool_put_unrefed_netmem : page: %px, allow_direct: %d\n", netmem_to_page(netmem), allow_direct);
 	if (!allow_direct)
 		allow_direct = page_pool_napi_local(pool);
 
@@ -781,6 +791,7 @@ void page_pool_put_unrefed_netmem(struct page_pool *pool, netmem_ref netmem,
 	if (netmem && !page_pool_recycle_in_ring(pool, netmem)) {
 		/* Cache full, fallback to free pages */
 		recycle_stat_inc(pool, ring_full);
+		//pr_info("cant recycle page: %px, refcnt: %d, pp_refcnt: %d, pfmemalloc: %d\n", netmem_to_page(netmem), page_ref_count(netmem_to_page(netmem)), atomic_long_read(&netmem_to_page(netmem)->pp_ref_count), page_is_pfmemalloc(netmem_to_page(netmem)));
 		page_pool_return_page(pool, netmem);
 	}
 }
@@ -862,7 +873,6 @@ static netmem_ref page_pool_drain_frag(struct page_pool *pool,
 				       netmem_ref netmem)
 {
 	long drain_count = BIAS_MAX - pool->frag_users;
-
 	/* Some user is still using the page frag */
 	if (likely(page_pool_unref_netmem(netmem, drain_count)))
 		return 0;
@@ -883,6 +893,7 @@ static void page_pool_free_frag(struct page_pool *pool)
 
 	pool->frag_page = 0;
 
+	//pr_info(" ==== page_pool_free_frag : page: %px, drain_count: %ld\n", netmem_to_page(netmem), drain_count);
 	if (!netmem || page_pool_unref_netmem(netmem, drain_count))
 		return;
 

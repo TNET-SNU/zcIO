@@ -121,7 +121,6 @@ void __folio_put(struct folio *folio)
 		free_huge_folio(folio);
 		return;
 	}
-
 	page_cache_release(folio);
 	folio_undo_large_rmappable(folio);
 	mem_cgroup_uncharge(folio);

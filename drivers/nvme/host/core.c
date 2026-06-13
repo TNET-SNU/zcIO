@@ -1133,8 +1133,9 @@ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
 		req = blk_mq_alloc_request_hctx(q, nvme_req_op(cmd), blk_flags,
 						qid - 1);
 
-	if (IS_ERR(req))
+	if (IS_ERR(req)){
 		return PTR_ERR(req);
+	}
 	nvme_init_request(req, cmd);
 	if (flags & NVME_SUBMIT_RETRY)
 		req->cmd_flags &= ~REQ_FAILFAST_DRIVER;

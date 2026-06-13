@@ -1030,7 +1030,6 @@ bool napi_pp_put_page(netmem_ref netmem)
 	 */
 	if (unlikely(!is_pp_page(page)))
 		return false;
-
 	page_pool_put_full_netmem(page->pp, page_to_netmem(page), false);
 
 	return true;
@@ -5974,9 +5973,11 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 
 		page = virt_to_head_page(from->head);
 		offset = from->data - (unsigned char *)page_address(page);
-
+	//	pr_info("========== [skb_try_coalesce] merge skb headlen: %d to previous skb\n", skb_headlen(from));
+	//	pr_info("========== previous skb nr_frags: %d ==========\n", to_shinfo->nr_frags);
 		skb_fill_page_desc(to, to_shinfo->nr_frags,
 				   page, offset, skb_headlen(from));
+	//	pr_info("========== after merge skb nr_frags: %d ==========\n", to_shinfo->nr_frags);
 		*fragstolen = true;
 	} else {
 		if (to_shinfo->nr_frags +

@@ -24,6 +24,10 @@
 #include "blk-rq-qos.h"
 #include "blk-cgroup.h"
 
+#include <linux/skbuff_ref.h>
+
+#include <linux/zcopy_ctx.h>
+
 #define ALLOC_CACHE_THRESHOLD	16
 #define ALLOC_CACHE_MAX		256
 
@@ -1178,7 +1182,20 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 		nr_pages = (fi.offset + fi.length - 1) / PAGE_SIZE -
 			   fi.offset / PAGE_SIZE + 1;
 		do {
-			bio_release_page(bio, page++);
+			bio_release_page(bio, page);
+
+//			if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
+				//pr_info("[bio_release_page] page: %px - pp_ref_count: %ld - page_ref_count: %d", page, pp, page_ref_count(page));
+		/*		if (atomic_long_read(&page->pp_ref_count) == 1) {
+					trace_printk("**[7]** bio_release_page - calling skb_page_unref : page: %px - pp_ref_count: %ld\n", page, atomic_long_read(&page->pp_ref_count));
+					//pr_info("skb_page_unref: %px - pp: %ld", page, pp);
+					skb_page_unref(page, true);
+
+				}*/
+//			}
+			//else pr_info("[2][original page] page :%px - refcount : %d", page, page_ref_count(page));
+			page++;
+	
 		} while (--nr_pages != 0);
 	}
 }
@@ -1262,6 +1279,7 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 	size_t offset;
 	int ret = 0;
 
+
 	/*
 	 * Move page array up in the allocated memory for the bio vecs as far as
 	 * possible so that we can start filling biovecs from the beginning
@@ -1299,19 +1317,64 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 		goto out;
 	}
 
+	struct my_ctx *ctx = NULL;
+	struct my_bio_private *priv = bio->bi_private;
+	int base_idx = 0;
+	if (priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
+		ctx = priv->ctx;
+		if (ctx && ctx->magic == MY_CTX_MAGIC){
+			base_idx = ctx->index;
+		}
+	}
+		
 	for (left = size, i = 0; left > 0; left -= len, i++) {
 		struct page *page = pages[i];
 
 		len = min_t(size_t, PAGE_SIZE - offset, left);
+		if (len != PAGE_SIZE){
+			//trace_printk("---[ctx: %px] len: %d - not PAGE_SIZE - offset: %zu\n", ctx, len, offset);
+		}
 		if (bio_op(bio) == REQ_OP_ZONE_APPEND) {
 			ret = bio_iov_add_zone_append_page(bio, page, len,
 					offset);
 			if (ret)
 				break;
-		} else
+		} else {
+			// store user address to bio->bi_private
+			if (ctx && ctx->magic == MY_CTX_MAGIC){
+				if (base_idx + i >= ctx->nr_pages){
+					trace_printk("[error] [bio: %px] base_idx(%d) + i(%d) >= ctx->nr_pages(%d)\n", bio, base_idx, i, ctx->nr_pages);
+				}
+			//	else {
+					if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE){
+						if (page->_pp_mapping_pad){
+							ctx->user_addr[base_idx + i] = (unsigned long)page->_pp_mapping_pad;
+							page->_pp_mapping_pad = 0;
+						}
+					}
+					else {
+						if (page->private){
+							ctx->user_addr[base_idx + i] = (unsigned long)page->private;
+							page->private = 0;
+						}
+					}
+					if (offset != 0) {
+						ctx->head_aligned = false;
+						trace_printk("[ctx: %px] head_aligned: false - offset: %zu\n", ctx, offset);
+					}
+			//	}
+			}
 			bio_iov_add_page(bio, page, len, offset);
-
+		}
 		offset = 0;
+	}
+	if (ctx && ctx->magic == MY_CTX_MAGIC){
+		ctx->index = base_idx + i;
+		if (len != PAGE_SIZE)
+		{
+			ctx->tail_aligned = false;
+			trace_printk("[ctx: %px] tail_aligned: false - len: %d\n", ctx, len);
+		}
 	}
 
 	iov_iter_revert(iter, left);
@@ -1354,13 +1417,11 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 		iov_iter_advance(iter, bio->bi_iter.bi_size);
 		return 0;
 	}
-
 	if (iov_iter_extract_will_pin(iter))
 		bio_set_flag(bio, BIO_PAGE_PINNED);
 	do {
 		ret = __bio_iov_iter_get_pages(bio, iter);
 	} while (!ret && iov_iter_count(iter) && !bio_full(bio, 0));
-
 	return bio->bi_vcnt ? 0 : ret;
 }
 EXPORT_SYMBOL_GPL(bio_iov_iter_get_pages);

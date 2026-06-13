@@ -528,7 +528,6 @@ int nvmf_connect_io_queue(struct nvme_ctrl *ctrl, u16 qid)
 	union nvme_result res;
 	int ret;
 	u32 result;
-
 	nvmf_connect_cmd_prep(ctrl, qid, &cmd);
 
 	data = nvmf_connect_data_prep(ctrl, ctrl->cntlid);
