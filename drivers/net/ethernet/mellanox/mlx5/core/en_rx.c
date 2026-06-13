@@ -1329,8 +1329,11 @@ static void mlx5e_shampo_update_hdr(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
 
 	if (is_ipv4) {
 		int nhoff = rq->hw_gro_data->fk.control.thoff - sizeof(struct iphdr);
+	/*------------------------------------------------------------*/
 		struct iphdr *ipv4 = (struct iphdr *)(skb->data + nhoff);
-		__be16 newlen = htons(skb->len - nhoff);
+		// __be16 newlen = htons(skb->len - nhoff);
+		__be16 newlen = ((skb->len - nhoff) > 0xFFFF) ? 0 : htons(skb->len - nhoff);
+	/*------------------------------------------------------------*/
 
 		csum_replace2(&ipv4->check, ipv4->tot_len, newlen);
 		ipv4->tot_len = newlen;
@@ -2307,6 +2310,57 @@ static bool mlx5e_flow_keys_equal(const struct flow_keys *a,
     return true;
 }
 
+// syeon
+#define TCP_DOFF_WORDS_DELTA   (24 / 4)   /* 24 bytes -> 6 words */
+#define TCP_DOFF_MIN_WORDS     5          /* 20B */
+
+static __always_inline bool zc_rollback_tcp_doff_24B(struct sk_buff *skb)
+{
+    unsigned int off = 0;    /* running offset from skb->data */
+    __be16 proto;
+
+    /* L2 */
+    proto = ((struct ethhdr *)(skb->data))->h_proto;
+    off += sizeof(struct ethhdr);
+
+    /* Optional VLAN (환경에 맞게 0~2개 처리) */
+    if (proto == htons(ETH_P_8021Q) || proto == htons(ETH_P_8021AD)) {
+        struct vlan_hdr *vh = (struct vlan_hdr *)(skb->data + off);
+        proto = vh->h_vlan_encapsulated_proto;
+        off += sizeof(struct vlan_hdr);
+    }
+
+    if (proto != htons(ETH_P_IP))
+        return false;
+
+    /* L3 (IPv4 + options) */
+    {
+        struct iphdr *iph = (struct iphdr *)(skb->data + off);
+        unsigned int ihl = iph->ihl * 4;
+
+        if (unlikely(ihl < sizeof(*iph)))
+            return false;
+
+        off += ihl; /* now at TCP header start */
+    }
+
+    /* TCP: byte 12 holds doff in high nibble */
+    {
+        u8 *doff_byte = (u8 *)(skb->data + off + 12);
+        u8 old_doff   = (*doff_byte >> 4) & 0x0F;
+        u8 new_doff;
+
+        if (unlikely(old_doff < TCP_DOFF_MIN_WORDS + TCP_DOFF_WORDS_DELTA))
+            return false; /* underflow 방지 */
+
+        new_doff = old_doff - TCP_DOFF_WORDS_DELTA;
+
+        *doff_byte = (*doff_byte & 0x0F) | (new_doff << 4);
+    }
+
+    return true;
+}
+
 static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
 {
 	u16 data_bcnt		= mpwrq_get_cqe_byte_cnt(cqe) - cqe->shampo.header_size;
@@ -2377,21 +2431,20 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 								  data_offset, page_idx);
 		if (unlikely(!*skb))
 			goto free_hd_entry;
-		/*syeon*/
-
-	
-				
-		if (head_size == rx_zcopy_head_size) {
-			u8 * th_off = (*skb)->data + 14 + 20 +12;
-			*th_off = (*th_off & 0x0F) | (8 << 4);
-		}
-
+		/* zcIO: SHAMPO RX hack for PDU-aligned zero-copy. When the NIC
+		 * reports the 90B split header, rewrite the TCP data-offset nibble
+		 * back to 8 words and inflate gso_size by 24. (Made toggleable via
+		 * rq->mpwqe.zc_stride in a later commit.)
+		 */
 		NAPI_GRO_CB(*skb)->count = 1;
-		if (head_size == rx_zcopy_head_size)
-			skb_shinfo(*skb)->gso_size = cqe_bcnt - head_size + 24; // syeon increased 24 for zcopy header
-		else
+		if (head_size == rx_zcopy_head_size) {
+			u8 *th_off = (*skb)->data + 14 + 20 + 12;
+
+			*th_off = (*th_off & 0x0F) | (8 << 4);
+			skb_shinfo(*skb)->gso_size = cqe_bcnt - head_size + 24;
+		} else {
 			skb_shinfo(*skb)->gso_size = cqe_bcnt - head_size;
-		//skb_dump(KERN_INFO, *skb, false);
+		}
 	} else {
 		NAPI_GRO_CB(*skb)->count++;
 		//pr_info("NAPI_GRO_CB(*skb)->count: %d\n", NAPI_GRO_CB(*skb)->count);

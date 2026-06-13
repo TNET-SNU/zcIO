@@ -442,9 +442,10 @@ u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
 	if (params->xdp_prog)
 		return PAGE_SHIFT;
 
-	/* syeon */
-	return 12;
-	//return MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev);
+	/* zcIO: force PAGE_SIZE (4K) MPWQE stride for RX zero-copy
+	 * (both initiator and target). Runtime toggle added in a later commit.
+	 */
+	return PAGE_SHIFT;
 }
 
 u8 mlx5e_mpwqe_get_log_num_strides(struct mlx5_core_dev *mdev,

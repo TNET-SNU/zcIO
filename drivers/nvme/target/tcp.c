@@ -22,8 +22,12 @@
 #include <trace/events/sock.h>
 
 #include "nvmet.h"
+#include <linux/nvmet_tcp_zc.h>
+#include <net/page_pool/helpers.h>
 
-#define NVMET_TCP_DEF_INLINE_DATA_SIZE	(4 * PAGE_SIZE)
+extern bool enable_zerocopy;
+
+#define NVMET_TCP_DEF_INLINE_DATA_SIZE	4 * PAGE_SIZE
 #define NVMET_TCP_MAXH2CDATA		0x400000 /* 16M arbitrary limit */
 #define NVMET_TCP_BACKLOG 128
 
@@ -136,6 +140,15 @@ struct nvmet_tcp_cmd {
 
 	__le32				exp_ddgst;
 	__le32				recv_ddgst;
+
+	// syeon
+	/* rx zcopy */
+	enum zc_policy zc_policy;
+	enum zc_reason zc_reason;
+	int zc_total_page_count;
+	struct page *old_pages[ZC_DATA_MAX_PAGES];
+	int old_page_count;
+	struct zc_data zc_data;
 };
 
 enum nvmet_tcp_queue_state {
@@ -147,6 +160,7 @@ enum nvmet_tcp_queue_state {
 };
 
 struct nvmet_tcp_queue {
+	u32				magic;
 	struct socket		*sock;
 	struct nvmet_tcp_port	*port;
 	struct work_struct	io_work;
@@ -195,6 +209,11 @@ struct nvmet_tcp_queue {
 	struct nvmet_tcp_cmd	connect;
 
 	struct page_frag_cache	pf_cache;
+
+	/*rx zcopy*/
+	bool zc_active;
+	struct msghdr zc_msg;
+	bool zc_h2c_data;
 
 	void (*data_ready)(struct sock *);
 	void (*state_change)(struct sock *);
@@ -348,11 +367,482 @@ static int nvmet_tcp_check_ddgst(struct nvmet_tcp_queue *queue, void *pdu)
 	return 0;
 }
 
+
+static __always_inline bool is_pp_page(struct page *page)
+{
+	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
+}
+/*
+static int cleanup_zc_pages(struct nvmet_tcp_cmd *cmd)
+{
+	int i;
+	struct scatterlist *sgl = cmd->req.sg;
+	struct scatterlist *sg;
+	struct page *page;
+
+	for (i = 0; i < cmd->old_page_count; i++){
+		if (cmd->old_pages[i]){
+			if (!PageSlab(cmd->old_pages[i])){
+				put_page(cmd->old_pages[i]);
+			}
+			cmd->old_pages[i] = NULL;
+		}
+	}
+
+	int stored_page_count = cmd->zc_data.page_count;
+	int page_count = 0;
+	if (stored_page_count != cmd->req.sg_cnt){
+		pr_err("[cleanup_zc_pages] stored_page_count != req.sg_cnt: %d != %d\n", stored_page_count, cmd->req.sg_cnt);
+	}
+
+	for_each_sg(sgl, sg, cmd->req.sg_cnt, i){
+		if (!sg){
+			pr_err("[cleanup_zc_pages] sg is NULL\n");
+			continue;
+		}
+		page = sg_page(sg);
+		if (page == NULL){
+			pr_err("[cleanup_zc_pages] page is NULL\n");
+			continue;
+		}
+		if (is_pp_page(page)){
+			//pr_info("[cleanup_zc_pages] page %px, page ref count %d, page_pool ref count %ld\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+            if (page_ref_count(page) > 0){
+		        put_page(page);
+				if (atomic_long_read(&page->pp_ref_count) > 0){
+		            page_pool_put_full_page(page->pp, page,false);
+				}
+            }
+        }
+		else {
+			//pr_info("[cleanup_zc_pages] free page %px\n", page);
+			__free_pages(page, 0);
+		}
+	}
+	kfree(sgl);
+	cmd->req.sg = NULL;
+	cmd->req.sg_cnt = 0;
+	cmd->old_page_count = 0;
+//	cmd->old_pages[0] = NULL;
+	cmd->zc_data.page_count = 0;
+	cmd->zc_total_page_count = 0;
+	return 0;
+}
+	*/
+static bool zc_page_is_stored(struct nvmet_tcp_cmd *cmd, struct page *page)
+{
+	int i;
+
+	for (i = 0; i < cmd->zc_data.page_count; i++) {
+		if (cmd->zc_data.page[i] == page)
+			return true;
+	}
+	return false;
+}
+static int cleanup_zc_pages(struct nvmet_tcp_cmd *cmd)
+{
+	int i;
+	struct scatterlist *sg;
+	struct page *page;
+	struct scatterlist *sgl = cmd->req.sg;
+
+	/* 1) zc_data.page[]에 저장한 zc page 먼저 정리 */
+	for (i = 0; i < cmd->zc_data.page_count; i++) {
+		page = cmd->zc_data.page[i];
+		if (!page)
+			continue;
+
+		if (!is_pp_page(page)) {
+			pr_err("[cleanup_zc_pages] zc page[%d] is not pp page: %px\n",
+			       i, page);
+			cmd->zc_data.page[i] = NULL;
+			continue;
+		}
+
+		if (page_ref_count(page) > 0)
+			put_page(page);
+
+		if (atomic_long_read(&page->pp_ref_count) > 0)
+			page_pool_put_full_page(page->pp, page, false);
+
+	}
+
+	/* 2) old_pages 정리 */
+	for (i = 0; i < cmd->old_page_count; i++) {
+		page = cmd->old_pages[i];
+		if (!page)
+			continue;
+
+		if (!PageSlab(page))
+			put_page(page);
+
+		cmd->old_pages[i] = NULL;
+	}
+
+	/* 3) SG를 돌면서 zc_data.page[]에 없는 page만 정리 */
+	if (sgl) {
+		for_each_sg(sgl, sg, cmd->req.sg_cnt, i) {
+			page = sg_page(sg);
+			if (!page)
+				continue;
+
+			/* 이미 zc_data.page[]에서 정리한 page면 skip */
+			//if (zc_page_is_stored(cmd, page))
+			if (i < cmd->zc_data.page_count)
+				continue;
+
+			/*
+			 * 여기서 뭘 할지는 ownership에 따라 달라짐.
+			 * 정말 alloc_pages()로 만든 일반 page면 __free_pages()
+			 * 그냥 ref만 잡아둔 page면 put_page()
+			 */
+			if (is_pp_page(page)) {
+				pr_err("[cleanup_zc_pages] unexpected pp page in non-zc sg[%d]: %px\n",
+				       i, page);
+				continue;
+			}
+
+			__free_pages(page, 0);
+		}
+
+		kfree(sgl);
+	}
+
+	cmd->req.sg = NULL;
+	cmd->req.sg_cnt = 0;
+	cmd->old_page_count = 0;
+	//for (i = 0; i < cmd->zc_data.page_count; i++)
+   //     cmd->zc_data.page[i] = NULL;
+	cmd->zc_data.page_count = 0;
+//	memset(cmd->old_pages, 0, sizeof(cmd->old_pages));
+	cmd->recv_msg.msg_control = &cmd->zc_data;
+	cmd->recv_msg.msg_controllen = sizeof(cmd->zc_data);
+
+	return 0;
+}
+
+#define ZC_PG_SZ PAGE_SIZE
+#define ZC_PG_MASK (ZC_PG_SZ - 1)
+
+static bool nvmet_tcp_zc_precheck(struct nvmet_tcp_queue *queue, struct nvmet_tcp_cmd *cmd, u32 data_offset, u32 pdu_len){
+	cmd->zc_reason = ZCR_OK;
+
+	if (cmd->zc_policy == ZC_ENABLED){
+		return true;
+	}
+
+	if (!enable_zerocopy){
+		cmd->zc_reason = ZCR_GLOB_OFF;
+		goto error;
+	}
+
+	if (!nvme_is_write(cmd->req.cmd)){
+		cmd->zc_reason = ZCR_NOT_WRITE;
+		goto error;
+	}
+
+	if (!queue || queue->state != NVMET_TCP_Q_LIVE){
+		cmd->zc_reason = ZCR_QUEUE_NOT_LIVE;
+		goto error;
+	}
+
+	if (queue->nvme_sq.qid == 0){
+		cmd->zc_reason = ZCR_QUEUE_QID_0;
+		goto error;
+	}
+
+	if (pdu_len & ZC_PG_MASK){
+		cmd->zc_reason = ZCR_PDU_LEN_NOT_4K;
+		goto error;
+	}
+
+	if (data_offset & ZC_PG_MASK){
+		cmd->zc_reason = ZCR_PDU_OFF_NOT_4K;
+		goto error;
+	}
+
+	if (cmd->req.transfer_len & ZC_PG_MASK){
+		cmd->zc_reason = ZCR_XFER_NOT_4K;
+		goto error;
+	}
+
+	if (cmd->rbytes_done & ZC_PG_MASK){
+		cmd->zc_reason = ZCR_RBYTES_NOT_4K;
+		goto error;
+	}
+
+	if (!cmd->req.sg || cmd->req.sg_cnt == 0){
+		cmd->zc_reason = ZCR_SG_BAD;
+		goto error;
+	}
+
+	struct sock *sk = queue->sock->sk;
+	if (!sk || !sk->sk_user_data || *(u32 *)sk->sk_user_data != NVMET_TCP_MAGIC){
+		cmd->zc_reason = ZCR_SK_BAD;
+		goto error;
+	}
+
+	if (cmd->rbytes_done == 0)
+	{
+		cmd->zc_policy = ZC_ENABLED;
+		cmd->zc_total_page_count = 0;
+
+		cmd->old_page_count = 0;
+		cmd->old_pages[0] = NULL;
+
+		cmd->zc_data.page_count = 0;
+		cmd->recv_msg.msg_control = &cmd->zc_data;
+		cmd->zc_data.page[0] = NULL;
+		cmd->zc_data.zc_policy = true;
+		cmd->recv_msg.msg_controllen = sizeof(cmd->zc_data);
+		//pr_info("[nvmet_tcp_zc_precheck - 0] [cmd: %px] rbytes_done:%d, pdu_len:%d, transfer_len:%zu", cmd, cmd->rbytes_done, pdu_len, cmd->req.transfer_len);
+    }
+	else {
+		pr_info("[nvmet_tcp_zc_precheck] [cmd: %px] rbytes_done:%d, pdu_len:%d, transfer_len:%zu", cmd, cmd->rbytes_done, pdu_len, cmd->req.transfer_len);
+	}
+	return true;
+
+error:
+	return false;
+}
+/*
+static void nvmet_tcp_zc_swap_sg_pages(struct nvmet_tcp_cmd *cmd){
+	struct scatterlist *sg;
+	int i;
+
+	if (!iov_iter_is_bvec(&cmd->recv_msg.msg_iter)) {
+		pr_err("[nvmet_tcp_zc_swap_sg_pages] iter is not bvec! type: %d\n", 
+				iov_iter_type(&cmd->recv_msg.msg_iter));
+		return;
+	}
+
+	int stored_zc_page_count, zc_page_count = 0;
+	struct zc_data *zc_data = (struct zc_data *)cmd->recv_msg.msg_control;
+	stored_zc_page_count = zc_data->page_count;
+
+	if (zc_data->page == NULL){
+		pr_err("[nvmet_tcp_zc_swap_sg_pages] zc_data->page is NULL\n");
+		return;
+	}
+
+	if (zc_data->page_count == 0){
+		//pr_err("[nvmet_tcp_zc_swap_sg_pages] zc_data->page_count is 0\n");
+		return;
+	}
+
+	//pr_info("[nvmet_tcp_zc_swap_sg_pages] start swap sg pages - sg count: %d\n", cmd->req.sg_cnt);
+	for_each_sg(cmd->req.sg, sg, cmd->req.sg_cnt, i){
+		if (!sg){
+			pr_err("[nvmet_tcp_zc_swap_sg_pages] sg is NULL\n");
+			break;
+		}
+		struct page *new_page = zc_data->page[zc_page_count++];
+		if (new_page == NULL || !is_pp_page(new_page)){
+			pr_err("[nvmet_tcp_zc_swap_sg_pages] bv_page is NULL\n");
+			break;
+		}
+		struct page *old_page = sg_page(sg);
+		if (old_page == NULL){
+			pr_err("[nvmet_tcp_zc_swap_sg_pages] old_page is NULL\n");
+			
+		}
+		if (new_page == old_page){
+			pr_info("[nvmet_tcp_zc_swap_sg_pages] new_page == old_page\n");
+			break;
+		}
+		if (is_pp_page(new_page)){
+			if (sg->length != PAGE_SIZE){
+				pr_info("[nvmet_tcp_zc_swap_sg_pages] sg length mismatch: %d != %ld\n", sg->length, PAGE_SIZE);
+				break;
+			}	
+			sg_set_page(sg, new_page, sg->length, sg->offset);
+			if (old_page){
+				cmd->old_pages[cmd->old_page_count++] = old_page;
+			}
+		}
+		else {
+			pr_info("[nvmet_tcp_zc_swap_sg_pages] new_page is not pp page\n");
+			break;
+		}
+		cmd->zc_total_page_count++;
+	}
+
+	if (zc_page_count != cmd->req.sg_cnt){
+		pr_err("[nvmet_tcp_zc_swap_sg_pages] zc_page_count mismatch: %d != %d\n", zc_page_count, cmd->req.sg_cnt);
+		fallback_count++;
+	}
+}
+*/
+
+enum nvmet_tcp_zc_swap_err {
+	NVMET_TCP_ZC_SWAP_OK = 0,
+	NVMET_TCP_ZC_SWAP_ERR_ITER_NOT_BVEC,
+	NVMET_TCP_ZC_SWAP_ERR_ZC_DATA_NULL,
+	NVMET_TCP_ZC_SWAP_ERR_PAGE_ARRAY_NULL,
+	NVMET_TCP_ZC_SWAP_ERR_PAGE_COUNT_ZERO,
+	NVMET_TCP_ZC_SWAP_ERR_PAGE_COUNT_OVERFLOW,
+	NVMET_TCP_ZC_SWAP_ERR_SG_NULL,
+	NVMET_TCP_ZC_SWAP_ERR_NEW_PAGE_NULL,
+	NVMET_TCP_ZC_SWAP_ERR_NEW_PAGE_NOT_PP,
+	NVMET_TCP_ZC_SWAP_ERR_OLD_PAGE_NULL,
+	NVMET_TCP_ZC_SWAP_ERR_SAME_PAGE,
+	NVMET_TCP_ZC_SWAP_ERR_SG_LEN_MISMATCH,
+	NVMET_TCP_ZC_SWAP_ERR_COUNT_MISMATCH,
+};
+
+static const char *nvmet_tcp_zc_swap_err_str(enum nvmet_tcp_zc_swap_err err)
+{
+	switch (err) {
+	case NVMET_TCP_ZC_SWAP_OK:
+		return "OK";
+	case NVMET_TCP_ZC_SWAP_ERR_ITER_NOT_BVEC:
+		return "iter_not_bvec";
+	case NVMET_TCP_ZC_SWAP_ERR_ZC_DATA_NULL:
+		return "zc_data_null";
+	case NVMET_TCP_ZC_SWAP_ERR_PAGE_ARRAY_NULL:
+		return "page_array_null";
+	case NVMET_TCP_ZC_SWAP_ERR_PAGE_COUNT_ZERO:
+		return "page_count_zero";
+	case NVMET_TCP_ZC_SWAP_ERR_PAGE_COUNT_OVERFLOW:
+		return "page_count_overflow";
+	case NVMET_TCP_ZC_SWAP_ERR_SG_NULL:
+		return "sg_null";
+	case NVMET_TCP_ZC_SWAP_ERR_NEW_PAGE_NULL:
+		return "new_page_null";
+	case NVMET_TCP_ZC_SWAP_ERR_NEW_PAGE_NOT_PP:
+		return "new_page_not_pp";
+	case NVMET_TCP_ZC_SWAP_ERR_OLD_PAGE_NULL:
+		return "old_page_null";
+	case NVMET_TCP_ZC_SWAP_ERR_SAME_PAGE:
+		return "same_page";
+	case NVMET_TCP_ZC_SWAP_ERR_SG_LEN_MISMATCH:
+		return "sg_len_mismatch";
+	case NVMET_TCP_ZC_SWAP_ERR_COUNT_MISMATCH:
+		return "count_mismatch";
+	default:
+		return "unknown";
+	}
+}
+
+static void nvmet_tcp_zc_swap_sg_pages(struct nvmet_tcp_cmd *cmd)
+{
+	struct scatterlist *sg;
+	struct zc_data *zc_data;
+	enum nvmet_tcp_zc_swap_err err = NVMET_TCP_ZC_SWAP_OK;
+	int i;
+	int stored_zc_page_count;
+	int zc_page_count = 0;
+	int fail_idx = -1;
+
+	if (!iov_iter_is_bvec(&cmd->recv_msg.msg_iter)) {
+		err = NVMET_TCP_ZC_SWAP_ERR_ITER_NOT_BVEC;
+		goto out;
+	}
+
+	zc_data = (struct zc_data *)cmd->recv_msg.msg_control;
+	if (!zc_data) {
+		err = NVMET_TCP_ZC_SWAP_ERR_ZC_DATA_NULL;
+		goto out;
+	}
+
+	stored_zc_page_count = zc_data->page_count;
+
+	if (!zc_data->page) {
+		err = NVMET_TCP_ZC_SWAP_ERR_PAGE_ARRAY_NULL;
+		goto out;
+	}
+
+	if (stored_zc_page_count == 0) {
+		err = NVMET_TCP_ZC_SWAP_ERR_PAGE_COUNT_ZERO;
+		goto out;
+	}
+
+	for_each_sg(cmd->req.sg, sg, cmd->req.sg_cnt, i) {
+		struct page *new_page;
+		struct page *old_page;
+
+		fail_idx = i;
+
+		if (!sg) {
+			err = NVMET_TCP_ZC_SWAP_ERR_SG_NULL;
+			break;
+		}
+
+		if (zc_page_count >= stored_zc_page_count) {
+			err = NVMET_TCP_ZC_SWAP_ERR_PAGE_COUNT_OVERFLOW;
+			break;
+		}
+
+		new_page = zc_data->page[zc_page_count];
+		if (!new_page) {
+			err = NVMET_TCP_ZC_SWAP_ERR_NEW_PAGE_NULL;
+			break;
+		}
+
+		if (!is_pp_page(new_page)) {
+			err = NVMET_TCP_ZC_SWAP_ERR_NEW_PAGE_NOT_PP;
+			break;
+		}
+
+		old_page = sg_page(sg);
+		if (!old_page) {
+			err = NVMET_TCP_ZC_SWAP_ERR_OLD_PAGE_NULL;
+			break;
+		}
+
+		if (new_page == old_page) {
+			err = NVMET_TCP_ZC_SWAP_ERR_SAME_PAGE;
+			break;
+		}
+
+		if (sg->length != PAGE_SIZE) {
+			err = NVMET_TCP_ZC_SWAP_ERR_SG_LEN_MISMATCH;
+			break;
+		}
+
+		sg_set_page(sg, new_page, sg->length, sg->offset);
+		cmd->old_pages[cmd->old_page_count++] = old_page;
+		cmd->zc_total_page_count++;
+		zc_page_count++;
+	}
+
+	/*
+	 * 루프 내부에서 특정 err가 안 잡혔더라도,
+	 * 결과적으로 다 못 바꿨으면 count mismatch로 기록
+	 */
+	if (zc_page_count != cmd->req.sg_cnt){
+		pr_err_ratelimited("[nvmet_tcp_zc_swap_sg_pages] count mismatch: swapped=%d sg_cnt=%d stored_page_cnt=%d\n",
+			zc_page_count,
+			cmd->req.sg_cnt,
+			stored_zc_page_count);
+		fallback_count++;
+		return;
+	}
+
+out:
+	if (err != NVMET_TCP_ZC_SWAP_OK) {
+		/*pr_err_ratelimited("[nvmet_tcp_zc_swap_sg_pages] failed: reason=%s idx=%d swapped=%d sg_cnt=%d stored_page_cnt=%d iter_type=%d\n",
+		       nvmet_tcp_zc_swap_err_str(err),
+		       fail_idx,
+		       zc_page_count,
+		       cmd->req.sg_cnt,
+		       zc_data ? stored_zc_page_count : -1,
+		       iov_iter_type(&cmd->recv_msg.msg_iter));
+			   */
+	}
+}
 /* If cmd buffers are NULL, no operation is performed */
 static void nvmet_tcp_free_cmd_buffers(struct nvmet_tcp_cmd *cmd)
 {
 	kfree(cmd->iov);
-	sgl_free(cmd->req.sg);
+	/* rx-zcopy start */
+	if (cmd->zc_policy == ZC_ENABLED){
+		cleanup_zc_pages(cmd);
+	}
+	/* rx-zcopy end */
+	else {
+		sgl_free(cmd->req.sg);
+	}
 	cmd->iov = NULL;
 	cmd->req.sg = NULL;
 }
@@ -385,6 +875,7 @@ static void nvmet_tcp_build_pdu_iovec(struct nvmet_tcp_cmd *cmd)
 
 	iov_iter_bvec(&cmd->recv_msg.msg_iter, ITER_DEST, cmd->iov,
 		      nr_pages, cmd->pdu_len);
+	//pr_info("[nvmet_tcp_build_pdu_iovec] iov: %px, nr_pages: %d, pdu_len: %d\n", cmd->iov, nr_pages, cmd->pdu_len);
 }
 
 static void nvmet_tcp_fatal_error(struct nvmet_tcp_queue *queue)
@@ -707,6 +1198,9 @@ static int nvmet_try_send_response(struct nvmet_tcp_cmd *cmd,
 		return -EAGAIN;
 
 	nvmet_tcp_free_cmd_buffers(cmd);
+	//syeon
+	//nvmet_sgl_free(cmd);
+
 	cmd->queue->snd_cmd = NULL;
 	nvmet_tcp_put_cmd(cmd);
 	return 1;
@@ -1015,6 +1509,13 @@ static int nvmet_tcp_handle_h2c_data_pdu(struct nvmet_tcp_queue *queue)
 		goto err_proto;
 	}
 	cmd->pdu_recv = 0;
+
+	//syeon
+	bool zc_enabled = nvmet_tcp_zc_precheck(queue, cmd, le32_to_cpu(data->data_offset), cmd->pdu_len);
+    if (!zc_enabled) {
+		//pr_info("[cmd: %p] zc_enabled: %d, zc_reason: %d\n", cmd, zc_enabled, cmd->zc_reason);
+	}
+
 	nvmet_tcp_build_pdu_iovec(cmd);
 	queue->cmd = cmd;
 	queue->rcv_state = NVMET_TCP_RECV_DATA;
@@ -1095,6 +1596,12 @@ static int nvmet_tcp_done_recv_pdu(struct nvmet_tcp_queue *queue)
 
 	if (nvmet_tcp_need_data_in(queue->cmd)) {
 		if (nvmet_tcp_has_inline_data(queue->cmd)) {
+			//syeon
+			pr_info("[nvmet_tcp_done_recv_pdu] has inline data\n");
+			//bool zc_enabled = nvmet_tcp_zc_precheck(queue, queue->cmd, 0, queue->cmd->pdu_len);
+			//if (!zc_enabled) {
+			//	pr_info("[nvmet_tcp_done_recv_pdu] zc_enabled: %d, zc_reason: %d\n", zc_enabled, queue->cmd->zc_reason);
+			//}
 			queue->rcv_state = NVMET_TCP_RECV_DATA;
 			nvmet_tcp_build_pdu_iovec(queue->cmd);
 			return 0;
@@ -1254,6 +1761,7 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
 	while (msg_data_left(&cmd->recv_msg)) {
 		len = sock_recvmsg(cmd->queue->sock, &cmd->recv_msg,
 			cmd->recv_msg.msg_flags);
+	//	pr_info("[nvmet_tcp_try_recv_data] len: %d, pdu_recv: %d, rbytes_done: %d\n", len, cmd->pdu_recv, cmd->rbytes_done);
 		if (len <= 0)
 			return len;
 		if (queue->tls_pskid) {
@@ -1271,9 +1779,20 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
 		nvmet_tcp_prep_recv_ddgst(cmd);
 		return 0;
 	}
+	
+	if (cmd->rbytes_done == cmd->req.transfer_len){
+	//if (cmd->pdu_recv == cmd->pdu_len){
+		if (cmd->zc_policy == ZC_ENABLED) {
+			nvmet_tcp_zc_swap_sg_pages(cmd);
+			//pr_info("[nvmet_tcp_try_recv_data] zc_total_page_count: %d, pdu_recv: %d, zc_data.page_count: %zu, rbytes_done: %d\n", cmd->zc_total_page_count, cmd->pdu_recv, cmd->zc_data.page_count, cmd->rbytes_done);
+		}
 
-	if (cmd->rbytes_done == cmd->req.transfer_len)
 		nvmet_tcp_execute_request(cmd);
+
+	}
+	else {
+		pr_info("[nvmet_tcp_try_recv_data] just log pdu_recv: %d, rbytes_done: %d, req.transfer_len: %zu\n", cmd->pdu_recv, cmd->rbytes_done, cmd->req.transfer_len);
+	}
 
 	nvmet_prepare_receive_pdu(queue);
 	return 0;
@@ -1389,6 +1908,7 @@ static void nvmet_tcp_release_queue(struct kref *kref)
 		container_of(kref, struct nvmet_tcp_queue, kref);
 
 	WARN_ON(queue->state != NVMET_TCP_Q_DISCONNECTING);
+	pr_info("[nvmet_tcp_release_queue] fallback_count: %d\n", READ_ONCE(fallback_count));
 	queue_work(nvmet_wq, &queue->release_work);
 }
 
@@ -1885,6 +2405,9 @@ static void nvmet_tcp_alloc_queue(struct nvmet_tcp_port *port,
 	INIT_WORK(&queue->release_work, nvmet_tcp_release_queue_work);
 	INIT_WORK(&queue->io_work, nvmet_tcp_io_work);
 	kref_init(&queue->kref);
+	// syeon
+	queue->magic = NVMET_TCP_MAGIC;
+
 	queue->sock = newsock;
 	queue->port = port;
 	queue->nr_cmds = 0;
