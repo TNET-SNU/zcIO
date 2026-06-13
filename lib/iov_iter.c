@@ -1544,6 +1544,8 @@ static ssize_t iov_iter_extract_kvec_pages(struct iov_iter *i,
 }
 
 /* rx-zcopy*/
+/* zcIO: host(initiator) RX zero-copy toggle, defined in drivers/nvme/host/tcp.c. */
+extern int nvme_host_rx_zc;
 static bool set_user_address_page(struct page **page, unsigned long first_addr, unsigned long addr, int page_count)
 {
 
@@ -1623,12 +1625,12 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
 	if (unlikely(res <= 0))
 		return res;
 	maxsize = min_t(size_t, maxsize, res * PAGE_SIZE - offset);
-	/* rx-zcopy*/
-	//if (i->data_source == ITER_DEST && offset != 0){
-		//pr_info("[syeon] user address page offset is not zero, offset = %zu\n", offset);
-	//}
-
-	set_user_address_page(*pages, first_addr, addr, res);
+	/* zcIO: only stamp the user address into page->private/_pp_mapping_pad
+	 * when host RX zero-copy is enabled. When off, leave every extracted
+	 * page untouched -> exact vanilla direct-I/O behaviour.
+	 */
+	if (READ_ONCE(nvme_host_rx_zc))
+		set_user_address_page(*pages, first_addr, addr, res);
 
 	iov_iter_advance(i, maxsize);
 	return maxsize;

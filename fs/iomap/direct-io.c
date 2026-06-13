@@ -449,8 +449,9 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 		bio->bi_private = dio;
 		bio->bi_end_io = iomap_dio_bio_end_io;
 
-		// syeon
-		if ( !(dio->flags & IOMAP_DIO_WRITE)){
+		// syeon - only for read, and only when host RX zero-copy is on.
+		// When off this block is skipped -> exact vanilla iomap dio path.
+		if ( !(dio->flags & IOMAP_DIO_WRITE) && READ_ONCE(nvme_host_rx_zc)){
 			priv = kmalloc(sizeof(struct my_bio_private), GFP_KERNEL);
 			if (priv){
 				priv->magic = MY_BIO_PRIVATE_MAGIC;

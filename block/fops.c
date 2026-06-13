@@ -373,8 +373,9 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	bio->bi_end_io = blkdev_bio_end_io_async;
 	bio->bi_ioprio = iocb->ki_ioprio;
 
-	// syeon - create priv only for read
-	if (is_read)
+	// syeon - create priv only for read, and only when host RX zero-copy is on.
+	// When off this whole block is skipped -> exact vanilla bio path.
+	if (is_read && READ_ONCE(nvme_host_rx_zc))
 	{
 		priv = kmalloc(sizeof(struct my_bio_private), GFP_KERNEL);
 		if (priv){

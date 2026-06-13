@@ -54,6 +54,13 @@ struct my_bio_private{
 };
 
 
+/* zcIO: host(initiator) RX zero-copy master toggle.
+ * Defined in drivers/nvme/host/tcp.c (nvme-tcp, built-in when CONFIG_NVME_TCP=y).
+ * Declared here so every host-side TU (block/fops, iomap, iov_iter, zcopy_*)
+ * shares one consistently-typed (int) view and gates on it identically.
+ */
+extern int nvme_host_rx_zc;
+
 struct my_ctx *init_my_ctx(struct my_bio_private *priv, int nr_pages, struct mm_struct *mm);
 struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm);
 void free_my_ctx(struct my_ctx *ctx);
