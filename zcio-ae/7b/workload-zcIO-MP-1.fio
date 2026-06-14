@@ -1,0 +1,16 @@
+# workload-zcIO-MP-1.fio — fig-7b per-(config,cores) 256k RANDOM-WRITE fio params (kernel initiator). EDIT to tune.
+#
+# [global]-ONLY: workload.sh appends one [dev0..7] section per discovered device
+# at runtime. Do NOT add [job]/filename lines here.
+# runtime must exceed MAX_SAMPLE_SECS in workload.sh (default 30s).
+[global]
+ioengine=libaio
+direct=1
+rw=randwrite
+time_based=1
+runtime=40s
+ramp_time=0
+group_reporting=1
+numjobs=1
+iodepth=1
+bs=256k
