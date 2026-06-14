@@ -2,21 +2,20 @@
 
 This page is for the Artifact Evaluation of zcIO (FAST '27).
 
-First, log in to `stream5.snu.ac.kr`, using the SSH private key whose public key is
-registered on stream5. To see the visual graphs, we recommend using X-window
-(X11 forwarding).
+First, log in to `stream5.snu.ac.kr` as the AE account `fast27` (password announced
+in advance). To see the visual graphs, we recommend using X-window (X11 forwarding).
 
 ```bash
 # at your local machine
 ssh -Y fast27@stream5.snu.ac.kr
 ```
 
-Then switch to the experiment account (`syeon`) and go to the `zcio-ae` directory.
+You are now in the `fast27` home; go to the `zcio-ae` directory (the repo is cloned
+at `/home/fast27/zcIO`).
 
 ```bash
 # at stream5, logged in as fast27
-sudo -iu syeon   # enter fast27's password (announced in advance)
-cd ~/zcIO/zcio-ae
+cd ~/zcIO/zcio-ae          # = /home/fast27/zcIO/zcio-ae
 ```
 
 ## One-time setup (`deploy.sh`)
@@ -90,7 +89,6 @@ cd ~/zcIO/zcio-ae
 BMC_HOST=<bmc-ip> BMC_USER=admin BMC_PASS=<announced> ./bmc-reset.sh
 ```
 
-2. After about 10 minutes, log back in to `stream5` and switch to `syeon` again
-   (`sudo -iu syeon`).
+2. After about 10 minutes, log back in to `stream5` as `fast27`.
 
 3. Go back to the figure's directory and run `./all_in_one.sh` again.
