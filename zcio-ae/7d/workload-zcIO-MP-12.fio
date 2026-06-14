@@ -1,0 +1,16 @@
+# workload-zcIO-MP-12.fio — fig-7d per-(config,cores) fio params. EDIT to tune this point.
+#
+# [global]-ONLY: workload.sh appends one [dev0..7] section per discovered device
+# at runtime. Do NOT add [job]/filename lines here.
+# runtime must exceed MAX_SAMPLE_SECS in workload.sh (default 30s).
+[global]
+ioengine=libaio
+direct=1
+rw=randread
+time_based=1
+runtime=40s
+ramp_time=0
+group_reporting=1
+numjobs=32
+iodepth=64
+bs=256k

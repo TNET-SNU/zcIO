@@ -1,0 +1,18 @@
+{
+  "_comment": "fig-7c SPDK bdev config — our 8 subsystems with CURRENT IPs (ens17np0=10.3.95.10, ens19np0=10.3.96.10). Regenerated from jonghyeon's spdk_nvme3.json which used the old 10.3.91/95 addressing. bdevs become Nvme0n1..Nvme7n1.",
+  "subsystems": [
+    {
+      "subsystem": "bdev",
+      "config": [
+        { "method": "bdev_nvme_attach_controller", "params": { "name": "Nvme0", "trtype": "TCP", "adrfam": "IPv4", "traddr": "10.3.95.10", "trsvcid": "4420", "subnqn": "nvmet-ens17np0-nvme6n1" } },
+        { "method": "bdev_nvme_attach_controller", "params": { "name": "Nvme1", "trtype": "TCP", "adrfam": "IPv4", "traddr": "10.3.95.10", "trsvcid": "4420", "subnqn": "nvmet-ens17np0-nvme7n1" } },
+        { "method": "bdev_nvme_attach_controller", "params": { "name": "Nvme2", "trtype": "TCP", "adrfam": "IPv4", "traddr": "10.3.95.10", "trsvcid": "4420", "subnqn": "nvmet-ens17np0-nvme8n1" } },
+        { "method": "bdev_nvme_attach_controller", "params": { "name": "Nvme3", "trtype": "TCP", "adrfam": "IPv4", "traddr": "10.3.95.10", "trsvcid": "4420", "subnqn": "nvmet-ens17np0-nvme9n1" } },
+        { "method": "bdev_nvme_attach_controller", "params": { "name": "Nvme4", "trtype": "TCP", "adrfam": "IPv4", "traddr": "10.3.96.10", "trsvcid": "4420", "subnqn": "nvmet-ens19np0-nvme2n1" } },
+        { "method": "bdev_nvme_attach_controller", "params": { "name": "Nvme5", "trtype": "TCP", "adrfam": "IPv4", "traddr": "10.3.96.10", "trsvcid": "4420", "subnqn": "nvmet-ens19np0-nvme3n1" } },
+        { "method": "bdev_nvme_attach_controller", "params": { "name": "Nvme6", "trtype": "TCP", "adrfam": "IPv4", "traddr": "10.3.96.10", "trsvcid": "4420", "subnqn": "nvmet-ens19np0-nvme4n1" } },
+        { "method": "bdev_nvme_attach_controller", "params": { "name": "Nvme7", "trtype": "TCP", "adrfam": "IPv4", "traddr": "10.3.96.10", "trsvcid": "4420", "subnqn": "nvmet-ens19np0-nvme5n1" } }
+      ]
+    }
+  ]
+}
