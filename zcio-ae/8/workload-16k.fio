@@ -1,0 +1,16 @@
+# workload-16k.fio — fig-8 per-block-size fio params. EDIT to tune this block size.
+#
+# [global]-ONLY: workload.sh appends one [dev0..3] section per discovered device
+# at runtime. Do NOT add [job]/filename lines here.
+# runtime must exceed MAX_SAMPLE_SECS in workload.sh (default 30s).
+[global]
+ioengine=libaio
+direct=1
+rw=read
+time_based=1
+runtime=40s
+ramp_time=0
+group_reporting=1
+numjobs=1
+iodepth=64
+bs=16k
