@@ -1,0 +1,24 @@
+# workload-spdk-32k.fio — fig-7c per-(config,bs) fio params. EDIT to tune this point.
+#
+# workload-spdk.sh replaces __JSON__ with the absolute path to spdk_nvme.json and
+# passes --bs=<size> on the command line (so do NOT set bs= here). The 8 bdevs
+# Nvme0n1..Nvme7n1 come from spdk_nvme.json (8 attached controllers).
+#
+# runtime must exceed MAX_SAMPLE_SECS in workload-spdk.sh (default 20s).
+[global]
+ioengine=spdk_bdev
+spdk_json_conf=__JSON__
+thread=1
+group_reporting=1
+direct=1
+rw=randread
+time_based=1
+runtime=40s
+ramp_time=0
+numjobs=1
+iodepth=32
+
+bs=32k
+
+[disks]
+filename=Nvme0n1:Nvme1n1:Nvme2n1:Nvme3n1
