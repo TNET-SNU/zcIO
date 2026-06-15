@@ -21,10 +21,10 @@ TADDR_95="10.3.95.10"; TADDR_96="10.3.96.10"
 NQNS_95=(nvmet-ens17np0-nvme6n1 nvmet-ens17np0-nvme7n1 nvmet-ens17np0-nvme8n1 nvmet-ens17np0-nvme9n1)
 NQNS_96=(nvmet-ens19np0-nvme2n1 nvmet-ens19np0-nvme3n1 nvmet-ens19np0-nvme4n1 nvmet-ens19np0-nvme5n1)
 
-WARMUP_SECS="${WARMUP_SECS:-10}"
-STEADY_WINDOW="${STEADY_WINDOW:-5}"
-STEADY_THRESH="${STEADY_THRESH:-5}"
-MAX_SAMPLE_SECS="${MAX_SAMPLE_SECS:-20}"   # cap when it never converges (e.g. 1 core)
+WARMUP_SECS="${WARMUP_SECS:-20}"
+STEADY_WINDOW="${STEADY_WINDOW:-10}"
+STEADY_THRESH="${STEADY_THRESH:-15}"
+MAX_SAMPLE_SECS="${MAX_SAMPLE_SECS:-50}"   # cap when it never converges (e.g. 1 core)
 
 OUT="${1:?usage: workload.sh <out_dir> <config> <cores-list>}"
 CONFIG="${2:?usage: workload.sh <out_dir> <config> <cores-list>}"
@@ -71,7 +71,7 @@ trap disconnect_all EXIT
 connect_one() {  # nqn addr  — retry: some of the 8 occasionally time out under burst
     local nqn="$1" addr="$2" i
     for i in 1 2 3 4 5; do
-        nvme connect -t tcp -n "$nqn" -a "$addr" -s "$TSVC" --disable-sqflow && return 0
+        nvme connect -t tcp -n "$nqn" -a "$addr" -s "$TSVC" --disable-sqflow -i 27 && return 0
         echo "  retry $i/5: $nqn @ $addr"
         nvme disconnect -n "$nqn" >/dev/null 2>&1 || true
         sleep 2
@@ -86,6 +86,7 @@ nvme disconnect-all >/dev/null 2>&1 || true
 sleep 1
 for nqn in "${NQNS_95[@]}"; do connect_one "$nqn" "$TADDR_95"; done
 for nqn in "${NQNS_96[@]}"; do connect_one "$nqn" "$TADDR_96"; done
+sleep 5  # let the 8 controllers settle before probing/running fio
 
 DEVS=()
 for nqn in "${NQNS_95[@]}" "${NQNS_96[@]}"; do
@@ -94,6 +95,22 @@ for nqn in "${NQNS_95[@]}" "${NQNS_96[@]}"; do
 done
 [[ ${#DEVS[@]} -gt 0 ]] || { echo "ERROR: no target devices appeared"; exit 1; }
 echo "[workload] ${#DEVS[@]} devices: ${DEVS[*]}"
+
+# ----- ensure the TARGET (rapids0) keeps the larger RX ring ------------
+# target-net-config.sh sets this, but only runs via all_in_one prep; when
+# workload.sh is run directly the target ring can sit at the driver default
+# (and it reverts on any mlx5 reload). Assert rx=8192 here so every run uses
+# it. workload.sh runs as root, so ssh as the invoking user ($SUDO_USER).
+RAPIDS0="${RAPIDS0:-rapids0.snu.ac.kr}"
+RUN_AS="${SUDO_USER:-$USER}"
+for tnic in ens17np0 ens19np0; do
+    if sudo -u "$RUN_AS" ssh -o ConnectTimeout=10 "$RAPIDS0" "sudo -n ethtool -G $tnic rx 8192" 2>/dev/null; then
+        cur=$(sudo -u "$RUN_AS" ssh -o ConnectTimeout=10 "$RAPIDS0" "ethtool -g $tnic 2>/dev/null | awk '/Current/{f=1} f&&/RX:/{print \$2; exit}'")
+        echo "[workload] rapids0 $tnic rx ring -> ${cur:-?}"
+    else
+        echo "[workload] WARN: could not set rapids0 $tnic rx ring (check ssh/sudo)"
+    fi
+done
 
 build_job() {  # jobfile out_file
     local jf="$1" f="$2" i=0
@@ -107,20 +124,24 @@ kill_fio() {
     wait "$1" 2>/dev/null || true
 }
 
-echo "cores,net_steady_GBps" > "$SUMMARY"
+echo "cores,net_steady_GBps,fio_read_GBps" > "$SUMMARY"
 
 # ----- sweep core count DOWN, measuring at each ------------------------
 for n in "${CORES[@]}"; do
     echo "================ cores=$n ================"
     ./cpu-limit.sh "$n" || echo "  WARN: cpu-limit $n failed"
     ./cpu-governor.sh performance >/dev/null 2>&1 || true
-    ./set-irq-affinity.sh >/dev/null 2>&1 || true
+    #./set-irq-affinity.sh >/dev/null 2>&1 || true
+    systemctl start irqbalance 2>/dev/null || true   # let irqbalance handle IRQs (no manual pin)
+
     sleep 1
 
     jf="workload-${CONFIG}-${n}.fio"
     [[ -f "$jf" ]] || { echo "  WARN: $jf not found — skipping cores=$n"; continue; }
     job="$(mktemp)"; build_job "$jf" "$job"
-    fio "$job" >/dev/null 2>"$OUT/cores-$n.err" &
+    # keep fio's own stdout so we can read its reported READ bw (printed on
+    # SIGTERM too) and compare it against the NIC rx-counter measurement below.
+    fio "$job" >"$OUT/cores-$n.fio.log" 2>"$OUT/cores-$n.err" &
     fpid=$!
 
     prev_rx=$(( $(cat "$RX95") + $(cat "$RX96") )); prev_t=$(date +%s.%N)
@@ -146,9 +167,14 @@ for n in "${CORES[@]}"; do
 
     win=("${tps[@]: -STEADY_WINDOW}")
     read -r steady_gbps cov_pct <<<"$(printf '%s\n' "${win[@]}" | awk '{s+=$1;ss+=$1*$1;nn++} END{m=s/nn;v=ss/nn-m*m;sd=(v>0)?sqrt(v):0;printf "%.2f %.2f",m,(m>0)?100*sd/m:0}')"
+    # fio's own aggregate READ bw (decimal GB/s, the parenthesised SI value) —
+    # whole-run avg, comparable to the NIC steady GB/s above. "n/a" if fio was
+    # SIGKILLed before printing its summary.
+    fio_bw_raw="$(awk -F'[()]' '/READ: bw=/{print $2; exit}' "$OUT/cores-$n.fio.log" 2>/dev/null)"
+    fio_gbps="$(awk -v s="$fio_bw_raw" 'BEGIN{if(s==""){print "n/a";exit} v=s+0; if(s~/TB\/s/)m=1000;else if(s~/GB\/s/)m=1;else if(s~/MB\/s/)m=0.001;else if(s~/kB\/s/)m=0.000001;else m=1; printf "%.2f", v*m}')"
     [[ "$steady" -eq 1 ]] && tag="steady" || tag="NOT-converged(${MAX_SAMPLE_SECS}s)"
-    echo "  cores=$n  net RX $tag: $steady_gbps GB/s  (CoV $cov_pct%)"
-    echo "$n,$steady_gbps" >> "$SUMMARY"
+    echo "  cores=$n  net RX $tag: $steady_gbps GB/s  (CoV $cov_pct%)   |   fio READ: $fio_gbps GB/s"
+    echo "$n,$steady_gbps,$fio_gbps" >> "$SUMMARY"
 done
 
 echo

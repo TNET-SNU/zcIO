@@ -32,15 +32,17 @@ cfg_nic() {  # iface ip prefix
   ip link set "${iface}" mtu "${MTU}"
   ethtool -K "${iface}" tso "${TSO}" gso "${GSO}" || true
 
-  # MTU/up bounces can flush the address; re-add if missing.
+  # MTU/up and ring resize can flush the address; re-add if missing.
   if ! ip -4 addr show dev "${iface}" | grep -qw "${ip}/${prefix}"; then
     ip addr add "${ip}/${prefix}" dev "${iface}" || true
   fi
 
-  local cur_tso cur_gso
+  local cur_tso cur_gso cur_rx cur_tx
   cur_tso=$(ethtool -k "${iface}" | awk -F': ' '/^tcp-segmentation-offload:/{print $2}')
   cur_gso=$(ethtool -k "${iface}" | awk -F': ' '/^generic-segmentation-offload:/{print $2}')
-  echo "  ${iface}: mtu=$(cat /sys/class/net/${iface}/mtu) tso=${cur_tso} gso=${cur_gso} ip=${ip}/${prefix}"
+  cur_rx=$(ethtool -g "${iface}" 2>/dev/null | awk '/^Current/{f=1} f&&/^RX:/{print $2; exit}')
+  cur_tx=$(ethtool -g "${iface}" 2>/dev/null | awk '/^Current/{f=1} f&&/^TX:/{print $2; exit}')
+  echo "  ${iface}: mtu=$(cat /sys/class/net/${iface}/mtu) tso=${cur_tso} gso=${cur_gso} rx_ring=${cur_rx} tx_ring=${cur_tx} ip=${ip}/${prefix}"
 }
 
 echo "[target-net-config] MTU=${MTU} TSO=${TSO} GSO=${GSO} pdu_align=${PDU}"
