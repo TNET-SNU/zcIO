@@ -13,6 +13,6 @@ sudo sysctl -w net.core.wmem_max=67108864
 sudo sysctl -w net.ipv4.tcp_rmem='4096 1048576 67108864'
 sudo sysctl -w net.ipv4.tcp_wmem='4096 1048576 67108864'
 
-sudo ethtool -G ens17np0 rx 4096 tx 8192
-sudo ethtool -G ens19np0 rx 4096 tx 8192
+sudo ethtool -G ens17np0 rx 8192 tx 8192
+sudo ethtool -G ens19np0 rx 8192 tx 8192
 
