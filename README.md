@@ -5,6 +5,10 @@ zcIO is a Linux kernel including a novel Linux NVMe/TCP stack that achieves seam
 
 # Why zero-copy needed?
 
+<p align="center">
+  <img width="800" src="https://github.com/user-attachments/assets/bfda35d0-75b4-4e37-a3fe-c83876c31a72">
+</p>
+
 Our profiling confirms that data copies during H2CData/C2HData PDU processing dominate the receive (RX) path for both READ operation and WRITE operation for large block data via NVMe/TCP (41.99%/40.52% of total CPU cycles for READ, and WRITE, respectively).
 
 
