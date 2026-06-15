@@ -49,17 +49,17 @@ group share the same kernels, so you only switch (reboot) kernels once between t
 two groups. Each `all_in_one.sh` checks the kernels and tells you exactly what to
 do if they don't match.
 
-| order | figure | path  |
-|-------|--------|-------|
-| 1     | `8`    | read  |
-| 2     | `7c`   | read  |
-| 3     | `7d`   | read  |
-| 4     | `9a`   | read  |
-| 5     | `9b`   | read  |
-| 6     | `9c`   | read  |
-| 7     | `9d`   | read  |
-| 8     | `7a`   | write |
-| 9     | `7b`   | write |
+| order | figure | path  | estimated time |
+|-------|--------|-------|----------------|
+| 1     | `8`    | read  |  |
+| 2     | `7c`   | read  |  |
+| 3     | `7d`   | read  |  |
+| 4     | `9a`   | read  |  |
+| 5     | `9b`   | read  |  |
+| 6     | `9c`   | read  |  |
+| 7     | `9d`   | read  |  |
+| 8     | `7a`   | write | 13m |
+| 9     | `7b`   | write | 20m |
 
 ## Topology
 
