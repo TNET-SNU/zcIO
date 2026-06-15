@@ -10,6 +10,10 @@
 #
 # The core list MUST be descending (we only ever offline more cores after the
 # full-core connect; onlining cores mid-run would re-trigger the connect path).
+#
+# Retry-on-low: for RETRY_CONFIGS at RETRY_CORES, if fio READ stays below
+# MIN_GBPS (a degraded "one-NIC" run), disconnect -> online all cores ->
+# reconnect -> cpu-limit back down -> remeasure, up to MAX_RETRY times.
 set -uo pipefail
 
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -25,6 +29,16 @@ WARMUP_SECS="${WARMUP_SECS:-20}"
 STEADY_WINDOW="${STEADY_WINDOW:-10}"
 STEADY_THRESH="${STEADY_THRESH:-15}"
 MAX_SAMPLE_SECS="${MAX_SAMPLE_SECS:-50}"   # cap when it never converges (e.g. 1 core)
+
+# retry-on-low (fixes the intermittent "one-NIC" degraded run)
+MIN_GBPS="${MIN_GBPS:-60}"                 # remeasure if fio READ stays below this
+RETRY_CORES="${RETRY_CORES:-15}"           # only these core counts are retried
+RETRY_CONFIGS="${RETRY_CONFIGS:-zcIO-MP zcIO-MT}"  # only these configs are retried
+MAX_RETRY="${MAX_RETRY:-5}"                # max attempts (incl. the first) per point
+MAXCORES="$(nproc --all)"
+
+RAPIDS0="${RAPIDS0:-rapids0.snu.ac.kr}"
+RUN_AS="${SUDO_USER:-$USER}"
 
 OUT="${1:?usage: workload.sh <out_dir> <config> <cores-list>}"
 CONFIG="${2:?usage: workload.sh <out_dir> <config> <cores-list>}"
@@ -80,37 +94,38 @@ connect_one() {  # nqn addr  — retry: some of the 8 occasionally time out unde
     return 1
 }
 
-# ----- connect ONCE at full cores -------------------------------------
-echo "[workload] connecting 8 subsystems (at full cores) ..."
-nvme disconnect-all >/dev/null 2>&1 || true
-sleep 1
-for nqn in "${NQNS_95[@]}"; do connect_one "$nqn" "$TADDR_95"; done
-for nqn in "${NQNS_96[@]}"; do connect_one "$nqn" "$TADDR_96"; done
-sleep 5  # let the 8 controllers settle before probing/running fio
+assert_target_ring() {  # keep rapids0 data NICs at rx 8192 (reverts on mlx5 reload)
+    local tnic cur
+    for tnic in ens17np0 ens19np0; do
+        if sudo -u "$RUN_AS" ssh -o ConnectTimeout=10 "$RAPIDS0" "sudo -n ethtool -G $tnic rx 8192" 2>/dev/null; then
+            cur=$(sudo -u "$RUN_AS" ssh -o ConnectTimeout=10 "$RAPIDS0" "ethtool -g $tnic 2>/dev/null | awk '/Current/{f=1} f&&/RX:/{print \$2; exit}'")
+            echo "[workload] rapids0 $tnic rx ring -> ${cur:-?}"
+        else
+            echo "[workload] WARN: could not set rapids0 $tnic rx ring (check ssh/sudo)"
+        fi
+    done
+}
 
-DEVS=()
-for nqn in "${NQNS_95[@]}" "${NQNS_96[@]}"; do
-    dev=""; for _ in $(seq 1 20); do dev="$(find_dev "$nqn")" && break; sleep 0.5; done
-    [[ -n "$dev" ]] && DEVS+=("$dev") || echo "  WARN: no device for $nqn"
-done
-[[ ${#DEVS[@]} -gt 0 ]] || { echo "ERROR: no target devices appeared"; exit 1; }
-echo "[workload] ${#DEVS[@]} devices: ${DEVS[*]}"
+# (re)connect all 8 subsystems at full cores, repopulate DEVS, assert target ring.
+connect_all() {
+    local nqn dev
+    echo "[workload] (re)connecting 8 subsystems at full cores ($MAXCORES) ..."
+    ./cpu-limit.sh "$MAXCORES" >/dev/null 2>&1 || echo "  WARN: online-all cores failed"
+    nvme disconnect-all >/dev/null 2>&1 || true
+    sleep 1
+    for nqn in "${NQNS_95[@]}"; do connect_one "$nqn" "$TADDR_95"; done
+    for nqn in "${NQNS_96[@]}"; do connect_one "$nqn" "$TADDR_96"; done
+    sleep 5  # let the 8 controllers settle before probing/running fio
 
-# ----- ensure the TARGET (rapids0) keeps the larger RX ring ------------
-# target-net-config.sh sets this, but only runs via all_in_one prep; when
-# workload.sh is run directly the target ring can sit at the driver default
-# (and it reverts on any mlx5 reload). Assert rx=8192 here so every run uses
-# it. workload.sh runs as root, so ssh as the invoking user ($SUDO_USER).
-RAPIDS0="${RAPIDS0:-rapids0.snu.ac.kr}"
-RUN_AS="${SUDO_USER:-$USER}"
-for tnic in ens17np0 ens19np0; do
-    if sudo -u "$RUN_AS" ssh -o ConnectTimeout=10 "$RAPIDS0" "sudo -n ethtool -G $tnic rx 8192" 2>/dev/null; then
-        cur=$(sudo -u "$RUN_AS" ssh -o ConnectTimeout=10 "$RAPIDS0" "ethtool -g $tnic 2>/dev/null | awk '/Current/{f=1} f&&/RX:/{print \$2; exit}'")
-        echo "[workload] rapids0 $tnic rx ring -> ${cur:-?}"
-    else
-        echo "[workload] WARN: could not set rapids0 $tnic rx ring (check ssh/sudo)"
-    fi
-done
+    DEVS=()
+    for nqn in "${NQNS_95[@]}" "${NQNS_96[@]}"; do
+        dev=""; for _ in $(seq 1 20); do dev="$(find_dev "$nqn")" && break; sleep 0.5; done
+        [[ -n "$dev" ]] && DEVS+=("$dev") || echo "  WARN: no device for $nqn"
+    done
+    [[ ${#DEVS[@]} -gt 0 ]] || { echo "ERROR: no target devices appeared"; exit 1; }
+    echo "[workload] ${#DEVS[@]} devices: ${DEVS[*]}"
+    assert_target_ring
+}
 
 build_job() {  # jobfile out_file
     local jf="$1" f="$2" i=0
@@ -124,20 +139,19 @@ kill_fio() {
     wait "$1" 2>/dev/null || true
 }
 
-echo "cores,net_steady_GBps,fio_read_GBps" > "$SUMMARY"
-
-# ----- sweep core count DOWN, measuring at each ------------------------
-for n in "${CORES[@]}"; do
-    echo "================ cores=$n ================"
+# Limit to n cores, run that point's fio, measure. Sets steady_gbps / cov_pct /
+# fio_gbps / tag. Returns: 0 ok, 1 too-few-samples, 2 jobfile missing.
+measure_core() {  # n
+    local n="$1" jf job fpid prev_rx prev_t cur_rx cur_t g cov win
+    steady_gbps="n/a"; cov_pct="n/a"; fio_gbps="n/a"; tag="n/a"
     ./cpu-limit.sh "$n" || echo "  WARN: cpu-limit $n failed"
     ./cpu-governor.sh performance >/dev/null 2>&1 || true
     #./set-irq-affinity.sh >/dev/null 2>&1 || true
     systemctl start irqbalance 2>/dev/null || true   # let irqbalance handle IRQs (no manual pin)
-
     sleep 1
 
     jf="workload-${CONFIG}-${n}.fio"
-    [[ -f "$jf" ]] || { echo "  WARN: $jf not found — skipping cores=$n"; continue; }
+    [[ -f "$jf" ]] || { echo "  WARN: $jf not found — skipping cores=$n"; return 2; }
     job="$(mktemp)"; build_job "$jf" "$job"
     # keep fio's own stdout so we can read its reported READ bw (printed on
     # SIGTERM too) and compare it against the NIC rx-counter measurement below.
@@ -162,7 +176,8 @@ for n in "${CORES[@]}"; do
     if [[ "$early" -eq 1 ]]; then wait "$fpid" 2>/dev/null || true; else kill_fio "$fpid"; fi
     rm -f "$job"
     if (( ${#tps[@]} < WARMUP_SECS + STEADY_WINDOW )); then
-        echo "  fio produced too few samples (${#tps[@]}) — see cores-$n.err:"; sed 's/^/    /' "$OUT/cores-$n.err"; continue
+        echo "  fio produced too few samples (${#tps[@]}) — see cores-$n.err:"; sed 's/^/    /' "$OUT/cores-$n.err"
+        return 1
     fi
 
     win=("${tps[@]: -STEADY_WINDOW}")
@@ -173,7 +188,47 @@ for n in "${CORES[@]}"; do
     fio_bw_raw="$(awk -F'[()]' '/READ: bw=/{print $2; exit}' "$OUT/cores-$n.fio.log" 2>/dev/null)"
     fio_gbps="$(awk -v s="$fio_bw_raw" 'BEGIN{if(s==""){print "n/a";exit} v=s+0; if(s~/TB\/s/)m=1000;else if(s~/GB\/s/)m=1;else if(s~/MB\/s/)m=0.001;else if(s~/kB\/s/)m=0.000001;else m=1; printf "%.2f", v*m}')"
     [[ "$steady" -eq 1 ]] && tag="steady" || tag="NOT-converged(${MAX_SAMPLE_SECS}s)"
-    echo "  cores=$n  net RX $tag: $steady_gbps GB/s  (CoV $cov_pct%)   |   fio READ: $fio_gbps GB/s"
+    return 0
+}
+
+eligible_retry() {  # n -> 0 if this (config,n) should be retried-on-low
+    local n="$1" c x
+    for c in $RETRY_CONFIGS; do
+        [[ "$c" == "$CONFIG" ]] || continue
+        for x in $RETRY_CORES; do [[ "$x" == "$n" ]] && return 0; done
+    done
+    return 1
+}
+below_min() {  # value -> 0 (true) if non-numeric or < MIN_GBPS
+    awk -v v="$1" -v th="$MIN_GBPS" 'BEGIN{ if (v ~ /^[0-9.]+$/ && v+0 >= th) exit 1; else exit 0 }'
+}
+
+# ----- connect ONCE at full cores -------------------------------------
+connect_all
+
+echo "cores,net_steady_GBps,fio_read_GBps" > "$SUMMARY"
+
+# ----- sweep core count DOWN, measuring at each (retry-on-low at RETRY_CORES) --
+for n in "${CORES[@]}"; do
+    echo "================ cores=$n ================"
+    attempt=1
+    while :; do
+        measure_core "$n"; mc=$?
+        [[ "$mc" -eq 2 ]] && break   # jobfile missing
+        if eligible_retry "$n" && below_min "$fio_gbps" && (( attempt < MAX_RETRY )); then
+            echo "  cores=$n  fio READ=${fio_gbps} GB/s < ${MIN_GBPS} (one-NIC?) — reconnecting & remeasuring (attempt $attempt/$((MAX_RETRY-1)))"
+            disconnect_all
+            sleep 2
+            connect_all
+            attempt=$((attempt+1))
+            continue
+        fi
+        break
+    done
+    [[ "$mc" -eq 2 ]] && continue   # jobfile missing — skip row
+    [[ "$mc" -eq 1 ]] && continue   # too few samples — diag already printed, skip row
+    extra=""; eligible_retry "$n" && below_min "$fio_gbps" && extra="  (still < ${MIN_GBPS} after ${MAX_RETRY} tries)"
+    echo "  cores=$n  net RX $tag: $steady_gbps GB/s  (CoV $cov_pct%)   |   fio READ: $fio_gbps GB/s$extra"
     echo "$n,$steady_gbps,$fio_gbps" >> "$SUMMARY"
 done
 
