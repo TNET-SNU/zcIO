@@ -59,7 +59,7 @@ for n in "${CORES[@]}"; do
     echo "================ cores=$n (SPDK) ================"
     ./cpu-limit.sh "$n" || echo "  WARN: cpu-limit $n failed"
     ./cpu-governor.sh performance >/dev/null 2>&1 || true
-    ./set-irq-affinity.sh >/dev/null 2>&1 || true
+    systemctl start irqbalance 2>/dev/null || true   # let irqbalance handle IRQs (no manual pin)
     sleep 1
 
     tmpl="workload-spdk-${n}.fio"

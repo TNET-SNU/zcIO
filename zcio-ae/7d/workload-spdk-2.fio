@@ -15,8 +15,8 @@ rw=randread
 time_based=1
 runtime=40s
 ramp_time=0
-numjobs=1
-iodepth=8
+numjobs=2
+iodepth=6
 
 bs=256k
 
