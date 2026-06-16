@@ -26,7 +26,7 @@ RAPIDS0="${RAPIDS0:-rapids0.snu.ac.kr}"
 # Unified AE staging dir on the target (override via env if needed). Exported so
 # the case/env-config children resolve the SAME path.
 export RAPIDS0
-export RAPIDS0_DIR="${RAPIDS0_DIR:-/home/fast27/zcio-ae-8}"
+export RAPIDS0_DIR="${RAPIDS0_DIR:-/home/$(whoami)/zcio-ae-8}"
 SSHOPTS="-o ConnectTimeout=10 -o ServerAliveInterval=5"
 SSH="ssh $SSHOPTS $RAPIDS0"
 

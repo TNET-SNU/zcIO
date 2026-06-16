@@ -187,6 +187,11 @@ create_port() {
     write_attr "${ADR_FAM}" "${port_dir}/addr_adrfam"
     write_attr "${ip}"      "${port_dir}/addr_traddr"
     write_attr "${TRSVCID}" "${port_dir}/addr_trsvcid"
+    # in-capsule (inline) data size; default 1024, override with INLINE_DATA_SIZE
+    if [[ -e "${port_dir}/param_inline_data_size" ]]; then
+      write_attr "${INLINE_DATA_SIZE:-1024}" "${port_dir}/param_inline_data_size" \
+        || echo "WARN: could not set param_inline_data_size=${INLINE_DATA_SIZE:-1024} on port ${portid}"
+    fi
   fi
 }
 

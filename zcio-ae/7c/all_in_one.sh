@@ -21,7 +21,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 
 RAPIDS0="${RAPIDS0:-rapids0.snu.ac.kr}"
 export RAPIDS0
-export RAPIDS0_DIR="${RAPIDS0_DIR:-/home/fast27/zcio-ae-7c}"
+export RAPIDS0_DIR="${RAPIDS0_DIR:-/home/$(whoami)/zcio-ae-7c}"
 SSHOPTS="-o ConnectTimeout=10 -o ServerAliveInterval=5"
 SSH="ssh $SSHOPTS $RAPIDS0"
 

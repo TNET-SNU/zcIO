@@ -31,7 +31,7 @@ rm -rf results-* 2>/dev/null || true   # fresh results each run (measure-point a
 
 RAPIDS0="${RAPIDS0:-rapids0.snu.ac.kr}"
 export RAPIDS0
-export RAPIDS0_DIR="${RAPIDS0_DIR:-/home/fast27/zcio-ae-7b}"
+export RAPIDS0_DIR="${RAPIDS0_DIR:-/home/$(whoami)/zcio-ae-7b}"
 SSHOPTS="-o ConnectTimeout=10 -o ServerAliveInterval=5"
 SSH="ssh $SSHOPTS $RAPIDS0"
 

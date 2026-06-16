@@ -15,7 +15,7 @@ MTU="${1:?mtu}"; TSO="${2:?tso}"; GSO="${3:?gso}"; PDU="${4:?pdu_align}"
 # rapids0 control plane (management SSH). Override via env if needed.
 RAPIDS0="${RAPIDS0:-rapids0.snu.ac.kr}"
 # Inherited (exported) from all_in_one.sh; this fallback only applies if run standalone.
-RAPIDS0_DIR="${RAPIDS0_DIR:-/home/fast27/zcio-ae-8}"
+RAPIDS0_DIR="${RAPIDS0_DIR:-/home/$(whoami)/zcio-ae-8}"
 SSH="ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 $RAPIDS0"
 
 echo ">>> [target rapids0] net-config: MTU=$MTU TSO=$TSO GSO=$GSO pdu_align=$PDU"

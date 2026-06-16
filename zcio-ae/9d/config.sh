@@ -36,9 +36,9 @@ NVME_NQNS=(
 # HOST (stream5) data-plane/zcopy scripts are LOCAL to this artifact dir ($HERE
 # in all_in_one.sh). TARGET (rapids0) nvmet + data-plane scripts live in this
 # dir on rapids0 and are run over SSH.
-TARGET_SCRIPT_DIR="${TARGET_SCRIPT_DIR:-/home/syeon/zcio-ae-9d}"
+TARGET_SCRIPT_DIR="${TARGET_SCRIPT_DIR:-/home/$(whoami)/zcio-ae-9d}"
 # CLIENT (creek1) data-plane/cpu setup scripts (init.sh, buffer.sh, cpu_power.sh).
-CLIENT_SCRIPT_DIR="${CLIENT_SCRIPT_DIR:-/home/syeon/zcio-ae-9d}"
+CLIENT_SCRIPT_DIR="${CLIENT_SCRIPT_DIR:-/home/$(whoami)/zcio-ae-9d}"
 # target-net-config.sh positional args for the read path: jumbo MTU, TSO on, GSO off.
 TARGET_MTU="${TARGET_MTU:-9000}"; TARGET_TSO="${TARGET_TSO:-on}"; TARGET_GSO="${TARGET_GSO:-off}"
 
@@ -49,7 +49,7 @@ HOST_IRQ_CORES="${HOST_IRQ_CORES:-0-5}"  # NIC IRQ affinity on the host
 MOUNT_BASE="${MOUNT_BASE:-/mnt/remote}"  # -> /mnt/remote1 .. /mnt/remote4
 
 # ---- client (creek1) --------------------------------------------------------
-CLIENT_DIR="${CLIENT_DIR:-/home/syeon/zcio-ae-9d}"
+CLIENT_DIR="${CLIENT_DIR:-/home/$(whoami)/zcio-ae-9d}"
 WRK_BIN="${WRK_BIN:-/opt/wrk/wrk}"   # wrk binary on creek1 (deploy.sh installs it here)
 WRK_DURATION="${WRK_DURATION:-30s}"
 WRK_TIMEOUT="${WRK_TIMEOUT:-10s}"

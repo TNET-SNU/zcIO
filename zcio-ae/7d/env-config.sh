@@ -13,7 +13,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 MTU="${1:?mtu}"; TSO="${2:?tso}"; GSO="${3:?gso}"; PDU="${4:?pdu_align}"
 
 RAPIDS0="${RAPIDS0:-rapids0.snu.ac.kr}"
-RAPIDS0_DIR="${RAPIDS0_DIR:-/home/fast27/zcio-ae-7d}"
+RAPIDS0_DIR="${RAPIDS0_DIR:-/home/$(whoami)/zcio-ae-7d}"
 SSH="ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 $RAPIDS0"
 
 echo ">>> [target rapids0] net-config: MTU=$MTU TSO=$TSO GSO=$GSO pdu_align=$PDU"
