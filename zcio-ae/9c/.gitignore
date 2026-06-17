@@ -1,0 +1,6 @@
+results-*.csv
+results-plot.png
+results-plot.pdf
+*.log
+results-*/
+results_*/

@@ -1,0 +1,8 @@
+results/
+*.log
+*.csv
+*.png
+*.pdf
+*.npz
+results_*/
+results-*/

@@ -1,0 +1,8 @@
+# experiment outputs (datagen logs, mlpstorage results) anywhere under the AE
+results/
+results_*/
+results-*/
+*.log
+mlperf_data/
+mlperf_merged/
+checkpoints/
