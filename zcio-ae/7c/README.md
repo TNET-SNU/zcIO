@@ -12,20 +12,25 @@ cd ~/zcIO/zcio-ae/7c
 ./all_in_one.sh
 ```
 
-After about 15 minutes, this script will print a table that looks like below.
+This is a **read-path** figure, so both hosts must be on the read kernels first
+(`stream5 = 6.11.0-hostzc+`, `rapids0 = 5.15.189-pduwin`). Check (and switch, if
+needed) with `./kernel-switch.sh read` (add `--reboot` to switch both hosts into
+them, which reboots).
+
+After about 7 minutes, this script will print a table that looks like below.
 
 ```
 ############################################################
 # COMBINED (stream5 1-core): steady net RX throughput (GB/s) by block size
 ############################################################
 bs                linux             zcIO              spdk
-4k              0.93              0.89              2.12
-16k             2.59              2.61              3.37
-32k             3.69              4.27              4.00
-64k             4.50              6.62              4.82
-128k            5.19              8.35              5.95
-256k            5.38              9.98              6.45
-512k            5.61              11.11             6.97
+4k              0.88              0.87              1.86
+16k             2.31              2.51              2.92
+32k             3.28              4.04              3.64
+64k             3.94              6.20              4.02
+128k            4.44              7.88              4.86
+256k            4.73              9.26              5.35
+512k            4.84              10.24             5.46
 
 Per-config raw results in results-<name>/  (linux zcIO spdk)
 ```
@@ -39,6 +44,18 @@ grouped bar chart:
 ```bash
 python3 plot.py        # -> results-plot.png / results-plot.pdf
 ```
+
+## Interpreting the results
+
+The absolute GB/s numbers carry some run-to-run variance. Saturated throughput might shift a little with scheduling and interrupt/softirq timing, and is largest at the big block sizes where the core is driven hardest. What matters is the **trend**, and the reproduction is successful if it holds:
+
+- At the smallest block size (`4k`) **`spdk` leads**, since its interrupt-free
+  design wins when each transfer is tiny.
+- From 32k onward **`zcIO` surpasses both baselines**: its zero-copy receive
+  removes the per-byte copy that saturates the single host core.
+- At `512k`, `zcIO` reaches **2.1× the `linux` baseline** and **1.8× `spdk`**. This
+  ordering at the large block sizes — `zcIO` > `spdk` ≈ `linux` — is the claim of
+  the figure.
 
 ## How it works
 

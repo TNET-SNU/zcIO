@@ -13,19 +13,24 @@ cd ~/zcIO/zcio-ae/7d
 ./all_in_one.sh
 ```
 
-After about 30 minutes, this script will print a table that looks like below.
+This is a **read-path** figure, so both hosts must be on the read kernels first
+(`stream5 = 6.11.0-hostzc+`, `rapids0 = 5.15.189-pduwin`). Check (and switch, if
+needed) with `./kernel-switch.sh read` (add `--reboot` to switch both hosts into
+them, which reboots).
+
+After about 17 minutes, this script will print a table that looks like below.
 
 ```
 ############################################################
 # COMBINED: steady net RX (GB/s) by stream5 cores, 256k randread
 ############################################################
 cores       linux       zcIO-MT     zcIO-MP     spdk
-1           4.46        7.36        7.82        4.64
-2           8.35        13.58       14.09       5.22
-4           14.01       23.09       25.14       9.80
-8           24.33       41.21       43.72       24.05
-12          30.14       48.21       53.67       29.41
-15          32.40       51.33       59.25       31.50
+1           4.51        8.06        7.76        4.83
+2           8.82        14.32       14.06       9.09
+4           14.38       25.60       25.87       16.03
+8           23.52       44.15       44.98       31.00
+12          30.99       57.24       56.41       35.52
+15          34.14       68.62       66.74       38.23
 
 Per-config raw results in results-<name>/  (linux zcIO-MT zcIO-MP spdk)
 ```
@@ -36,6 +41,24 @@ render the line chart:
 ```bash
 python3 plot.py        # -> results-plot.png / results-plot.pdf
 ```
+
+## Interpreting the results
+
+The absolute GB/s numbers carry some run-to-run variance — throughput shifts a
+little with scheduling and interrupt/softirq timing on the host cores. What matters
+is the **trend**, and the reproduction is successful if it holds:
+
+- Both **`zcIO` variants (`MP`/`MT`) scale well past the `linux` baseline** as cores
+  increase, reaching ~2× linux at 15 cores.
+- **`zcIO-MP` and `zcIO-MT` stay nearly equal** across the whole core sweep — this
+  is the key point. `MT` (multi-thread) shares a single address space, so unmapping
+  zero-copy pages would normally fire cross-core **TLB shootdowns** (IPIs) that `MP`
+  (separate per-process address spaces) avoids; multi-threaded receive would then
+  fall behind at higher core counts. Because `MT` keeps pace with `MP` here, zcIO
+  has **essentially eliminated that TLB-shootdown overhead**.
+- **`spdk` tracks the `linux` baseline** — no zero-copy win on the receive path.
+- This ordering — `zcIO-MP` ≈ `zcIO-MT` ≫ `linux` ≈ `spdk` — is the claim of the
+  figure.
 
 ## How it works
 

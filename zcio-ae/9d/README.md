@@ -10,7 +10,7 @@ cd ~/zcIO/zcio-ae/9d
 ./all_in_one.sh
 ```
 
-After about 20 minutes, this script will print a table that looks like below.
+After about 6 minutes, this script will print a table that looks like below.
 
 ```
 ############################################################
@@ -24,8 +24,8 @@ zcIO    512k  4.2         8613.0
 zcIO    1M    4.6         4750.1
 zcIO    100M  4.6         46.6
 
-    raw logs: /home/syeon/zcIO/zcio-ae/9d/results/<linux|zcIO>/<size>.log
-    csv     : /home/syeon/zcIO/zcio-ae/9d/results/summary.csv
+    raw logs: /home/fast27/zcIO/zcio-ae/9d/results/<linux|zcIO>/<size>.log
+    csv     : /home/fast27/zcIO/zcio-ae/9d/results/summary.csv
     plot    : python3 plot.py
 ```
 

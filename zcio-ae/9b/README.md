@@ -26,8 +26,10 @@ You only need:
 cd ~/zcIO/zcio-ae && ./deploy.sh        # global passwordless SSH + NOPASSWD sudo
 ```
 
-Read-path kernels (verified by the script): `stream5 = 6.11.0-hostzc+`,
-`rapids0 = 5.15.189-pduwin`.
+Read-path kernels (verified by the script via `./kernel-switch.sh read`):
+`stream5 = 6.11.0-hostzc+`, `rapids0 = 5.15.189-pduwin`. Check or switch yourself
+with `./kernel-switch.sh read` (add `--reboot` to switch both hosts into them,
+which reboots).
 
 ## Run
 

@@ -11,6 +11,11 @@ cd ~/zcIO/zcio-ae/7a
 ./all_in_one.sh
 ```
 
+This is a **write-path** figure, so both hosts must be on the write kernels first
+(`stream5 = 5.15.189-pduwin`, `rapids0 = 6.11.0-target-zc-add-frozen+`). Check (and
+switch, if needed) with `./kernel-switch.sh write` (add `--reboot` to switch both
+hosts into them, which reboots).
+
 After about 13 minutes, this script will print a table that looks like below.
 
 ```

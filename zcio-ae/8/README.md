@@ -11,6 +11,11 @@ cd ~/zcIO/zcio-ae/8
 ./all_in_one.sh
 ```
 
+This is a **read-path** figure, so both hosts must be on the read kernels first
+(`stream5 = 6.11.0-hostzc+`, `rapids0 = 5.15.189-pduwin`). Check (and switch, if
+needed) with `./kernel-switch.sh read` (add `--reboot` to switch both hosts into
+them, which reboots).
+
 | config | E2E MTU | target TSO | nvme_pdu_align | what it adds        |
 |--------|---------|------------|----------------|---------------------|
 | 1      | 1500    | off        | 0              | baseline (1500 MTU) |
@@ -18,7 +23,7 @@ cd ~/zcIO/zcio-ae/8
 | 3      | 9000    | on         | 0              | + TSO               |
 | 4      | 9000    | on         | 1              | + PDU alignment     |
 
-After about 15 minutes, this script will print a table that looks like below.
+After about 8 minutes, this script will print a table that looks like below.
 
 ```
 ############################################################
@@ -42,6 +47,28 @@ render the grouped bar chart:
 ```bash
 python3 plot.py        # -> results-plot.png / results-plot.pdf
 ```
+
+## Interpreting the results
+
+Unlike the other figures, the thing to note here is not run-to-run variance but an
+**overall difference in scale**: the absolute GB/s you measure may sit uniformly
+above or below the reference table. That is because **the reference numbers were
+collected on a different test machine** than the one this artifact now runs on, so
+the absolute level shifts even though the experiment is the same. Compare the
+**trend across configs**, not the absolute numbers.
+
+The trend should still hold, and the reproduction is successful if it does:
+
+- Each config improves over the previous one at the larger block sizes
+  (`cfg1` < `cfg2` < `cfg3`), as jumbo frames and TSO are added.
+- Most importantly, **`cfg4` (zcIO, PDU-aligned) tracks `cfg3` (TSO) closely at the
+  large block sizes** — in the reference table they are within a few percent at
+  256k/512k (`8.78` vs `9.06`, `8.82` vs `8.88`). This is the point of the figure:
+  turning on PDU-aligned packetization in zcIO is **not a large overhead** on top
+  of TSO, even though it constrains how the target packetizes the read stream.
+- At the small block sizes `cfg4` sits a bit below `cfg3` (the per-PDU alignment
+  cost is relatively larger when payloads are small), but that gap closes as the
+  block size grows.
 
 ## How it works
 

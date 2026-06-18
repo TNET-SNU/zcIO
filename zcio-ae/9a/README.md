@@ -24,9 +24,10 @@ passwordless SSH + NOPASSWD sudo:
 cd ~/zcIO/zcio-ae && ./deploy.sh
 ```
 
-Read-path kernels must be booted (the script verifies and stops if not):
-`stream5 = 6.11.0-hostzc+`, `rapids0 = 5.15.189-pduwin`. Switch with
-`sudo ./reboot-to-kernel.sh 6.11` (stream5) / boot `5.15.189-pduwin` on rapids0.
+Read-path kernels must be booted (`stream5 = 6.11.0-hostzc+`,
+`rapids0 = 5.15.189-pduwin`). The script verifies these with `./kernel-switch.sh read`
+and stops on mismatch; check or switch yourself with `./kernel-switch.sh read`
+(add `--reboot` to switch both hosts into them, which reboots).
 
 ## Run
 
@@ -35,7 +36,7 @@ cd ~/zcIO/zcio-ae/9a
 ./all_in_one.sh
 ```
 
-**Takes about 40 minutes** (the per-config dataset generation dominates).
+**Takes about 30 minutes** (the per-config dataset generation dominates).
 
 `all_in_one.sh` verifies the kernels + /opt env, stages the `rapids0/` target
 scripts, then for each config (default, zcIO) brings up NVMe/TCP and runs the
@@ -44,9 +45,10 @@ it finishes it prints a table and writes `results/fig-9a-mlperf.png`:
 
 ```
 workload        default         zcIO            speedup          (peak incoming Gbps)
-UNet3D          4.10            9.80            2.39x
-Llama3 (load)   3.20            7.50            2.34x
-CosmoFlow       2.10            10.30           4.90x
+----------------------------------------------------------------
+UNet3D          35.64           57.41           1.61x
+Llama3 (load)   38.89           62.99           1.62x
+CosmoFlow       13.08           16.38           1.25x
 ```
 
 zcIO should outperform default on every workload. Per-workload CSVs land in
