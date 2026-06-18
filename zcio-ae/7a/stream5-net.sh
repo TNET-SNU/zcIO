@@ -60,7 +60,7 @@ apply_nic() {  # iface cidr
   ethtool -K "$iface" rx-gro-hw on            # hw-gro at MTU 1500
   ifconfig "$iface" mtu "$MTU"                # then bump to 9000 (hw-gro stays on)
   ethtool -K "$iface" tso on gro on
-  ethtool -G "$iface" rx 4096 tx 8192   # NIC ring buffers (after mlx5 reload, before traffic)
+  ethtool -G "$iface" rx 8192 tx 8192   # NIC ring buffers (after mlx5 reload, before traffic)
 
   local hwgro mtu state
   hwgro=$(ethtool -k "$iface" 2>/dev/null | awk -F': ' '/^rx-gro-hw:/{print $2}')

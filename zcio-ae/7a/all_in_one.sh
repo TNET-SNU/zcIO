@@ -91,7 +91,7 @@ setup_kernel_target() {  # zcopy_on.sh|zcopy_off.sh
     $SSH sudo -n "$RAPIDS0_DIR/nvmet-9100.sh" --no-ipsetup || { echo "!! nvmet setup failed"; return 1; }
     $SSH sudo -n "$RAPIDS0_DIR/$zc"                     || true
     $SSH sudo -n "$RAPIDS0_DIR/cpu-limit.sh" "$TARGET_CORES" || echo "!! cpu-limit failed"
-    $SSH sudo -n "$RAPIDS0_DIR/set-irq-affinity.sh"     || true
+    #$SSH sudo -n "$RAPIDS0_DIR/set-irq-affinity.sh"     || true   # disabled: keep rapids0 irqbalance on
     $SSH sudo -n "$RAPIDS0_DIR/cpu-governor.sh" performance || true
 }
 setup_spdk_target() {  # cores
@@ -107,7 +107,7 @@ setup_spdk_target() {  # cores
     # we don't offline cores while nvmf_tgt is mid-DPDK-init (which kills it). The
     # SPDK core mask (cpu0..N-1) matches the cores left online.
     $SSH sudo -n "$RAPIDS0_DIR/cpu-limit.sh" "$cores"  || echo "!! cpu-limit failed"
-    $SSH sudo -n "$RAPIDS0_DIR/set-irq-affinity.sh"    || true
+    #$SSH sudo -n "$RAPIDS0_DIR/set-irq-affinity.sh"    || true   # disabled: keep rapids0 irqbalance on
     $SSH sudo -n "$RAPIDS0_DIR/cpu-governor.sh" performance || true
     # cpu-limit flaps mlx5; wait for the data NIC to recover before SPDK binds its listener
     echo ">>> waiting for data NIC (.95.10) to settle after cpu-limit ..."
@@ -132,8 +132,12 @@ for config in "${CONFIGS[@]}"; do
         ./measure-point.sh "results-$config" "$bs" "workload-$config-$bs.fio" bs \
             || echo "!! measure $config bs=$bs failed"
     done
-    ./disconnect-targets.sh
-    [[ "$config" == spdk ]] && { $SSH sudo -n "$RAPIDS0_DIR/spdk-target-stop.sh" || true; }
+    if [[ -n "${KEEP_UP:-}" ]]; then
+        echo ">>> KEEP_UP set — leaving target + nvme connections up (no disconnect / no spdk-stop)"
+    else
+        ./disconnect-targets.sh
+        [[ "$config" == spdk ]] && { $SSH sudo -n "$RAPIDS0_DIR/spdk-target-stop.sh" || true; }
+    fi
 done
 
 # ----- combined report ------------------------------------------------
@@ -160,10 +164,23 @@ PY
 echo; echo "Plot with:  python3 plot.py"
 
 # ----- restore --------------------------------------------------------
-echo; echo ">>> restore: stream5 net + pdu_align 0 ; rapids0 cores online + kernel nvmet baseline"
-./set-pdu-align.sh 0 || true
-./stream5-restore.sh || echo "!! stream5 restore reported an error"
-$SSH sudo -n "$RAPIDS0_DIR/spdk-target-stop.sh"   || true
-$SSH sudo -n "$RAPIDS0_DIR/restore-tcp-config.sh" || true
-$SSH sudo -n "$RAPIDS0_DIR/target-restore.sh"     || echo "!! rapids0 target-restore reported an error"
+if [[ -n "${KEEP_UP:-}" ]]; then
+    echo; echo ">>> KEEP_UP set — skipping restore. Target/SPDK + nvme connections left up for manual fio."
+    echo "    connected NVMe-oF devices (point your fio here):"
+    for b in /sys/block/nvme*n*; do
+        bn="$(basename "$b")"; [[ "$bn" =~ ^nvme[0-9]+n[0-9]+$ ]] || continue
+        [[ "$(cat "$b/device/transport" 2>/dev/null)" == tcp ]] && echo "      /dev/$bn"
+    done
+    echo "    when done, tear down with:"
+    echo "      ./disconnect-targets.sh"
+    echo "      $SSH sudo -n $RAPIDS0_DIR/spdk-target-stop.sh"
+    echo "      ./stream5-restore.sh ; $SSH sudo -n $RAPIDS0_DIR/target-restore.sh"
+else
+    echo; echo ">>> restore: stream5 net + pdu_align 0 ; rapids0 cores online + kernel nvmet baseline"
+    ./set-pdu-align.sh 0 || true
+    ./stream5-restore.sh || echo "!! stream5 restore reported an error"
+    $SSH sudo -n "$RAPIDS0_DIR/spdk-target-stop.sh"   || true
+    $SSH sudo -n "$RAPIDS0_DIR/restore-tcp-config.sh" || true
+    $SSH sudo -n "$RAPIDS0_DIR/target-restore.sh"     || echo "!! rapids0 target-restore reported an error"
+fi
 echo "[all-in-one fig-7a] done."

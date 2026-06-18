@@ -12,5 +12,5 @@ runtime=40s
 ramp_time=0
 group_reporting=1
 numjobs=1
-iodepth=20
+iodepth=16
 bs=64k

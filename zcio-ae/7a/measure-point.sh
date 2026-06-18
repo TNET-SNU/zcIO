@@ -28,7 +28,7 @@ HDRCOL="${4:-x}"
 WARMUP_SECS="${WARMUP_SECS:-10}"
 STEADY_WINDOW="${STEADY_WINDOW:-5}"
 STEADY_THRESH="${STEADY_THRESH:-5}"
-MAX_SAMPLE_SECS="${MAX_SAMPLE_SECS:-20}"
+MAX_SAMPLE_SECS="${MAX_SAMPLE_SECS:-30}"
 
 # Debug: dump the full per-second TX curve (ramp / DRAM plateau / write-cliff) to
 # pick the window correctly. Gated by a flag FILE (env vars don't survive the sudo

@@ -21,7 +21,6 @@ TADDR_95="10.3.95.10"; TADDR_96="10.3.96.10"
 NQNS_95=(nvmet-ens17np0-nvme6n1 nvmet-ens17np0-nvme7n1 nvmet-ens17np0-nvme8n1 nvmet-ens17np0-nvme9n1)
 NQNS_96=()   # single-NIC simplification (fig-7a is single-core): only ens17np0 (10.3.95.10), 4 devices
 NUM_IO_QUEUE=4
-
 modprobe nvme_tcp 2>/dev/null || true
 nvme disconnect-all >/dev/null 2>&1 || true   # clear stale connections (prior run / target reboot)
 
