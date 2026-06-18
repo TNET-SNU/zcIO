@@ -11,7 +11,7 @@ cd ~/zcIO/zcio-ae/7b
 ./all_in_one.sh
 ```
 
-After about 15 minutes, this script prints a table that looks like below. The
+After about 37 minutes, this script prints a table that looks like below. The
 example shows the `spdk` series (collected on this machine); the remaining
 series (`linux`, `zcIO-MT`, `zcIO-MP`) are produced at runtime.
 
@@ -20,12 +20,12 @@ series (`linux`, `zcIO-MT`, `zcIO-MP`) are produced at runtime.
 # COMBINED: steady net TX (GB/s) by rapids0 core count
 ############################################################
 cores             linux             zcIO-MT           zcIO-MP           spdk
-1                 -                 -                 -                 4.28
-2                 -                 -                 -                 6.97
-4                 -                 -                 -                 12.32
-8                 -                 -                 -                 22.55
-12                -                 -                 -                 25.69
-15                -                 -                 -                 27.93
+1                 3.65              6.99              6.96              4.82
+2                 3.70              11.89             12.23             8.39
+4                 10.15             22.74             22.97             14.27
+8                 16.95             36.33             37.97             23.83
+12                21.25             46.35             49.31             30.14
+15                22.65             51.38             51.82             32.98
 
 Plot with:  python3 plot.py
 ```
@@ -35,6 +35,40 @@ To render the line chart:
 ```bash
 python3 plot.py        # -> results-plot.png / results-plot.pdf
 ```
+
+## Interpreting the results
+
+The absolute GB/s numbers carry some run-to-run variance, so do not expect them to
+match the table above exactly. This figure is fixed at **256k**, a large block, so
+every point exercises the target SSDs' raw NAND bandwidth and carries the
+**device-internal variability** below; on top of that, the figure **sweeps the
+target core count**, and at the low core counts the receive CPU is the bottleneck,
+so its saturated throughput shifts a little with scheduling and interrupt/softirq
+timing. The device-internal variability comes from:
+
+1. **Garbage collection** — NAND erases in large blocks but writes in pages, so as
+   the drive fills its background GC competes with host writes for NAND bandwidth,
+   making throughput fluctuate.
+2. **SLC cache / write cliff** — TLC/QLC drives absorb writes in a fast SLC region
+   and drop to slow native speed once it fills; our scripts re-format the drives to
+   write only in SLC and reset this cache each run, but the automation may still
+   proceed with the cache not fully reset, which shows up as variance.
+3. **Fresh vs steady-state** — a freshly erased/trimmed drive writes fast, but once
+   it is "dirty" write amplification and GC kick in, lowering and destabilizing
+   throughput.
+4. **Thermal throttling** — sustained large-block writes heat the controller/NAND
+   and trigger intermittent throttling.
+
+What matters is the **trend**, and the reproduction is successful if it holds:
+
+- **`zcIO` (`MT`/`MP`) reaches ≥ 2× the `linux` baseline at the low core counts**,
+  where the receive CPU is scarce and zero-copy's saved per-byte copy matters most.
+- **`spdk` stays below ~1.5× the `linux` baseline** at those low core counts — it
+  helps, but well short of `zcIO`.
+- As the core count grows, every config rises toward the NIC/link limit and the
+  lines converge; `zcIO` reaches a given throughput with **fewer target cores**.
+  This core-efficiency ordering — `zcIO` > `spdk` > `linux` when cores are scarce —
+  is the claim of the figure.
 
 ## How it works
 

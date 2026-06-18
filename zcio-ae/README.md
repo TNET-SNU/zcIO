@@ -59,7 +59,7 @@ do if they don't match.
 | 6     | `9c`   | read  |  |
 | 7     | `9d`   | read  |  |
 | 8     | `7a`   | write | 13m |
-| 9     | `7b`   | write | 20m |
+| 9     | `7b`   | write | 37m |
 
 ## Topology
 

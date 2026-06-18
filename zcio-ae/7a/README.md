@@ -11,7 +11,7 @@ cd ~/zcIO/zcio-ae/7a
 ./all_in_one.sh
 ```
 
-After about 15 minutes, this script will print a table that looks like below.
+After about 13 minutes, this script will print a table that looks like below.
 
 ```
 ############################################################
@@ -35,6 +35,43 @@ the grouped bar chart:
 ```bash
 python3 plot.py        # -> results-plot.png / results-plot.pdf
 ```
+
+## Interpreting the results
+
+The absolute GB/s numbers carry some run-to-run variance, so do not expect them to
+match the table above exactly. The variance is **largest at the big block sizes**,
+where the workload exercises the target SSDs' raw NAND bandwidth and exposes their
+**device-internal variability** — the small-block points are IOPS-bound and
+comparatively stable. That device-internal variability comes from:
+
+1. **Garbage collection** — NAND erases in large blocks but writes in pages, so as
+   the drive fills its background GC competes with host writes for NAND bandwidth,
+   making throughput fluctuate.
+2. **SLC cache / write cliff** — TLC/QLC drives absorb writes in a fast SLC region
+   and drop to slow native speed once it fills; our scripts re-format the drives to
+   write only in SLC and reset this cache each run, but the automation may still
+   proceed with the cache not fully reset, which shows up as variance.
+3. **Fresh vs steady-state** — a freshly erased/trimmed drive writes fast, but once
+   it is "dirty" write amplification and GC kick in, lowering and destabilizing
+   throughput.
+4. **Thermal throttling** — sustained large-block writes heat the controller/NAND
+   and trigger intermittent throttling.
+
+On top of the device side, the single-core target itself contributes a little
+variance even when fully saturated, as the one receive core's throughput shifts
+slightly with scheduling and interrupt/softirq timing.
+
+What matters is the **trend**, and the reproduction is successful if it holds:
+
+- **`zcIO` reaches ≥ 2× the `linux` baseline** at the larger block sizes (roughly
+  128k and above), where zero-copy receive eliminates the per-byte copy cost on
+  the single-core target. In the reference table this is ~2.1× at 512k
+  (`9.16` vs `4.40`).
+- **`spdk` stays below ~1.5× the `linux` baseline** across the sweep — it helps,
+  but well short of `zcIO`. In the reference table SPDK peaks around 1.3×.
+- At the smallest block size (`4k`) the three are close; the gap opens up as the
+  block size grows. This per-byte-copy ordering — `zcIO` > `spdk` > `linux` at
+  large block sizes — is the claim of the figure.
 
 ## How it works
 
