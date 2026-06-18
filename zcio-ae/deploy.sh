@@ -7,9 +7,12 @@
 # Each figure's all_in_one.sh stages its own per-host setup scripts automatically.
 set -uo pipefail
 
-# Machines used by the AE. The host (stream5) is local. creek1 is only used by
-# figure 9d (nginx client); setting it up here is harmless for the other figures.
-REMOTE_HOSTS=(rapids0.snu.ac.kr creek1.snu.ac.kr)
+# Machines used by the AE. The host (stream5) is local. stream6 is the SECOND
+# initiator for the write figures (7a/7b). creek1 is only used by figure 9d (nginx
+# client); setting all of them up here is harmless for the other figures.
+# NOTE: stream6 has password auth disabled — passwordless SSH needs a key there
+# (ssh-copy-id stream6.snu.ac.kr), then this installs its NOPASSWD sudoers.
+REMOTE_HOSTS=(rapids0.snu.ac.kr stream6.snu.ac.kr creek1.snu.ac.kr)
 
 SSH_OPTS="-o ConnectTimeout=10 -o BatchMode=yes"
 SUDOERS="/etc/sudoers.d/zcio-ae"

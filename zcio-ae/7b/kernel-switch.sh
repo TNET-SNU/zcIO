@@ -14,12 +14,15 @@
 #           (target sends read data -> pdu on rapids0 ; initiator receives -> zc on stream5)
 #   write : stream5=5.15.189-pduwin          rapids0=6.11.0-target-zc-add-frozen+
 #           (initiator sends write data -> pdu on stream5 ; target receives -> zc on rapids0)
+#           PLUS stream6 (second initiator) = 5.15.189-pduwin (same sender kernel).
 #
 # Kernel names + GRUB-match substrings are overridable via env (KERN_S5_READ, etc).
 set -uo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 RAPIDS0="${RAPIDS0:-rapids0.snu.ac.kr}"
 SSH="ssh -o ConnectTimeout=10 $RAPIDS0"
+STREAM6="${STREAM6:-stream6.snu.ac.kr}"
+SSH6="ssh -o ConnectTimeout=10 $STREAM6"
 
 MODE="${1:-}"; ACTION="${2:-check}"
 case "$MODE" in read|write) ;; *) echo "usage: $0 <read|write> [--reboot]"; exit 2 ;; esac
@@ -32,18 +35,29 @@ else
   R0_KERN="${KERN_R0_WRITE:-6.11.0-target-zc-add-frozen+}"; R0_MATCH="${R0_MATCH:-target-zc}"
 fi
 
+# stream6 is the SECOND initiator, used only by the write figures; it runs the
+# same pduwin sender kernel as stream5.
+if [[ "$MODE" == write ]]; then USE_S6=1; S6_KERN="$S5_KERN"; S6_MATCH="$S5_MATCH"; else USE_S6=0; fi
+
 sk="$(uname -r)"
 rk="$($SSH uname -r 2>/dev/null)" || { echo "!! cannot ssh $RAPIDS0"; exit 1; }
 s5_ok=0; r0_ok=0
 [[ "$sk" == "$S5_KERN" ]] && s5_ok=1
 [[ "$rk" == "$R0_KERN" ]] && r0_ok=1
 
+s6_ok=1; s6k="(n/a)"
+if [[ "$USE_S6" == 1 ]]; then
+  s6k="$($SSH6 uname -r 2>/dev/null)" || { echo "!! cannot ssh $STREAM6"; exit 1; }
+  s6_ok=0; [[ "$s6k" == "$S6_KERN" ]] && s6_ok=1
+fi
+
 echo "[kernel-switch] mode=$MODE"
 echo "  stream5 : have '$sk'  need '$S5_KERN'  $([[ $s5_ok == 1 ]] && echo OK || echo MISMATCH)"
 echo "  rapids0 : have '$rk'  need '$R0_KERN'  $([[ $r0_ok == 1 ]] && echo OK || echo MISMATCH)"
+[[ "$USE_S6" == 1 ]] && echo "  stream6 : have '$s6k'  need '$S6_KERN'  $([[ $s6_ok == 1 ]] && echo OK || echo MISMATCH)"
 
-if [[ "$s5_ok" == 1 && "$r0_ok" == 1 ]]; then
-  echo "[kernel-switch] both hosts on the $MODE kernels."
+if [[ "$s5_ok" == 1 && "$r0_ok" == 1 && "$s6_ok" == 1 ]]; then
+  echo "[kernel-switch] all hosts on the $MODE kernels."
   exit 0
 fi
 
@@ -58,6 +72,13 @@ if [[ "$r0_ok" != 1 ]]; then
   echo ">> rebooting rapids0 into '$R0_KERN' (GRUB match '$R0_MATCH') ..."
   ssh -t "$RAPIDS0" "sudo /opt/reboot-to-kernel.sh '$R0_MATCH'" \
     || echo "   (ssh connection dropped — expected once rapids0 starts rebooting)"
+fi
+if [[ "$USE_S6" == 1 && "$s6_ok" != 1 ]]; then
+  echo ">> rebooting stream6 into '$S6_KERN' (GRUB match '$S6_MATCH') ..."
+  # stream6 has no reboot helper installed; stage ours to /tmp and run it there.
+  scp -q -o ConnectTimeout=10 ./reboot-to-kernel.sh "$STREAM6:/tmp/zcio-reboot-to-kernel.sh" \
+    && ssh -t "$STREAM6" "sudo bash /tmp/zcio-reboot-to-kernel.sh '$S6_MATCH'" \
+    || echo "   (ssh connection dropped — expected once stream6 starts rebooting)"
 fi
 if [[ "$s5_ok" != 1 ]]; then
   echo ">> switching stream5 to '$S5_KERN' (GRUB match '$S5_MATCH') and rebooting NOW ..."

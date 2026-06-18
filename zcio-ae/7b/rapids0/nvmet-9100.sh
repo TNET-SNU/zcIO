@@ -198,12 +198,46 @@ link_sub_to_port() {
   [[ -L "${port_dir}/subsystems/${nqn}" ]] || ln -s "${subsys_dir}" "${port_dir}/subsystems/${nqn}"
 }
 
+FMT_THRESHOLD_BYTES="${FMT_THRESHOLD_BYTES:-1000000000}"   # 1 GB
+
+# nvme-format every "Samsung SSD 9100 PRO" namespace whose used capacity exceeds
+# FMT_THRESHOLD_BYTES, for a fresh-SLC benchmark start (matches the SPDK path,
+# which formats before binding). Without this the kernel-nvmet path leaves the
+# drives dirty -> 256k randwrite hits GC/RMW -> high iowait + write-cliff (e.g.
+# linux 15-core dropping 24 -> 13 GB/s). Model-gated: the boot drive and any
+# other model are never touched. Skip with SKIP_FORMAT=1.
+format_dirty_9100() {
+  command -v python3 >/dev/null 2>&1 || { echo "  (python3 missing — skip usage check)"; return 0; }
+  echo "Formatting dirty 9100 PRO namespaces (used > $((FMT_THRESHOLD_BYTES/1000000000)) GB)..."
+  local dev used model
+  while IFS=$'\t' read -r dev used model; do
+    [[ -b "$dev" ]] || continue
+    if (( used > FMT_THRESHOLD_BYTES )); then
+      echo "  ${dev}: used=${used} B (${model}) — nvme format"
+      nvme format "${dev}" --force >/dev/null 2>&1 && echo "    formatted" || echo "    WARN: nvme format ${dev} failed"
+    else
+      echo "  ${dev}: used=${used} B — clean, skip"
+    fi
+  done < <(nvme list -o json 2>/dev/null | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for x in d.get("Devices", []):
+    m = x.get("ModelNumber", "") or ""
+    if "9100 PRO" in m:
+        print("%s\t%s\t%s" % (x.get("DevicePath", ""), x.get("UsedBytes", 0), m))
+')
+}
+
 main() {
   need_root
   load_modules
   mount_configfs
 
   [[ "${DO_RESET}" -eq 1 ]] && reset_nvmet
+
+  # fresh-SLC: format any 9100 PRO that still has data, before exporting it
+  [[ -n "${SKIP_FORMAT:-}" ]] || format_dirty_9100
 
   if [[ "${SETUP_IP}" -eq 1 ]]; then
     setup_ip "${NIC1_IFACE}" "${NIC1_IP}" "${NIC1_PREFIX}"

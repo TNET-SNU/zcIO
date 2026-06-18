@@ -12,6 +12,6 @@ thread=1
 runtime=40s
 ramp_time=0
 group_reporting=1
-numjobs=8
+numjobs=15
 iodepth=1
 bs=256k
