@@ -1,4 +1,4 @@
-# make_4disks.sh  (원본 유지 + 마지막 du 출력 버그만 수정)
+# make_4disks.sh  (original preserved + only the final du output bug fixed)
 #!/bin/bash
 set -e
 

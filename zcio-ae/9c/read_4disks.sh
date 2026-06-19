@@ -1,4 +1,4 @@
-# read_4disks.sh  (CPU/THREADS 파라미터화 + taskset 제거)
+# read_4disks.sh  (CPU/THREADS parameterized + taskset removed)
 #!/bin/bash
 set -e
 

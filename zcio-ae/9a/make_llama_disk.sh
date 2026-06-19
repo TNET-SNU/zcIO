@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# LLaMA3-8B 체크포인트 디스크에 생성 (write only)
+# Write the LLaMA3-8B checkpoint to disk (write only).
 set -e
 
 source /opt/mlperf-env/venv/bin/activate
 
-# ── 설정 ──────────────────────────────────────────────────────────────────────
+# ── config ────────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR="/mnt/rocksdb_test/testdb1/llama3_8b_ckpt"
 MODEL="llama3-8b"
 NUM_PROCESSES=8
@@ -37,5 +37,5 @@ mlpstorage checkpointing run \
     --allow-run-as-root \
     --oversubscribe
 
-echo "완료. 파일 수: $(find "${CHECKPOINT_DIR}" -type f | wc -l)"
+echo "Done. file count: $(find "${CHECKPOINT_DIR}" -type f | wc -l)"
 du -sh "${CHECKPOINT_DIR}"

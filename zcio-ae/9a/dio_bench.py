@@ -2,21 +2,21 @@
 """
 LLaMA3-8B Checkpoint Direct I/O Read Benchmark  (4-disk parallel)
 
-기존 mlpstorage가 생성한 실제 LLaMA3-8B 체크포인트 .pt 파일을
-O_DIRECT로 8개 디스크에서 병렬 읽기하여 throughput 측정.
+Reads the real LLaMA3-8B checkpoint .pt files produced by mlpstorage in parallel
+across 8 disks via O_DIRECT and measures throughput.
 
-체크포인트 구조 (1 step):
+Checkpoint layout (1 step):
   8 rank × (model_states ~1.9GB + optim_states ~11.2GB) ≈ 105 GB
   → 8 disks × 1 rank = 2 files/disk
 
-사용법:
-  python3 dio_bench.py convert                            # .pt → .safetensors 변환 (testdb1)
-  python3 dio_bench.py distribute                         # 파일을 8디스크에 분산 복사
-  python3 dio_bench.py run                                # 8디스크 병렬 raw read (기본)
-  python3 dio_bench.py run --mode safetensors             # safetensors O_DIRECT (I/O 병목)
-  python3 dio_bench.py run --mode torch                   # 8디스크 병렬 torch.load
-  python3 dio_bench.py run --disks 1                      # 단일 디스크만 사용
-  python3 dio_bench.py run --read-cores 1                 # 코어 제한
+Usage:
+  python3 dio_bench.py convert                            # .pt → .safetensors convert (testdb1)
+  python3 dio_bench.py distribute                         # distribute files across 8 disks
+  python3 dio_bench.py run                                # parallel raw read on 8 disks (default)
+  python3 dio_bench.py run --mode safetensors             # safetensors O_DIRECT (I/O bound)
+  python3 dio_bench.py run --mode torch                   # parallel torch.load on 8 disks
+  python3 dio_bench.py run --disks 1                      # use a single disk only
+  python3 dio_bench.py run --read-cores 1                 # core limit
   python3 dio_bench.py run --repeats 5
 """
 
@@ -31,7 +31,7 @@ import argparse
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# safetensors dtype 문자열 → torch dtype 매핑
+# safetensors dtype string → torch dtype mapping
 SAFETENSORS_DTYPE = {
     "F64":  "torch.float64",
     "F32":  "torch.float32",
@@ -45,9 +45,9 @@ SAFETENSORS_DTYPE = {
     "BOOL": "torch.bool",
 }
 
-# torch.load 동시 실행 수 제한 (메모리 보호)
-# torch.load는 역직렬화 중 파일 크기의 ~3배 임시 메모리 사용
-# 11.2 GB × 3 = ~33 GB/슬롯. Semaphore(2) → 66 GB + 버퍼 44 GB = ~110 GB → 125 GB 안전
+# Limit concurrent torch.load calls (memory protection).
+# torch.load uses ~3x the file size in temporary memory during deserialization.
+# 11.2 GB × 3 = ~33 GB/slot. Semaphore(2) → 66 GB + 44 GB buffers = ~110 GB → safe under 125 GB.
 _torch_sem = threading.Semaphore(2)
 
 ALIGNMENT = 4096
@@ -64,7 +64,7 @@ DISK_ROOTS = [
 #    "/mnt/rocksdb_itest/testdb8",
 ]
 
-# rank → disk 매핑: rank 0 → disk0, rank 1 → disk1, ...
+# rank → disk mapping: rank 0 → disk0, rank 1 → disk1, ...
 RANKS_PER_DISK = 2
 
 
@@ -75,18 +75,18 @@ def drop_caches():
 GB = 1024 ** 3
 
 
-# ───────────────────── distribute 서브커맨드 ─────────────────────
+# ───────────────────── distribute subcommand ─────────────────────
 
 def get_ckpt_subdir(step):
     return os.path.join("llama3_8b_ckpt", "llama3-8b", step)
 
 
 def cmd_distribute(args):
-    """testdb1의 체크포인트를 8디스크에 rank 기준 분산 복사.
-    .pt와 .safetensors 파일 모두 복사."""
+    """Distribute the testdb1 checkpoint across 8 disks by rank.
+    Copies both the .pt and .safetensors files."""
     src_dir = os.path.join(DISK_ROOTS[0], get_ckpt_subdir(args.step))
     if not os.path.isdir(src_dir):
-        print(f"ERROR: {src_dir} 없음"); sys.exit(1)
+        print(f"ERROR: {src_dir} not found"); sys.exit(1)
 
     all_ckpt = sorted(f for f in os.listdir(src_dir)
                       if f.endswith('.pt') or f.endswith('.safetensors'))
@@ -108,14 +108,14 @@ def cmd_distribute(args):
             if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
                 print(f"  [disk{disk_idx+1}] {fname} ({sz:.1f} GB) — skip")
                 continue
-            print(f"  [disk{disk_idx+1}] {fname} ({sz:.1f} GB) — 복사중...",
+            print(f"  [disk{disk_idx+1}] {fname} ({sz:.1f} GB) — copying...",
                   end=" ", flush=True)
             t0 = time.monotonic()
             shutil.copy2(src, dst)
             t1 = time.monotonic()
             print(f"done ({t1-t0:.1f}s, {sz/(t1-t0):.2f} GB/s)")
 
-    print("\n  분산 완료!")
+    print("\n  distribution done!")
     for i, root in enumerate(DISK_ROOTS):
         d = os.path.join(root, get_ckpt_subdir(args.step))
         if os.path.isdir(d):
@@ -126,7 +126,7 @@ def cmd_distribute(args):
 
 
 def _flatten_tensors(obj, prefix=''):
-    """중첩 state dict에서 텐서만 평탄화. safetensors는 flat tensor dict만 지원."""
+    """Flatten only the tensors out of a nested state dict. safetensors supports only a flat tensor dict."""
     import torch
     out = {}
     if isinstance(obj, dict):
@@ -141,19 +141,19 @@ def _flatten_tensors(obj, prefix=''):
 
 
 def cmd_convert(args):
-    """testdb1의 .pt 체크포인트를 .safetensors로 변환.
-    distribute 전에 실행. 원본 .pt는 유지."""
+    """Convert the testdb1 .pt checkpoint to .safetensors.
+    Run before distribute. The original .pt is kept."""
     import torch
     try:
         from safetensors.torch import save_file
     except ImportError:
-        print("ERROR: safetensors 없음.  pip install safetensors")
+        print("ERROR: safetensors not installed.  pip install safetensors")
         sys.exit(1)
 
     src_dir = os.path.join(DISK_ROOTS[0], get_ckpt_subdir(args.step))
     pt_files = sorted(f for f in os.listdir(src_dir) if f.endswith('.pt'))
     if not pt_files:
-        print(f"ERROR: {src_dir} 에 .pt 파일 없음"); sys.exit(1)
+        print(f"ERROR: no .pt files in {src_dir}"); sys.exit(1)
 
     print(f"  Converting {len(pt_files)} files in {src_dir}")
     for fname in pt_files:
@@ -161,7 +161,7 @@ def cmd_convert(args):
         dst = src[:-3] + '.safetensors'
         sz = os.path.getsize(src) / GB
         if os.path.exists(dst) and os.path.getsize(dst) > 0:
-            print(f"  skip: {fname} → 이미 변환됨 ({os.path.getsize(dst)/GB:.1f} GB)")
+            print(f"  skip: {fname} → already converted ({os.path.getsize(dst)/GB:.1f} GB)")
             continue
         print(f"  {fname} ({sz:.1f} GB) → .safetensors ...", end=' ', flush=True)
         t0 = time.monotonic()
@@ -171,13 +171,13 @@ def cmd_convert(args):
         del state, flat
         t1 = time.monotonic()
         print(f"done ({t1-t0:.1f}s → {os.path.getsize(dst)/GB:.1f} GB)")
-    print("  변환 완료! 'distribute' 를 다시 실행하세요.")
+    print("  conversion done! Run 'distribute' again.")
 
 
-# ───────────────────── I/O 함수들 ─────────────────────
+# ───────────────────── I/O functions ─────────────────────
 
 def dio_raw_read_files(file_list, chunk_size):
-    """O_DIRECT raw read — 한 스레드가 file_list의 파일들을 순차 읽기.
+    """O_DIRECT raw read — one thread reads the files in file_list sequentially.
     Returns (total_bytes, io_seconds)."""
     buf = mmap.mmap(-1, chunk_size)
     mv = memoryview(buf)
@@ -248,7 +248,7 @@ class SizedMmap:
 
 def dio_torch_load_files(file_list, io_buf, chunk_size):
     """O_DIRECT prefetch into pre-allocated buffer → torch.load.
-    한 스레드가 file_list 순차 처리.
+    One thread processes file_list sequentially.
     Returns (total_bytes, io_seconds_sum)."""
     import torch
     mv = memoryview(io_buf)
@@ -274,7 +274,7 @@ def dio_torch_load_files(file_list, io_buf, chunk_size):
         t1 = time.monotonic()
         io_sec_sum += (t1 - t0)
 
-        # Phase 2: torch.load — 세마포어로 동시 실행 수 제한 (OOM 방지)
+        # Phase 2: torch.load — limit concurrency with a semaphore (avoid OOM)
         with _torch_sem:
             state = torch.load(SizedMmap(io_buf, file_size), weights_only=False)
             del state
@@ -285,8 +285,8 @@ def dio_torch_load_files(file_list, io_buf, chunk_size):
 
 
 def dio_safetensors_load_files(file_list, io_buf, chunk_size):
-    """O_DIRECT read .safetensors → header 파싱 → torch.frombuffer() (zero-copy).
-    역직렬화 오버헤드 ≈ 0 → I/O가 병목.
+    """O_DIRECT read .safetensors → parse header → torch.frombuffer() (zero-copy).
+    Deserialization overhead ≈ 0 → I/O is the bottleneck.
     Returns (total_bytes, io_seconds_sum)."""
     import torch
     mv = memoryview(io_buf)
@@ -313,12 +313,12 @@ def dio_safetensors_load_files(file_list, io_buf, chunk_size):
         t1 = time.monotonic()
         io_sec_sum += (t1 - t0)
 
-        # safetensors header 파싱 (in-memory, I/O 없음)
+        # parse safetensors header (in-memory, no I/O)
         header_len = struct.unpack_from('<Q', io_buf, 0)[0]
         header = json.loads(bytes(mv[8:8 + header_len]))
         data_base = 8 + header_len
 
-        # tensor 생성: mmap 버퍼를 직접 참조 (zero-copy)
+        # build tensors: reference the mmap buffer directly (zero-copy)
         tensors = {}
         for name, meta in header.items():
             if name == '__metadata__':
@@ -337,12 +337,12 @@ def dio_safetensors_load_files(file_list, io_buf, chunk_size):
     return total_bytes, io_sec_sum
 
 
-# ───────────────────── run 서브커맨드 ─────────────────────
+# ───────────────────── run subcommand ─────────────────────
 
 def collect_disk_files(num_disks, step, ranks, ext='.pt'):
-    """각 디스크별 파일 목록을 반환. 디스크당 할당된 rank만 포함.
-    num_disks==1 (single disk mode): testdb1의 모든 rank 파일을 읽음
-      (distribute 전 원본이 testdb1에 모두 존재).
+    """Return the file list per disk, including only the ranks assigned to each disk.
+    num_disks==1 (single disk mode): read all rank files from testdb1
+      (before distribute, the original holds them all on testdb1).
     Returns: list of (disk_idx, [file_paths]), total_size"""
     disk_files = []
     total_size = 0
@@ -351,7 +351,7 @@ def collect_disk_files(num_disks, step, ranks, ext='.pt'):
         root = DISK_ROOTS[disk_idx]
         step_dir = os.path.join(root, get_ckpt_subdir(step))
         if not os.path.isdir(step_dir):
-            print(f"  WARNING: {step_dir} 없음 — distribute 먼저 실행")
+            print(f"  WARNING: {step_dir} not found — run distribute first")
             continue
 
         all_files = sorted(os.path.join(step_dir, f)
@@ -359,11 +359,11 @@ def collect_disk_files(num_disks, step, ranks, ext='.pt'):
                            if f.endswith(ext))
 
         if num_disks == 1:
-            # Single disk mode: 모든 rank 파일을 하나의 디스크에서 읽음
-            # testdb1은 distribute 전 원본을 보유하므로 전체 rank 파일 접근 가능
+            # Single disk mode: read all rank files from one disk
+            # testdb1 holds the pre-distribute original, so all rank files are reachable
             files = all_files
         else:
-            # Multi disk mode: 이 디스크에 할당된 rank만 필터
+            # Multi disk mode: filter to only the ranks assigned to this disk
             start_rank = disk_idx * RANKS_PER_DISK
             end_rank = min(start_rank + RANKS_PER_DISK, ranks)
             filtered = []
@@ -397,7 +397,7 @@ def cmd_run(args):
 
     disk_files, total_size = collect_disk_files(num_disks, args.step, args.ranks, ext)
     if not disk_files:
-        print("ERROR: 읽을 파일 없음. 'distribute' 먼저 실행하세요.")
+        print("ERROR: no files to read. Run 'distribute' first.")
         sys.exit(1)
 
     total_files = sum(len(fl) for _, fl in disk_files)
@@ -462,12 +462,12 @@ def cmd_run(args):
 
         t0 = time.monotonic()
 
-        # 디스크당 tpd 스레드 — 파일을 round-robin으로 분배
+        # tpd threads per disk — distribute files round-robin
         with ThreadPoolExecutor(max_workers=total_threads) as pool:
             futures = {}  # future → (disk_idx, thread_idx)
             buf_idx = 0
             for disk_idx, files in disk_files:
-                # 파일을 tpd 스레드에 분배 (round-robin)
+                # distribute files across tpd threads (round-robin)
                 thread_file_lists = [[] for _ in range(tpd)]
                 for fi, fpath in enumerate(files):
                     thread_file_lists[fi % tpd].append(fpath)
@@ -487,7 +487,7 @@ def cmd_run(args):
                         buf_idx += 1
                     futures[fut] = (disk_idx, ti)
 
-            # 디스크별 합산
+            # aggregate per disk
             disk_results = {}  # disk_idx → (bytes, max_sec)
             for fut in as_completed(futures):
                 disk_idx, ti = futures[fut]

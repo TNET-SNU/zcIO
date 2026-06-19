@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# CosmoFlow 벤치마크 실행 (싱글코어, 오버헤드 최소)
+# Run the CosmoFlow benchmark (single core, minimal overhead).
 set -e
 
 source /opt/mlperf-env/venv/bin/activate
 
-# ── 설정 ──────────────────────────────────────────────────────────────────────
+# ── config ────────────────────────────────────────────────────────────────────
 DATA_DIR="/mnt/rocksdb_test/mlperf_merged"
 RESULTS_DIR="results_cosmoflow_single"
 ACCELERATOR_TYPE="h100"
@@ -14,7 +14,7 @@ MEMORY_GB=40
 COMPUTATION_TIME=0.00350
 READ_THREADS=5
 NUM_EPOCHS=1
-CPU_CORE=0   # taskset -c 0 (싱글코어)
+CPU_CORE=0   # taskset -c 0 (single core)
 
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1

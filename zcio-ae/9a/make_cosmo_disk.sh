@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# CosmoFlow 데이터 생성 + symlink-merge (풀코어)
+# Generate CosmoFlow data + symlink-merge (full cores).
 set -e
 
 source /opt/mlperf-env/venv/bin/activate
 
-# ── 설정 ──────────────────────────────────────────────────────────────────────
+# ── config ────────────────────────────────────────────────────────────────────
 DATA_DIR="/mnt/rocksdb_test/mlperf_merged"
-# NVMe/TCP 네트워크 디스크 4장만 사용. testdb5~8은 로컬 루트fs(/dev/mapper/ubuntu-vg)라
-# 거기 데이터를 깔면 read가 네트워크가 아니라 로컬로 새서 NIC throughput이 반쪽만 잡힌다.
+# Use only the 4 NVMe/TCP network disks. testdb5~8 are on the local root fs
+# (/dev/mapper/ubuntu-vg); putting data there makes reads leak to local storage
+# instead of the network, so the NIC throughput would only be half-measured.
 DISK_ROOTS=(
     "/mnt/rocksdb_test/testdb1/cosmoflow_data"
     "/mnt/rocksdb_test/testdb2/cosmoflow_data"
@@ -17,22 +18,22 @@ DISK_ROOTS=(
 NUM_DISKS=${#DISK_ROOTS[@]}
 NUM_FILES=8000
 FILES_PER_DISK=$((NUM_FILES / NUM_DISKS))   # 2000 per disk (8000/4)
-NUM_PROCS=$(nproc)                           # 풀코어
+NUM_PROCS=$(nproc)                           # full cores
 
 echo "disks=${NUM_DISKS}, files_per_disk=${FILES_PER_DISK}, num_procs=${NUM_PROCS}"
 
-# ── 디스크별 데이터 생성 ───────────────────────────────────────────────────────
+# ── per-disk data generation ──────────────────────────────────────────────────
 for i in "${!DISK_ROOTS[@]}"; do
     DISK_DIR="${DISK_ROOTS[$i]}"
     DISK_TRAIN="${DISK_DIR}/cosmoflow/train"
     DISK_COUNT=$(find "${DISK_TRAIN}" -maxdepth 1 -type f -name '*.npz' 2>/dev/null | wc -l)
 
     if [ "${DISK_COUNT}" -ge "${FILES_PER_DISK}" ]; then
-        echo "  disk$((i+1)): ${DISK_COUNT}개 존재, skip"
+        echo "  disk$((i+1)): ${DISK_COUNT} present, skip"
         continue
     fi
 
-    echo "  disk$((i+1)): ${FILES_PER_DISK}개 생성 중..."
+    echo "  disk$((i+1)): generating ${FILES_PER_DISK} files..."
     rm -rf "${DISK_TRAIN}"
     mlpstorage training datagen \
         --model cosmoflow \
@@ -45,15 +46,15 @@ for i in "${!DISK_ROOTS[@]}"; do
                  reader.data_loader=pytorch \
         --allow-run-as-root \
         --oversubscribe
-    echo "  disk$((i+1)): 완료"
+    echo "  disk$((i+1)): done"
 done
 
 # ── symlink-merge ──────────────────────────────────────────────────────────────
 MERGED_TRAIN="${DATA_DIR}/cosmoflow/train"
 
-# 항상 재생성: DISK_ROOTS(디스크 구성)가 바뀌면 기존 merge가 로컬 디스크(testdb5~8)를
-# 가리키는 stale 심링크일 수 있으므로 재사용하지 않고 매번 새로 만든다.
-echo "symlink-merge 재생성 중 (${NUM_FILES}개, ${NUM_DISKS}장 인터리브)..."
+# Always rebuild: if DISK_ROOTS (disk layout) changes, an existing merge may hold
+# stale symlinks pointing at the local disks (testdb5~8), so rebuild from scratch.
+echo "rebuilding symlink-merge (${NUM_FILES} files, ${NUM_DISKS} disks interleaved)..."
 rm -rf "${MERGED_TRAIN}"
 mkdir -p "${MERGED_TRAIN}"
 
@@ -73,4 +74,4 @@ for i in $(seq 0 $((FILES_PER_DISK - 1))); do
     done
 done
 
-echo "symlink-merge 완료: $(ls "${MERGED_TRAIN}" | wc -l)개"
+echo "symlink-merge done: $(ls "${MERGED_TRAIN}" | wc -l) files"

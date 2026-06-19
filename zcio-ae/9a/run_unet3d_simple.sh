@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# UNet3D 단순 실행 스크립트 (taskset 없음, 정리 없음)
-# 사용법: 실험 전에 setup_irq.sh 먼저 실행, CPU offline/online은 직접 조절
+# Simple UNet3D run script (no taskset, no cleanup).
+# Usage: run setup_irq.sh before the experiment; manage CPU offline/online yourself.
 set -e
 
 source /opt/mlperf-env/venv/bin/activate
@@ -18,7 +18,7 @@ export OMPI_MCA_opal_progress_lp_call_yield=1
 DATA_DIR="/mnt/rocksdb_test/mlperf_merged"
 ACCELERATOR_TYPE="h100"
 NUM_ACCELERATORS=2
-NUM_FILES=3072           # 8×12×33 = 3168 (num_accel × read_threads로 균등 분배)
+NUM_FILES=3072           # 8×12×33 = 3168 (evenly sharded by num_accel × read_threads)
 READ_THREADS=8
 MEMORY_GB=$((6 * NUM_ACCELERATORS))  # 36 GB
 

@@ -59,8 +59,8 @@ TOTAL=$((NUM_FILES * 4))
 MERGED_TRAIN="${MERGED}/unet3d/train"
 
 echo "── Building merged directory: ${MERGED_TRAIN} (${TOTAL} files, interleaved) ──"
-# /mnt/rocksdb_test는 다른 유저(ki) 소유라 top 디렉토리(${MERGED})는 못 지운다.
-# train 서브디렉토리만 비우고 다시 만든다 (부모 mlperf_merged/unet3d는 우리 소유).
+# /mnt/rocksdb_test is owned by another user (ki), so the top dir (${MERGED}) cannot be removed.
+# Only empty and rebuild the train subdir (the parent mlperf_merged/unet3d is ours).
 rm -rf "${MERGED_TRAIN}"
 mkdir -p "${MERGED_TRAIN}"
 
