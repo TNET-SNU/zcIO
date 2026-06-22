@@ -55,9 +55,9 @@ do if they don't match.
 | 2     | `7c`   | read  | 7m  |
 | 3     | `7d`   | read  | 17m |
 | 4     | `9a`   | read  | 30m |
-| 5     | `9b`   | read  |  |
-| 6     | `9c`   | read  |  |
-| 7     | `9d`   | read  | 6m  |
+| 5     | `9d`   | read  | 6m  |
+| 6     | `9b`   | read  | 40m |
+| 7     | `9c`   | read  | 10m |
 | 8     | `7a`   | write | 13m |
 | 9     | `7b`   | write | 37m |
 
