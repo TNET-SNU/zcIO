@@ -46,3 +46,5 @@ To enable RX zero-copy for NVMe/TCP target, configure a module parameter like be
 ```Bash
 echo 1 | sudo tee /sys/module/tcp_zc/parameters/enable_zerocopy
 ```
+
+Artifact evaluation scripts for reproducing the paper's figures live in `zcio-ae/` (one directory per figure).
