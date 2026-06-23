@@ -31,8 +31,8 @@ cfg_nic() {  # iface ip prefix
   ip link set "${iface}" up
   ip link set "${iface}" mtu "${MTU}"
   ethtool -K "${iface}" tso "${TSO}" gso "${GSO}" || true
-  ethtool -G "$iface" rx 4096
-  ethtool -G "$iface" tx 8192
+ # ethtool -G "$iface" rx 4096
+ # ethtool -G "$iface" tx 8192
 
   # MTU/up bounces can flush the address; re-add if missing.
   if ! ip -4 addr show dev "${iface}" | grep -qw "${ip}/${prefix}"; then
