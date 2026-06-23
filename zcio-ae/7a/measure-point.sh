@@ -25,7 +25,7 @@ HDRCOL="${4:-x}"
 # Each point is preceded by a blkdiscard cache reset (see below) so the SSD starts
 # fresh. Measurement: skip a WARMUP_SECS warmup, then report the first 5s window
 # whose CoV drops below threshold (same as the read figures).
-WARMUP_SECS="${WARMUP_SECS:-10}"
+WARMUP_SECS="${WARMUP_SECS:-15}"
 STEADY_WINDOW="${STEADY_WINDOW:-5}"
 STEADY_THRESH="${STEADY_THRESH:-5}"
 MAX_SAMPLE_SECS="${MAX_SAMPLE_SECS:-30}"

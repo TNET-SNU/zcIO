@@ -24,7 +24,7 @@ if [[ $EUID -ne 0 ]]; then exec sudo -n "$SCRIPT_PATH" "$@"; fi
 # iface | cidr | target-IP-to-ping
 NICS=(
   "ens2np0|10.3.95.5/24|10.3.95.10"
-  "ens3np0|10.3.96.5/24|10.3.96.10"
+#  "ens3np0|10.3.96.5/24|10.3.96.10"
 )
 MTU=9000
 
@@ -60,6 +60,8 @@ apply_nic() {  # iface cidr
   ethtool -K "$iface" rx-gro-hw on            # hw-gro at MTU 1500
   ifconfig "$iface" mtu "$MTU"                # then bump to 9000 (hw-gro stays on)
   ethtool -K "$iface" tso on gro on
+  # hw-gro is "off [fixed]" on this NIC, so use LRO for RX coalescing instead.
+  ethtool -K "$iface" lro on 2>/dev/null && echo "    lro: on" || echo "    (lro not settable on $iface)"
   ethtool -G "$iface" rx 8192 tx 8192   # NIC ring buffers (after mlx5 reload, before traffic)
 
   local hwgro mtu state
