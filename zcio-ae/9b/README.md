@@ -38,9 +38,11 @@ cd ~/zcIO/zcio-ae/9b
 ./all_in_one.sh
 ```
 
-**Takes about 40 minutes** (the per-config dataset generation dominates).
-For a quick look, `./all_in_one_fast.sh` runs only the curve endpoints
-(default @ 6 and 10 cores, zcIO @ 6 cores) instead of the full sweep.
+By default this runs the **3-point comparison** — default @ 6 and 10 cores, zcIO @
+6 cores — which is enough to show zcIO reaches the AU≥90% target at fewer cores.
+For the **full sweep** (`1, 2, 4, 6, 8, 10` cores per config) run
+`./all_in_one_full.sh` instead — **about 40 minutes** (the per-config dataset
+generation dominates).
 
 Per config it brings up NVMe/TCP at full cores, stages the dataset, then sweeps
 online-core counts running mlpstorage and parsing the steady-state (epoch-2) AU%.
@@ -61,6 +63,8 @@ zcIO should hit AU≥90% at fewer cores than default. Per-config CSVs land in
 
 ## Subsetting
 
+The full sweep takes `CONFIGS` / `CORES` overrides:
+
 ```bash
-CONFIGS="default" CORES="2 4 8" ./all_in_one.sh
+CONFIGS="default" CORES="2 4 8" ./all_in_one_full.sh
 ```
