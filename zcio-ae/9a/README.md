@@ -36,7 +36,8 @@ cd ~/zcIO/zcio-ae/9a
 ./all_in_one.sh
 ```
 
-**Takes about 30 minutes** (the per-config dataset generation dominates).
+**Takes about 20 minutes** (the dataset generation dominates; data is reused
+across configs and across figures, e.g. fig-9b's UNet3D).
 
 `all_in_one.sh` verifies the kernels + /opt env, stages the `rapids0/` target
 scripts, then for each config (default, zcIO) brings up NVMe/TCP and runs the

@@ -54,10 +54,10 @@ do if they don't match.
 | 1     | `8`    | read  | 8m  |
 | 2     | `7c`   | read  | 7m  |
 | 3     | `7d`   | read  | 17m |
-| 4     | `9c`   | read  | 10m |
-| 5     | `9d`   | read  | 6m  |
-| 6     | `9a`   | read  | 30m |
-| 7     | `9b`   | read  | 40m |
+| 4     | `9b`   | read  | 20m |
+| 5     | `9a`   | read  | 20m |
+| 6     | `9c`   | read  | 10m |
+| 7     | `9d`   | read  | 6m  |
 | 8     | `7a`   | write | 13m |
 | 9     | `7b`   | write | 37m |
 

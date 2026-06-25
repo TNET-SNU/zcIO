@@ -42,6 +42,8 @@ NUM_FILES="${NUM_FILES:-3072}"
 # THREAD_MULT=2 -> each GPU gets 2*cores reader threads (total = 2 * NUM_ACCEL * cores).
 # e.g. 10 cores -> 8 accel x 2x10 = 160 reader threads.
 THREAD_MULT="${THREAD_MULT:-2}"
+ZCIO_THREAD_MULT="${ZCIO_THREAD_MULT:-3}"               # zcIO uses more reader threads/accel; default keeps THREAD_MULT
+[[ "$CFG" == zcIO ]] && THREAD_MULT="$ZCIO_THREAD_MULT"
 EPOCHS="${EPOCHS:-5}"                                    # run 3 epochs; epoch 1 = cold warm-up
 REPORT_EPOCH="${REPORT_EPOCH:-max}"                     # "max" = best AU across epochs; or a number for a fixed epoch
 LOW_EPOCH_CORES="${LOW_EPOCH_CORES:-}"                  # these core counts run only LOW_EPOCHS (low-AU points where epochs don't matter)
