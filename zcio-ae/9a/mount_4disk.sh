@@ -39,14 +39,24 @@ echo "[mount] target namespaces: /dev/${DEVS[0]} /dev/${DEVS[1]} /dev/${DEVS[2]}
 
 for i in 1 2 3 4; do sudo mkdir -p "/mnt/rocksdb_test/testdb$i"; done
 
+# REUSE=1 -> keep the existing filesystem + data (mount only, NO mkfs), so the same
+# workload's data can be reused across configs (default -> zcIO) without a costly
+# regenerate. Falls back to mkfs if there's no mountable FS. REUSE=0 (default)
+# reformats fresh -- used for a new workload's first config.
+REUSE="${REUSE:-0}"
 for i in 0 1 2 3; do
-    sudo mkfs.ext4 -F -b 4096 "/dev/${DEVS[$i]}" \
-        || { echo "ERROR: mkfs failed on /dev/${DEVS[$i]}"; exit 1; }
+    n=$((i + 1))
+    dev="/dev/${DEVS[$i]}"
+    mnt="/mnt/rocksdb_test/testdb$n"
+    mountpoint -q "$mnt" && sudo umount "$mnt" 2>/dev/null || true
+    if [[ "$REUSE" == 1 ]] && sudo mount "$dev" "$mnt" 2>/dev/null; then
+        echo "[mount] testdb$n: REUSE existing FS on $dev (no mkfs)"
+    else
+        [[ "$REUSE" == 1 ]] && { echo "[mount] testdb$n: REUSE requested but no FS on $dev -> mkfs"; sudo umount "$mnt" 2>/dev/null || true; }
+        sudo mkfs.ext4 -F -b 4096 "$dev" \
+            || { echo "ERROR: mkfs failed on $dev"; exit 1; }
+        sudo mount "$dev" "$mnt"
+    fi
 done
-
-sudo mount "/dev/${DEVS[0]}" /mnt/rocksdb_test/testdb1
-sudo mount "/dev/${DEVS[1]}" /mnt/rocksdb_test/testdb2
-sudo mount "/dev/${DEVS[2]}" /mnt/rocksdb_test/testdb3
-sudo mount "/dev/${DEVS[3]}" /mnt/rocksdb_test/testdb4
 
 echo "[mount] mounted testdb1..4 on /mnt/rocksdb_test"

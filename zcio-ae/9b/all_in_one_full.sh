@@ -142,7 +142,9 @@ for cfg in "${CONFIGS[@]}"; do
     settle
 
     echo ">>> [$cfg] UNet3D online-core sweep ..."
-    ENV_DIR="$ENV_DIR" "$SWEEP_SH" "$cfg" "$OUTDIR" || echo "!! sweep error for $cfg (continuing)"
+    # low-AU cores (1,2) barely change across epochs -> run just 1 epoch there to save time
+    ENV_DIR="$ENV_DIR" LOW_EPOCH_CORES="${LOW_EPOCH_CORES:-1 2}" "$SWEEP_SH" "$cfg" "$OUTDIR" \
+        || echo "!! sweep error for $cfg (continuing)"
 
     cd "$HERE"
     echo

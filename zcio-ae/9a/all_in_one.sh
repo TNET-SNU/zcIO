@@ -107,34 +107,46 @@ safe_unmount() {
     else echo "  [unmount] some mounts remain — check: fuser -m /mnt/rocksdb_test/testdb*"; fi
 }
 
-# ----- per-config x per-workload sweep --------------------------------
-for cfg in "${CONFIGS[@]}"; do
+# ----- per-workload x per-config sweep --------------------------------
+# Outer loop = WORKLOAD. For each workload we run all configs (default, then zcIO)
+# back-to-back, generating the disk data only ONCE -- for the FIRST config -- and
+# REUSING it for the rest (the data is identical across configs; only the kernel
+# knobs differ). A new workload's first config reformats the disks (fresh data).
+#
+#   workload A: default (mkfs + datagen) -> zcIO (REUSE, no reinit)
+#   workload B: default (mkfs + datagen) -> zcIO (REUSE, no reinit)
+#   ...
+for wl in "${WORKLOADS[@]}"; do
     echo
     echo "############################################################"
-    echo "# config: $cfg"
+    echo "# workload: $wl"
     echo "############################################################"
-    "$ENV_DIR/disconnect.sh" || echo "!! disconnect reported an error (continuing)"
+    ci=0
+    for cfg in "${CONFIGS[@]}"; do
+        # first config of this workload -> fresh disk (REUSE=0: mkfs + datagen);
+        # later configs -> reuse the same data (REUSE=1: no mkfs, datagen auto-skips).
+        if [[ $ci -eq 0 ]]; then reuse=0; else reuse=1; fi
+        [[ $reuse -eq 1 ]] && tag="REUSE data" || tag="fresh disk"
 
-    echo ">>> [$cfg] bringing up NVMe/TCP stack ..."
-    if ! bring_up "$cfg"; then
-        echo "!! setup failed for $cfg — skipping"; continue
-    fi
-
-    # Per workload: mount -> run -> unmount (each workload mounts+datagens inside
-    # workload-*.sh; we unmount right after so every workload gets a clean mount).
-    for wl in "${WORKLOADS[@]}"; do
         echo
-        echo ">>> [$cfg] workload: $wl  (mount -> run -> unmount)"
-        if ! "./workload-${wl}.sh" "$cfg" "$OUTDIR"; then
+        echo ">>> [$wl/$cfg] disconnect + bring up NVMe/TCP ($tag) ..."
+        "$ENV_DIR/disconnect.sh" || echo "!! disconnect reported an error (continuing)"
+        if ! bring_up "$cfg"; then
+            echo "!! setup failed for $cfg — skipping"; ci=$((ci + 1)); continue
+        fi
+
+        echo ">>> [$wl/$cfg] workload run (REUSE=$reuse)"
+        if ! REUSE="$reuse" "./workload-${wl}.sh" "$cfg" "$OUTDIR"; then
             echo "!! workload $wl failed for $cfg (continuing)"
         fi
-        echo ">>> [$cfg] $wl done — unmount"
+        echo ">>> [$wl/$cfg] done — unmount"
         safe_unmount
+        ci=$((ci + 1))
     done
 
-    # config done: drop the NVMe/TCP sessions
+    # workload done: drop the NVMe/TCP sessions before the next workload
     echo
-    echo ">>> [$cfg] all workloads done — disconnect"
+    echo ">>> [$wl] all configs done — disconnect"
     "$ENV_DIR/disconnect.sh" || echo "!! disconnect reported an error (continuing)"
 done
 

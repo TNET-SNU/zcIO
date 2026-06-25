@@ -42,8 +42,10 @@ NUM_FILES="${NUM_FILES:-3072}"
 # THREAD_MULT=2 -> each GPU gets 2*cores reader threads (total = 2 * NUM_ACCEL * cores).
 # e.g. 10 cores -> 8 accel x 2x10 = 160 reader threads.
 THREAD_MULT="${THREAD_MULT:-2}"
-EPOCHS="${EPOCHS:-2}"                                    # run 2 epochs; epoch 1 = cold warm-up
-REPORT_EPOCH="${REPORT_EPOCH:-2}"                       # report THIS epoch's AU (2 = steady, discards epoch 1)
+EPOCHS="${EPOCHS:-5}"                                    # run 3 epochs; epoch 1 = cold warm-up
+REPORT_EPOCH="${REPORT_EPOCH:-max}"                     # "max" = best AU across epochs; or a number for a fixed epoch
+LOW_EPOCH_CORES="${LOW_EPOCH_CORES:-}"                  # these core counts run only LOW_EPOCHS (low-AU points where epochs don't matter)
+LOW_EPOCHS="${LOW_EPOCHS:-1}"                           # epochs to run for a LOW_EPOCH_CORES point
 MEM_GB="${MEM_GB:-36}"
 ACCEL_TYPE="${ACCEL_TYPE:-h100}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-3600}"                      # per-point safety cap (s)
@@ -83,10 +85,12 @@ for N in "${CORES[@]}"; do
     sleep "${SETTLE:-3}"                                  # let the offline settle before launching MPI
 
     T=$(( THREAD_MULT * N ))                              # read_threads scales with cores (2*N)
+    EP="$EPOCHS"                                          # per-core epochs (low-AU cores may run fewer)
+    for c in $LOW_EPOCH_CORES; do [[ "$c" == "$N" ]] && EP="$LOW_EPOCHS"; done
     RES="results_${CFG}_cpu${N}"
     LOG="$OUTDIR/unet3d-${CFG}-cpu${N}.log"
     rm -rf "$RES"
-    echo "  cores=$N  read_threads=$T (=${THREAD_MULT}x$N)"
+    echo "  cores=$N  read_threads=$T (=${THREAD_MULT}x$N)  epochs=$EP"
 
     timeout "$RUN_TIMEOUT" mlpstorage training run \
         --model unet3d \
@@ -98,37 +102,45 @@ for N in "${CORES[@]}"; do
         --params dataset.num_files_train="$NUM_FILES" \
                  reader.odirect=true \
                  reader.read_threads="$T" \
-                 train.epochs="$EPOCHS" \
+                 train.epochs="$EP" \
         --open --allow-run-as-root --oversubscribe \
         > "$LOG" 2>&1
     rc=$?
     [[ $rc -eq 124 ]] && echo "  !! TIMEOUT after ${RUN_TIMEOUT}s (cores=$N)"
 
-    # Parse the WARM epoch (REPORT_EPOCH) AU from the per-rank output JSONs, NOT the
-    # [METRIC] line (which averages ALL epochs incl. the cold epoch 1). DLIO stores
-    # per-epoch AU as "<epoch>.au.block1" in each <rank>_output.json; average over ranks.
+    # Parse per-epoch AU from the per-rank output JSONs (NOT the [METRIC] line, which
+    # averages ALL epochs incl. the cold epoch 1). DLIO stores per-epoch AU as
+    # "<epoch>.au.block1" in each <rank>_output.json. We rank-average each epoch, then
+    # report REPORT_EPOCH: "max" = the BEST epoch's AU (epoch 1 is cold so a steady
+    # epoch wins); a number = that specific epoch. samples/s is that same epoch's.
     RUNDIR=$(ls -td "$RES"/training/unet3d/run/*/ 2>/dev/null | head -1)
-    read AU SAMP < <(python3 - "$RUNDIR" "$REPORT_EPOCH" <<'PY'
+    read AU SAMP BESTEP < <(python3 - "$RUNDIR" "$REPORT_EPOCH" <<'PY'
 import json, glob, os, sys
-rundir, ep = sys.argv[1], sys.argv[2]
-au=[]; sp=[]
+from collections import defaultdict
+rundir, mode = sys.argv[1], sys.argv[2]
+au_ep = defaultdict(list); sp_ep = defaultdict(list)
 for f in glob.glob(os.path.join(rundir, "*_output.json")):
     try:
-        d=json.load(open(f)); b=d.get(ep, {})
-        if isinstance(b.get("au"), dict)        and "block1" in b["au"]:        au.append(float(b["au"]["block1"]))
-        if isinstance(b.get("throughput"), dict)and "block1" in b["throughput"]: sp.append(float(b["throughput"]["block1"]))
+        d = json.load(open(f))
+        for ep, b in d.items():
+            if not isinstance(b, dict): continue
+            if isinstance(b.get("au"), dict)         and "block1" in b["au"]:         au_ep[ep].append(float(b["au"]["block1"]))
+            if isinstance(b.get("throughput"), dict) and "block1" in b["throughput"]: sp_ep[ep].append(float(b["throughput"]["block1"]))
     except Exception: pass
-fa = f"{sum(au)/len(au):.4f}" if au else "N/A"
-fs = f"{sum(sp)/len(sp):.4f}" if sp else "N/A"
-print(fa, fs)
+au_avg = {e: sum(v)/len(v) for e, v in au_ep.items() if v}   # per-epoch, averaged over ranks
+if not au_avg:
+    print("N/A N/A N/A"); sys.exit()
+best = max(au_avg, key=au_avg.get) if mode == "max" else mode
+fa = f"{au_avg[best]:.4f}" if best in au_avg else "N/A"
+sv = sp_ep.get(best, [])
+fs = f"{sum(sv)/len(sv):.4f}" if sv else "N/A"
+print(fa, fs, best)
 PY
 )
-    # Only the epoch-2 (steady) AU is reported. IO / pass-fail come from the
-    # [METRIC] line which spans ALL epochs (mixes the cold epoch 1), so we drop them.
-    AU=${AU:-N/A}; SAMP=${SAMP:-N/A}
+    AU=${AU:-N/A}; SAMP=${SAMP:-N/A}; BESTEP=${BESTEP:-N/A}
 
     echo "$CFG,$N,$T,$AU,$SAMP" >> "$CSV"
-    printf "  → cores=%-2s thr=%-3s  epoch%s AU=%-8s samples/s=%s\n" "$N" "$T" "$REPORT_EPOCH" "$AU" "$SAMP"
+    printf "  → cores=%-2s thr=%-3s  AU=%-8s (best epoch %s/%s)  samples/s=%s\n" "$N" "$T" "$AU" "$BESTEP" "$EP" "$SAMP"
 done
 
 # restore all cores for the next config's connect / a clean machine

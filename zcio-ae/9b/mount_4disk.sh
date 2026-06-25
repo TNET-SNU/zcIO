@@ -39,14 +39,29 @@ echo "[mount] target namespaces: /dev/${DEVS[0]} /dev/${DEVS[1]} /dev/${DEVS[2]}
 
 for i in 1 2 3 4; do sudo mkdir -p "/mnt/rocksdb_test/testdb$i"; done
 
+# Per disk: REUSE if it already holds the UNet3D dataset (mounts cleanly AND has
+# files in mlperf_data/unet3d/train) -> skip mkfs, keep the data. Otherwise mkfs
+# fresh. The dataset lives on the NVMe/TCP target and persists across
+# disconnect/reconnect, so this avoids wiping + regenerating ~500 GB every config.
+# Self-correcting: if the data is gone (mount fails or dir empty) it falls back to
+# mkfs, so a first/clean run still works. Set FORCE_MKFS=1 to always reformat.
+DATA_SUB="mlperf_data/unet3d/train"
 for i in 0 1 2 3; do
-    sudo mkfs.ext4 -F -b 4096 "/dev/${DEVS[$i]}" \
-        || { echo "ERROR: mkfs failed on /dev/${DEVS[$i]}"; exit 1; }
+    n=$((i + 1))
+    dev="/dev/${DEVS[$i]}"
+    mnt="/mnt/rocksdb_test/testdb$n"
+    mountpoint -q "$mnt" && sudo umount "$mnt" 2>/dev/null || true
+    if [[ "${FORCE_MKFS:-0}" != 1 ]] \
+        && sudo mount "$dev" "$mnt" 2>/dev/null \
+        && [ -d "$mnt/$DATA_SUB" ] && [ -n "$(ls -A "$mnt/$DATA_SUB" 2>/dev/null)" ]; then
+        echo "[mount] testdb$n: dataset present on $dev -> REUSE (skip mkfs)"
+    else
+        sudo umount "$mnt" 2>/dev/null || true
+        echo "[mount] testdb$n: no dataset on $dev -> mkfs + mount"
+        sudo mkfs.ext4 -F -b 4096 "$dev" \
+            || { echo "ERROR: mkfs failed on $dev"; exit 1; }
+        sudo mount "$dev" "$mnt"
+    fi
 done
-
-sudo mount "/dev/${DEVS[0]}" /mnt/rocksdb_test/testdb1
-sudo mount "/dev/${DEVS[1]}" /mnt/rocksdb_test/testdb2
-sudo mount "/dev/${DEVS[2]}" /mnt/rocksdb_test/testdb3
-sudo mount "/dev/${DEVS[3]}" /mnt/rocksdb_test/testdb4
 
 echo "[mount] mounted testdb1..4 on /mnt/rocksdb_test"
