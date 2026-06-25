@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# coresweep-plot.py — fig-9b: UNet3D AU% vs online-core count, default vs zcIO.
+# plot.py — fig-9b: UNet3D AU% vs online-core count, default vs zcIO.
 #
-#   Usage:  ./coresweep-plot.py <outdir> [config ...]
+#   Usage:  python3 plot.py [--results-dir results] [--configs default zcIO] [--out results-plot.png]
 #
-# Reads <outdir>/coresweep-unet3d-<config>.csv (config,cores,au_pct,samples_per_s,
-# io_mb_per_s,pass), prints a table, and writes a line plot (AU% vs cores, one
-# line per config) to <outdir>/fig-9b-coresweep.png. Table-only if no matplotlib.
+# Reads <results-dir>/coresweep-unet3d-<config>.csv (config,cores,read_threads,
+# au_pct,samples_per_s), prints a table, and writes a line plot (AU% vs cores, one
+# line per config) to results-plot.png (+ .pdf) in the current dir. Table-only if
+# matplotlib is unavailable.
 import csv, os, sys
 
 def load(outdir, cfg):
@@ -21,10 +22,14 @@ def load(outdir, cfg):
     return d
 
 def main():
-    if len(sys.argv) < 2:
-        print("usage: coresweep-plot.py <outdir> [config ...]"); return 1
-    outdir = sys.argv[1]
-    configs = sys.argv[2:] or ["default", "zcIO"]
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results-dir", default="results")      # where the coresweep-unet3d-<config>.csv files are
+    ap.add_argument("--configs", nargs="+", default=["default", "zcIO"])
+    ap.add_argument("--out", default="results-plot.png")
+    args = ap.parse_args()
+    outdir = args.results_dir
+    configs = args.configs
 
     data = {c: load(outdir, c) for c in configs}
     data = {c: v for c, v in data.items() if v}
@@ -69,9 +74,11 @@ def main():
     ax.grid(alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    out = os.path.join(outdir, "fig-9b-coresweep.png")
+    out = args.out
     fig.savefig(out, dpi=150)
-    print(f"\n-> {out}")
+    pdf = os.path.splitext(out)[0] + ".pdf"
+    fig.savefig(pdf)
+    print(f"\n-> {out}  /  {pdf}")
     return 0
 
 if __name__ == "__main__":

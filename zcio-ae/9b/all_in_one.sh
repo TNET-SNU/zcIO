@@ -128,6 +128,6 @@ echo
 echo "############################################################"
 echo "# FAST: UNet3D AU% — default@{6,10} vs zcIO@{6}"
 echo "############################################################"
-python3 "$PLOT_PY" "$OUTDIR" "${CONFIGS[@]}" || echo "!! plot.py failed"
+python3 "$PLOT_PY" --results-dir "$OUTDIR" --configs "${CONFIGS[@]}" || echo "!! plot.py failed"
 echo
 echo "[all_in_one] done. CSVs + plot under: $OUTDIR/"

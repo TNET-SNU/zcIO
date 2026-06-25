@@ -184,7 +184,7 @@ echo
 echo "############################################################"
 echo "# COMBINED: UNet3D AU% per online-core count (default vs zcIO)"
 echo "############################################################"
-python3 "$PLOT_PY" "$OUTDIR" "${CONFIGS[@]}" || echo "!! plot.py failed"
+python3 "$PLOT_PY" --results-dir "$OUTDIR" --configs "${CONFIGS[@]}" || echo "!! plot.py failed"
 
 echo
 echo "[all-in-one] done. Per-config CSVs + plot under: $OUTDIR/"

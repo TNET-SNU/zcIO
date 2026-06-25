@@ -46,7 +46,7 @@ generation dominates).
 
 Per config it brings up NVMe/TCP at full cores, stages the dataset, then sweeps
 online-core counts running mlpstorage and parsing the steady-state (epoch-2) AU%.
-It prints a table and writes `results/fig-9b-coresweep.png`:
+It prints a table and writes `results-plot.png` (+ `.pdf`):
 
 ```
 cores       default     zcIO         (AU %)

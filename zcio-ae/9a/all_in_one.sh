@@ -164,7 +164,7 @@ echo
 echo "############################################################"
 echo "# COMBINED: MLPerf Storage default vs zcIO (per workload)"
 echo "############################################################"
-python3 ./plot.py "$OUTDIR" "${CONFIGS[@]}" || echo "!! plot.py failed"
+python3 ./plot.py --results-dir "$OUTDIR" --configs "${CONFIGS[@]}" || echo "!! plot.py failed"
 
 echo
 echo "[mlperf-all-in-one] done. Per-workload results under: $OUTDIR/"

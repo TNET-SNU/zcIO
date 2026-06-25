@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-# mlperf-plot.py — fig-9a combined report: default vs zcIO peak incoming Gbps.
+# plot.py — fig-9a combined report: default vs zcIO peak incoming Gbps.
 #
-#   Usage:  ./mlperf-plot.py <outdir> [config ...]
-#           ./mlperf-plot.py results default zcIO
+#   Usage:  python3 plot.py [--results-dir results] [--configs default zcIO] [--out results-plot.png]
 #
-# Reads <outdir>/<workload>-<config>.csv (header: workload,config,peak_incoming_gbps)
+# Reads <results-dir>/<workload>-<config>.csv (header: workload,config,peak_incoming_gbps)
 # for each workload, prints a table (default | zcIO | speedup) and writes a grouped
-# bar chart to <outdir>/fig-9a-mlperf.png. Degrades to table-only if matplotlib
+# bar chart to results-plot.png (+ .pdf) in the current dir. Table-only if matplotlib
 # is missing.
 import csv, os, sys
 
@@ -25,10 +24,14 @@ def read_peak(outdir, wl, cfg):
     return None
 
 def main():
-    if len(sys.argv) < 2:
-        print("usage: mlperf-plot.py <outdir> [config ...]"); return 1
-    outdir = sys.argv[1]
-    configs = sys.argv[2:] or ["default", "zcIO"]
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results-dir", default="results")      # where the <workload>-<config>.csv files are
+    ap.add_argument("--configs", nargs="+", default=["default", "zcIO"])
+    ap.add_argument("--out", default="results-plot.png")
+    args = ap.parse_args()
+    outdir = args.results_dir
+    configs = args.configs
 
     # discover workloads present, keep canonical order then any extras
     present = [w for w in WL_ORDER
@@ -91,9 +94,11 @@ def main():
     ax.grid(axis="y", alpha=0.3)
     ax.set_ylim(top=ax.get_ylim()[1] * 1.18)
     fig.tight_layout()
-    out = os.path.join(outdir, "fig-9a-mlperf.png")
+    out = args.out
     fig.savefig(out, dpi=150)
-    print(f"\n-> {out}")
+    pdf = os.path.splitext(out)[0] + ".pdf"
+    fig.savefig(pdf)
+    print(f"\n-> {out}  /  {pdf}")
     return 0
 
 if __name__ == "__main__":

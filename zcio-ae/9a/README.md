@@ -42,7 +42,7 @@ across configs and across figures, e.g. fig-9b's UNet3D).
 `all_in_one.sh` verifies the kernels + /opt env, stages the `rapids0/` target
 scripts, then for each config (default, zcIO) brings up NVMe/TCP and runs the
 three workloads (mount → datagen → single-core O_DIRECT read → peak Gbps). After
-it finishes it prints a table and writes `results/fig-9a-mlperf.png`:
+it finishes it prints a table and writes `results-plot.png` (+ `.pdf`):
 
 ```
 workload        default         zcIO            speedup          (peak incoming Gbps)
