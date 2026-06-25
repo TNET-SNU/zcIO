@@ -86,6 +86,7 @@ for N in "${CORES[@]}"; do
 
     T=$(( THREAD_MULT * N ))                              # read_threads scales with cores (2*N)
     EP="$EPOCHS"                                          # per-core epochs (low-AU cores may run fewer)
+    for c in ${MID_EPOCH_CORES:-}; do [[ "$c" == "$N" ]] && EP="${MID_EPOCHS:-2}"; done
     for c in $LOW_EPOCH_CORES; do [[ "$c" == "$N" ]] && EP="$LOW_EPOCHS"; done
     RES="results_${CFG}_cpu${N}"
     LOG="$OUTDIR/unet3d-${CFG}-cpu${N}.log"

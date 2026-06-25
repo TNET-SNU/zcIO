@@ -39,20 +39,23 @@ echo "[mount] target namespaces: /dev/${DEVS[0]} /dev/${DEVS[1]} /dev/${DEVS[2]}
 
 for i in 1 2 3 4; do sudo mkdir -p "/mnt/rocksdb_test/testdb$i"; done
 
-# REUSE=1 -> keep the existing filesystem + data (mount only, NO mkfs), so the same
-# workload's data can be reused across configs (default -> zcIO) without a costly
-# regenerate. Falls back to mkfs if there's no mountable FS. REUSE=0 (default)
-# reformats fresh -- used for a new workload's first config.
-REUSE="${REUSE:-0}"
+# EXPECT_DATA: if set, REUSE a disk whose existing FS already holds this dataset
+# (mounts cleanly AND has files under <mnt>/<EXPECT_DATA>) -> skip mkfs, keep the
+# data. This reuses data across configs (default->zcIO) AND across figures
+# (e.g. 9b's unet3d at mlperf_data/unet3d/train). A disk without that dataset is
+# reformatted fresh; empty EXPECT_DATA -> always mkfs. Self-correcting either way.
+EXPECT_DATA="${EXPECT_DATA:-}"
 for i in 0 1 2 3; do
     n=$((i + 1))
     dev="/dev/${DEVS[$i]}"
     mnt="/mnt/rocksdb_test/testdb$n"
     mountpoint -q "$mnt" && sudo umount "$mnt" 2>/dev/null || true
-    if [[ "$REUSE" == 1 ]] && sudo mount "$dev" "$mnt" 2>/dev/null; then
-        echo "[mount] testdb$n: REUSE existing FS on $dev (no mkfs)"
+    if [[ -n "$EXPECT_DATA" ]] && sudo mount "$dev" "$mnt" 2>/dev/null \
+        && [ -d "$mnt/$EXPECT_DATA" ] && [ -n "$(ls -A "$mnt/$EXPECT_DATA" 2>/dev/null)" ]; then
+        echo "[mount] testdb$n: dataset present ($EXPECT_DATA) on $dev -> REUSE (skip mkfs)"
     else
-        [[ "$REUSE" == 1 ]] && { echo "[mount] testdb$n: REUSE requested but no FS on $dev -> mkfs"; sudo umount "$mnt" 2>/dev/null || true; }
+        sudo umount "$mnt" 2>/dev/null || true
+        echo "[mount] testdb$n: no '$EXPECT_DATA' on $dev -> mkfs + mount"
         sudo mkfs.ext4 -F -b 4096 "$dev" \
             || { echo "ERROR: mkfs failed on $dev"; exit 1; }
         sudo mount "$dev" "$mnt"

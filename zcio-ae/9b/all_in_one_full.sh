@@ -42,6 +42,20 @@ PLOT_PY="${PLOT_PY:-$HERE/plot.py}"
 OUTDIR="${OUTDIR:-results}"; mkdir -p "$OUTDIR"; OUTDIR="$(cd "$OUTDIR" && pwd)"
 SETTLE="${SETTLE:-3}"                                    # seconds to let NVMe/TCP + mounts settle between ops
 
+# zcIO reaches the AU>=90% target at few cores, so 8/10 are redundant there.
+# Cap zcIO's sweep at ZCIO_MAX_CORES; default keeps the full CORES list.
+ZCIO_MAX_CORES="${ZCIO_MAX_CORES:-6}"
+cores_for() {
+    local all="${CORES:-1 2 4 6 8 10}"
+    if [[ "$1" == zcIO ]]; then
+        local c out=""
+        for c in $all; do [[ "$c" -le "$ZCIO_MAX_CORES" ]] && out+="$c "; done
+        echo "${out% }"
+    else
+        echo "$all"
+    fi
+}
+
 # settle pause between mount/unmount/connect/disconnect so the kernel finishes
 # tearing down / bringing up state before the next op (avoids stale ctrl races).
 settle() { sleep "$SETTLE"; }
@@ -142,9 +156,10 @@ for cfg in "${CONFIGS[@]}"; do
     settle
 
     echo ">>> [$cfg] UNet3D online-core sweep ..."
-    # low-AU cores (1,2) barely change across epochs -> run just 1 epoch there to save time
-    ENV_DIR="$ENV_DIR" LOW_EPOCH_CORES="${LOW_EPOCH_CORES:-1 2}" "$SWEEP_SH" "$cfg" "$OUTDIR" \
-        || echo "!! sweep error for $cfg (continuing)"
+    # low-AU cores (1,2) barely change across epochs -> run just 1 epoch there to save time;
+    # zcIO sweep is capped at ZCIO_MAX_CORES (default keeps the full core list).
+    ENV_DIR="$ENV_DIR" LOW_EPOCH_CORES="${LOW_EPOCH_CORES:-1 2}" MID_EPOCH_CORES="${MID_EPOCH_CORES:-4}" CORES="$(cores_for "$cfg")" \
+        "$SWEEP_SH" "$cfg" "$OUTDIR" || echo "!! sweep error for $cfg (continuing)"
 
     cd "$HERE"
     echo

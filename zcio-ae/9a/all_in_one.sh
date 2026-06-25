@@ -107,41 +107,44 @@ safe_unmount() {
     else echo "  [unmount] some mounts remain — check: fuser -m /mnt/rocksdb_test/testdb*"; fi
 }
 
+# A workload's data is REUSED if already on disk (across configs AND across
+# figures). The marker is a per-disk subpath present only when this workload's
+# data exists; mount_4disk skips mkfs when it finds it (else reformats fresh).
+data_marker() {
+    case "$1" in
+        unet3d)    echo "mlperf_data/unet3d/train" ;;       # == fig-9b's unet3d data -> reused
+        cosmoflow) echo "cosmoflow_data/cosmoflow/train" ;;
+        llama3)    echo "llama3_8b_ckpt/llama3-8b/global_epoch1_step1" ;;
+        *)         echo "" ;;
+    esac
+}
+
 # ----- per-workload x per-config sweep --------------------------------
-# Outer loop = WORKLOAD. For each workload we run all configs (default, then zcIO)
-# back-to-back, generating the disk data only ONCE -- for the FIRST config -- and
-# REUSING it for the rest (the data is identical across configs; only the kernel
-# knobs differ). A new workload's first config reformats the disks (fresh data).
-#
-#   workload A: default (mkfs + datagen) -> zcIO (REUSE, no reinit)
-#   workload B: default (mkfs + datagen) -> zcIO (REUSE, no reinit)
-#   ...
+# Outer loop = WORKLOAD. Each workload runs all configs (default, then zcIO)
+# back-to-back. The disk is (re)generated only when THIS workload's data is NOT
+# already present -- so default->zcIO reuse the same data, and a workload whose
+# data is already on disk (e.g. unet3d left by fig-9b) is reused, not regenerated.
+# A workload with different data reformats fresh.
 for wl in "${WORKLOADS[@]}"; do
     echo
     echo "############################################################"
     echo "# workload: $wl"
     echo "############################################################"
-    ci=0
+    edata="$(data_marker "$wl")"
     for cfg in "${CONFIGS[@]}"; do
-        # first config of this workload -> fresh disk (REUSE=0: mkfs + datagen);
-        # later configs -> reuse the same data (REUSE=1: no mkfs, datagen auto-skips).
-        if [[ $ci -eq 0 ]]; then reuse=0; else reuse=1; fi
-        [[ $reuse -eq 1 ]] && tag="REUSE data" || tag="fresh disk"
-
         echo
-        echo ">>> [$wl/$cfg] disconnect + bring up NVMe/TCP ($tag) ..."
+        echo ">>> [$wl/$cfg] disconnect + bring up NVMe/TCP ..."
         "$ENV_DIR/disconnect.sh" || echo "!! disconnect reported an error (continuing)"
         if ! bring_up "$cfg"; then
-            echo "!! setup failed for $cfg — skipping"; ci=$((ci + 1)); continue
+            echo "!! setup failed for $cfg — skipping"; continue
         fi
 
-        echo ">>> [$wl/$cfg] workload run (REUSE=$reuse)"
-        if ! REUSE="$reuse" "./workload-${wl}.sh" "$cfg" "$OUTDIR"; then
+        echo ">>> [$wl/$cfg] workload run (reuse '$edata' if present, else fresh)"
+        if ! EXPECT_DATA="$edata" "./workload-${wl}.sh" "$cfg" "$OUTDIR"; then
             echo "!! workload $wl failed for $cfg (continuing)"
         fi
         echo ">>> [$wl/$cfg] done — unmount"
         safe_unmount
-        ci=$((ci + 1))
     done
 
     # workload done: drop the NVMe/TCP sessions before the next workload
