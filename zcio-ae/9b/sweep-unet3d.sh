@@ -41,10 +41,10 @@ NUM_FILES="${NUM_FILES:-3072}"
 # read_threads (per accelerator) SCALES with online cores: rt = THREAD_MULT * cores.
 # THREAD_MULT=2 -> each GPU gets 2*cores reader threads (total = 2 * NUM_ACCEL * cores).
 # e.g. 10 cores -> 8 accel x 2x10 = 160 reader threads.
-THREAD_MULT="${THREAD_MULT:-2}"
-ZCIO_THREAD_MULT="${ZCIO_THREAD_MULT:-3}"               # zcIO uses more reader threads/accel; default keeps THREAD_MULT
-[[ "$CFG" == zcIO ]] && THREAD_MULT="$ZCIO_THREAD_MULT"
-EPOCHS="${EPOCHS:-5}"                                    # run 3 epochs; epoch 1 = cold warm-up
+THREAD_MULT="${THREAD_MULT:-2}"                        # base reader-thread mult (per accel = THREAD_MULT * cores)
+TMULT_HI="${TMULT_HI:-3}"                              # the HIGHEST core in this sweep (peak point) uses this mult instead
+CORE_MAX=0; for _c in "${CORES[@]}"; do (( _c > CORE_MAX )) && CORE_MAX=$_c; done
+EPOCHS="${EPOCHS:-3}"                                    # run 3 epochs; epoch 1 = cold warm-up
 REPORT_EPOCH="${REPORT_EPOCH:-max}"                     # "max" = best AU across epochs; or a number for a fixed epoch
 LOW_EPOCH_CORES="${LOW_EPOCH_CORES:-}"                  # these core counts run only LOW_EPOCHS (low-AU points where epochs don't matter)
 LOW_EPOCHS="${LOW_EPOCHS:-1}"                           # epochs to run for a LOW_EPOCH_CORES point
@@ -86,14 +86,15 @@ for N in "${CORES[@]}"; do
     "$SETCORES" "$N"                                     # offline down to N online cores
     sleep "${SETTLE:-3}"                                  # let the offline settle before launching MPI
 
-    T=$(( THREAD_MULT * N ))                              # read_threads scales with cores (2*N)
+    TM="$THREAD_MULT"; [[ "$N" -eq "$CORE_MAX" ]] && TM="$TMULT_HI"   # top core gets the higher mult
+    T=$(( TM * N ))                                       # read_threads = TM * cores
     EP="$EPOCHS"                                          # per-core epochs (low-AU cores may run fewer)
     for c in ${MID_EPOCH_CORES:-}; do [[ "$c" == "$N" ]] && EP="${MID_EPOCHS:-2}"; done
     for c in $LOW_EPOCH_CORES; do [[ "$c" == "$N" ]] && EP="$LOW_EPOCHS"; done
     RES="results_${CFG}_cpu${N}"
     LOG="$OUTDIR/unet3d-${CFG}-cpu${N}.log"
     rm -rf "$RES"
-    echo "  cores=$N  read_threads=$T (=${THREAD_MULT}x$N)  epochs=$EP"
+    echo "  cores=$N  read_threads=$T (=${TM}x$N)  epochs=$EP"
 
     timeout "$RUN_TIMEOUT" mlpstorage training run \
         --model unet3d \

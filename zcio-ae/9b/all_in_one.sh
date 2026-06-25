@@ -20,7 +20,7 @@ HERE="$(pwd)"
 ENV_DIR="${ENV_DIR:-$HERE}"
 CONFIGS=(default zcIO)
 # per-config online-core list (THIS is the only real difference from all_in_one_full.sh)
-cores_for() { case "$1" in default) echo "6 10" ;; zcIO) echo "6" ;; *) echo "" ;; esac; }
+cores_for() { case "$1" in default) echo "6 8 10" ;; zcIO) echo "6" ;; *) echo "" ;; esac; }
 MOUNT_SH="${MOUNT_SH:-./mount_4disk.sh}"
 UNMOUNT_SH="${UNMOUNT_SH:-./unmount_4disk.sh}"
 SWEEP_SH="${SWEEP_SH:-$HERE/sweep-unet3d.sh}"
