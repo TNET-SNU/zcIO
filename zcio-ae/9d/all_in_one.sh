@@ -241,16 +241,33 @@ run_one() {
   verify_irq_pin
 
   local out="$odir/$size.log"
-  ssh_client "WRK_BIN=$WRK_BIN bash $CLIENT_DIR/ae-run-wrk.sh $HOST_NIC_IP $t $c $WRK_DURATION $WRK_TIMEOUT $WRK_WARMUP" \
-      2>&1 | tee "$out"
-
-  local gb rps
-  gb=$(grep -oP 'TOTAL_GBPS=\K[\d.]+' "$out" | tail -1)
-  rps=$(grep -oP 'TOTAL_RPS=\K[\d.]+' "$out" | tail -1)
+  # Retry the wrk load if it comes back near-0 GB/s: the FIRST config (linux) often
+  # gets a cold-start dud — nginx/NVMe-TCP not warmed when wrk hits — that re-runs
+  # fine. Accept only when throughput >= MIN_GBPS; otherwise settle + re-run.
+  local MIN_GBPS="${MIN_GBPS:-1}"            # below this (GB/s) = treat as cold-start dud
+  local MAX_WRK_RETRY="${MAX_WRK_RETRY:-3}"  # total attempts
+  local WRK_RETRY_SETTLE="${WRK_RETRY_SETTLE:-5}"
+  local gb rps try=1
+  while :; do
+    ssh_client "WRK_BIN=$WRK_BIN bash $CLIENT_DIR/ae-run-wrk.sh $HOST_NIC_IP $t $c $WRK_DURATION $WRK_TIMEOUT $WRK_WARMUP" \
+        2>&1 | tee "$out"
+    gb=$(grep -oP 'TOTAL_GBPS=\K[\d.]+' "$out" | tail -1)
+    rps=$(grep -oP 'TOTAL_RPS=\K[\d.]+' "$out" | tail -1)
+    if [ -n "$gb" ] && awk -v g="$gb" -v m="$MIN_GBPS" 'BEGIN{exit !(g+0 >= m+0)}'; then
+      break                                  # good measurement
+    fi
+    if [ "$try" -ge "$MAX_WRK_RETRY" ]; then
+      warn "config=$zc size=$size: ${gb:-NA} GB/s still < ${MIN_GBPS} after ${MAX_WRK_RETRY} tries — recording as-is"
+      break
+    fi
+    warn "config=$zc size=$size: ${gb:-NA} GB/s < ${MIN_GBPS} (cold start?) — retry $((try+1))/${MAX_WRK_RETRY} after ${WRK_RETRY_SETTLE}s"
+    sleep "$WRK_RETRY_SETTLE"
+    try=$((try+1))
+  done
   # show GB/s to 1 decimal (round at the 2nd); leave NA untouched
   [ -n "$gb" ] && gb=$(printf '%.1f' "$gb")
   echo "$zc,$size,${gb:-NA},${rps:-NA}" >> "$SUMMARY"
-  sub "=> config=$zc size=$size : ${gb:-NA} GB/s"
+  sub "=> config=$zc size=$size : ${gb:-NA} GB/s  (try $try/${MAX_WRK_RETRY})"
 
   sudo bash "$HERE/nginx-teardown.sh" >/dev/null 2>&1 || true
 }
