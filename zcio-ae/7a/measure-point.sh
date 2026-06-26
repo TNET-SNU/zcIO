@@ -83,8 +83,11 @@ done
 wait
 sleep "$IDLE_SECS"
 
+# confine randwrite to a per-device working set (fresh-SLC start, like fig-7b's 10G)
+WSET_SIZE="${WSET_SIZE:-10G}"
 job="$(mktemp)"
-cat "$FIOFILE" > "$job"
+sed -E -e "s/^size=.*/size=${WSET_SIZE}/" "$FIOFILE" > "$job"
+grep -q '^size=' "$job" || sed -i "0,/^\[global\]/s//[global]\nsize=${WSET_SIZE}/" "$job"
 i=0; for d in "${DEVS[@]}"; do printf '\n[dev%d]\nfilename=%s\n' "$i" "$d" >> "$job"; i=$((i+1)); done
 
 kill_fio() {
