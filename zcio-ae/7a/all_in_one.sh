@@ -56,6 +56,11 @@ stage_to() {
 echo ">>> staging target scripts to $RAPIDS0:$RAPIDS0_DIR"
 stage_to "$RAPIDS0" "$(pwd)/rapids0" "$RAPIDS0_DIR" || { echo "!! staging failed"; exit 1; }
 
+# ----- fresh-SLC clean start: nvme-format the 9100 PROs, settle, and VERIFY clean
+# BEFORE the run (SKIP_FORMAT=1 to skip; FMT_IDLE_SECS to tune the settle wait).
+echo; echo ">>> [rapids0] format-9100.sh — fresh-SLC clean start (format + settle + verify)"
+$SSH sudo -n "$RAPIDS0_DIR/format-9100.sh" || { echo "!! format-9100 failed — aborting (devices not clean)"; exit 1; }
+
 # ----- stream5 data-plane (full cores, once) --------------------------
 echo; echo ">>> [stream5] data plane: buffers + net (reload mlx5 + MTU 9000)"
 # ----- ensure the host (SENDER) has all cores online ------------------

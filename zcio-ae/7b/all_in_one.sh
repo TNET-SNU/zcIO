@@ -77,6 +77,11 @@ stage_files_to "$STREAM6" "$STREAM6_DIR" \
     || { echo "!! stream6 staging failed"; exit 1; }
 $SSH6 "rm -rf $STREAM6_DIR/results-* 2>/dev/null; true"
 
+# ----- fresh-SLC clean start: nvme-format the 9100 PROs, settle, and VERIFY clean
+# BEFORE the run (SKIP_FORMAT=1 to skip; FMT_IDLE_SECS to tune the settle wait).
+echo; echo ">>> [rapids0] format-9100.sh — fresh-SLC clean start (format + settle + verify)"
+$SSH sudo -n "$RAPIDS0_DIR/format-9100.sh" || { echo "!! format-9100 failed — aborting (devices not clean)"; exit 1; }
+
 # ----- initiator data-plane (both senders, full cores, once) ----------
 online_all_cores_local() {
     local off; off="$(cat /sys/devices/system/cpu/offline 2>/dev/null)"
