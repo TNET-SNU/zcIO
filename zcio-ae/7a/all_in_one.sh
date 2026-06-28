@@ -77,10 +77,12 @@ if [ -n "$off" ]; then
     done
 fi
 echo ">>> [initiator stream5] online cores: $(nproc)"
-# stream5 is the full-core SENDER (not the bottleneck), so no governor here — the
-# performance governor is set on rapids0 (the core-limited bottleneck) per config.
+# stream5 is the full-core SENDER. rapids0 (the core-limited bottleneck) gets the
+# performance governor per config below, but pin stream5 to performance too so the
+# sender CPU never throttles down (a throttled sender would cap the write throughput).
 ./buffer.sh                   || echo "!! buffer.sh failed (continuing)"
 ./stream5-net.sh              || { echo "!! stream5 net setup failed"; exit 1; }
+sudo -n ./cpu-governor.sh performance >/dev/null 2>&1 || echo "!! stream5 cpu-governor failed (continuing)"
 
 # ----- target setup helpers (rapids0) ---------------------------------
 setup_kernel_target() {  # zcopy_on.sh|zcopy_off.sh

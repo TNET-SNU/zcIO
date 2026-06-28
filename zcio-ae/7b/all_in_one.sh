@@ -72,7 +72,7 @@ echo ">>> staging target scripts to $RAPIDS0:$RAPIDS0_DIR"
 stage_to "$RAPIDS0" "$(pwd)/rapids0" "$RAPIDS0_DIR" || { echo "!! staging failed"; exit 1; }
 echo ">>> staging initiator scripts to $STREAM6:$STREAM6_DIR"
 stage_files_to "$STREAM6" "$STREAM6_DIR" \
-    buffer.sh stream6-net.sh stream6-restore.sh set-pdu-align.sh \
+    buffer.sh stream6-net.sh stream6-restore.sh set-pdu-align.sh cpu-governor.sh \
     connect-targets.sh disconnect-targets.sh measure-host.sh workload-*.fio \
     || { echo "!! stream6 staging failed"; exit 1; }
 $SSH6 "rm -rf $STREAM6_DIR/results-* 2>/dev/null; true"
@@ -99,9 +99,13 @@ echo ">>> [stream5] online cores: $(nproc)  |  [stream6] online cores: $($SSH6 n
 echo; echo ">>> [stream5] data plane: buffers + net (reload mlx5 + MTU 9000)"
 ./buffer.sh                   || echo "!! stream5 buffer.sh failed (continuing)"
 ./stream5-net.sh              || { echo "!! stream5 net setup failed"; exit 1; }
+# both initiators are full-core SENDERS — pin them to performance so the sender CPU
+# never throttles (a throttled stream5 sends slower -> NIC-RX imbalance at the target).
+sudo -n ./cpu-governor.sh performance >/dev/null 2>&1 || echo "!! stream5 cpu-governor failed (continuing)"
 echo ">>> [stream6] data plane: buffers + net"
 $SSH6 sudo -n "$STREAM6_DIR/buffer.sh"      || echo "!! stream6 buffer.sh failed (continuing)"
 $SSH6 sudo -n "$STREAM6_DIR/stream6-net.sh" || { echo "!! stream6 net setup failed"; exit 1; }
+$SSH6 sudo -n "$STREAM6_DIR/cpu-governor.sh" performance >/dev/null 2>&1 || echo "!! stream6 cpu-governor failed (continuing)"
 
 # ----- helpers that act on BOTH initiators ----------------------------
 pdu_both() {  # 0|2
@@ -187,9 +191,10 @@ setup_spdk_target() {  # cores
     # path is limited too, AND the SPDK core mask (cpu0..N-1) matches the online
     # cores so DPDK EAL is happy. cpu-limit flaps mlx5, so wait for the NICs back.
     $SSH sudo -n "$RAPIDS0_DIR/cpu-limit.sh" "$cores"  || echo "!! cpu-limit failed"
-    # set-irq-affinity.sh stops irqbalance and pins IRQs manually; keep rapids0
-    # irqbalance ON instead (it spreads NIC/NVMe IRQs across the online cores).
-    #$SSH sudo -n "$RAPIDS0_DIR/set-irq-affinity.sh"    || true
+    # IRQ_SPLIT=1: pin the two target NICs to DISJOINT cores (set-irq-affinity.sh,
+    # stops irqbalance) so two-host write RX doesn't contend on shared cores (the
+    # "one NIC hot, one cold" imbalance). Unset -> leave irqbalance on.
+    [[ -n "${IRQ_SPLIT:-}" ]] && $SSH sudo -n "$RAPIDS0_DIR/set-irq-affinity.sh" || true
     $SSH sudo -n "$RAPIDS0_DIR/cpu-governor.sh" performance || true
     wait_nics_settle
     $SSH sudo -n "$RAPIDS0_DIR/spdk-target-start.sh" "$cores" || { echo "!! spdk target start failed"; return 1; }
@@ -203,8 +208,8 @@ run_kernel_config() {  # config zcopy pdu
     for n in $CORE_SWEEP; do
         echo "---------------- $config: rapids0 cores=$n ----------------"
         $SSH sudo -n "$RAPIDS0_DIR/cpu-limit.sh" "$n"       || echo "  !! cpu-limit $n failed"
-        # keep rapids0 irqbalance ON (see setup_spdk_target note); no manual pinning.
-        #$SSH sudo -n "$RAPIDS0_DIR/set-irq-affinity.sh"     || true
+        # IRQ_SPLIT=1: pin two NICs to disjoint cores (see setup_spdk_target note).
+        [[ -n "${IRQ_SPLIT:-}" ]] && $SSH sudo -n "$RAPIDS0_DIR/set-irq-affinity.sh" || true
         sleep 1
         measure_2host "$config" "$n" "workload-$config-$n.fio" \
             || echo "  !! measure $config cores=$n failed"
