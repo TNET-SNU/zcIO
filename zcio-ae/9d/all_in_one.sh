@@ -69,9 +69,46 @@ clean_slate() {
   sudo killall nginx 2>/dev/null || true
   sudo bash "$HERE/teardown.sh" >/dev/null 2>&1 || true
   sudo nvme disconnect-all 2>/dev/null || true
-  # target: drop any existing nvmet config
+  # WAIT for the NVMe/TCP controllers to actually disappear. disconnect-all is async;
+  # a leftover controller from the PREVIOUS figure (e.g. 9c) is the root cause of
+  # "9d after 9c is ~0 GB/s on the first run" — 9d's first connect/mount then races
+  # the stale teardown and nginx serves a bad backend. A full cycle (failed run's
+  # exit cleanup) clears it, which is why a re-run works. Block here instead.
+  local i c left
+  for i in $(seq 1 20); do
+    left=0
+    for c in /sys/class/nvme/nvme*; do
+      [ -e "$c/transport" ] || continue
+      [ "$(cat "$c/transport" 2>/dev/null)" = tcp ] && left=1
+    done
+    [ "$left" = 0 ] && break
+    sleep 1
+  done
+  [ "$left" = 0 ] && sub "host: no stale NVMe/TCP controllers" || warn "host: NVMe/TCP controllers still present after 20s"
+
+  # host: make sure the data mounts are actually gone
+  local m
+  for m in /mnt/rocksdb_test/testdb*; do
+    [ -d "$m" ] || continue
+    mountpoint -q "$m" 2>/dev/null && { sudo umount -l "$m" 2>/dev/null || true; }
+  done
+
+  # target: drop the nvmet config and VERIFY it is actually gone (ports + subsystems
+  # empty) before we proceed — not just a fixed sleep.
   ssh_target "sudo bash $TARGET_SCRIPT_DIR/nvmet-9100-teardown.sh" >/dev/null 2>&1 || true
-  sub "clean."
+  for i in $(seq 1 20); do
+    ssh_target 'ls /sys/kernel/config/nvmet/ports/ 2>/dev/null | grep -q . \
+             || ls /sys/kernel/config/nvmet/subsystems/ 2>/dev/null | grep -q .' || break
+    sleep 1
+  done
+  if ssh_target 'ls /sys/kernel/config/nvmet/ports/ 2>/dev/null | grep -q . \
+              || ls /sys/kernel/config/nvmet/subsystems/ 2>/dev/null | grep -q .'; then
+    warn "target: nvmet ports/subsystems STILL present after 20s"
+  else
+    sub "target: nvmet fully torn down"
+  fi
+  sleep "${CLEAN_SETTLE:-5}"
+  sub "clean — everything confirmed down."
 }
 
 # ----- cleanup on exit (success OR failure): teardown host + target, restore --
