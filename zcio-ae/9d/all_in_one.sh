@@ -278,35 +278,27 @@ run_one() {
   verify_irq_pin
 
   local out="$odir/$size.log"
-  # Retry the wrk load if it comes back near-0 GB/s: the FIRST config (linux) often
-  # gets a cold-start dud — nginx/NVMe-TCP not warmed when wrk hits — that re-runs
-  # fine. Accept only when throughput >= MIN_GBPS; otherwise settle + re-run.
-  local MIN_GBPS="${MIN_GBPS:-1}"            # below this (GB/s) = treat as cold-start dud
-  local MAX_WRK_RETRY="${MAX_WRK_RETRY:-3}"  # total attempts
-  local WRK_RETRY_SETTLE="${WRK_RETRY_SETTLE:-5}"
-  local gb rps try=1
-  while :; do
-    ssh_client "WRK_BIN=$WRK_BIN bash $CLIENT_DIR/ae-run-wrk.sh $HOST_NIC_IP $t $c $WRK_DURATION $WRK_TIMEOUT $WRK_WARMUP" \
-        2>&1 | tee "$out"
-    gb=$(grep -oP 'TOTAL_GBPS=\K[\d.]+' "$out" | tail -1)
-    rps=$(grep -oP 'TOTAL_RPS=\K[\d.]+' "$out" | tail -1)
-    if [ -n "$gb" ] && awk -v g="$gb" -v m="$MIN_GBPS" 'BEGIN{exit !(g+0 >= m+0)}'; then
-      break                                  # good measurement
-    fi
-    if [ "$try" -ge "$MAX_WRK_RETRY" ]; then
-      warn "config=$zc size=$size: ${gb:-NA} GB/s still < ${MIN_GBPS} after ${MAX_WRK_RETRY} tries — recording as-is"
-      break
-    fi
-    warn "config=$zc size=$size: ${gb:-NA} GB/s < ${MIN_GBPS} (cold start?) — retry $((try+1))/${MAX_WRK_RETRY} after ${WRK_RETRY_SETTLE}s"
-    sleep "$WRK_RETRY_SETTLE"
-    try=$((try+1))
-  done
-  # show GB/s to 1 decimal (round at the 2nd); leave NA untouched
-  [ -n "$gb" ] && gb=$(printf '%.1f' "$gb")
-  echo "$zc,$size,${gb:-NA},${rps:-NA}" >> "$SUMMARY"
-  sub "=> config=$zc size=$size : ${gb:-NA} GB/s  (try $try/${MAX_WRK_RETRY})"
-
+  # Run the wrk load ONCE. If it comes back near-0 GB/s the whole environment is in a
+  # bad cold-start state (nginx/NVMe-TCP not warmed, leftover from a previous figure) —
+  # an in-place re-run of just wrk does NOT fix it. Instead we signal the caller to
+  # disconnect and restart the entire sweep from clean_slate (return 2), which is what
+  # a full re-run of all_in_one does by hand. Accept only when throughput >= MIN_GBPS.
+  local MIN_GBPS="${MIN_GBPS:-1}"            # below this (GB/s) = bad cold-start state
+  local gb rps
+  ssh_client "WRK_BIN=$WRK_BIN bash $CLIENT_DIR/ae-run-wrk.sh $HOST_NIC_IP $t $c $WRK_DURATION $WRK_TIMEOUT $WRK_WARMUP" \
+      2>&1 | tee "$out"
+  gb=$(grep -oP 'TOTAL_GBPS=\K[\d.]+' "$out" | tail -1)
+  rps=$(grep -oP 'TOTAL_RPS=\K[\d.]+' "$out" | tail -1)
   sudo bash "$HERE/nginx-teardown.sh" >/dev/null 2>&1 || true
+
+  if [ -z "$gb" ] || ! awk -v g="$gb" -v m="$MIN_GBPS" 'BEGIN{exit !(g+0 >= m+0)}'; then
+    warn "config=$zc size=$size: ${gb:-NA} GB/s < ${MIN_GBPS} (bad cold start) — restart sweep from clean_slate"
+    return 2                                 # signal: caller must disconnect + restart
+  fi
+  # show GB/s to 1 decimal (round at the 2nd); leave NA untouched
+  gb=$(printf '%.1f' "$gb")
+  echo "$zc,$size,${gb},${rps:-NA}" >> "$SUMMARY"
+  sub "=> config=$zc size=$size : ${gb} GB/s"
 }
 
 # ============================== main ========================================
@@ -321,17 +313,45 @@ stage_setup
 clean_slate
 prep_client_once
 
-for zc in "${ZC_MODES[@]}"; do
-  echo
-  echo "############################################################"
-  echo "# CONFIG = $zc"
-  echo "############################################################"
-  prep_target "$zc"
-  prep_host   "$zc"
-  for size in "${SIZES[@]}"; do
-    run_one "$zc" "$size"
+# One full pass over every config/size. Returns 2 the moment a run comes back with
+# bad-cold-start throughput, so the caller can disconnect + clean_slate + restart the
+# WHOLE sweep from scratch (not an in-place wrk retry — that never fixes a cold start).
+run_sweep() {
+  echo "config,size,total_GBps,total_rps" > "$SUMMARY"   # fresh summary for this attempt
+  local zc size
+  for zc in "${ZC_MODES[@]}"; do
+    echo
+    echo "############################################################"
+    echo "# CONFIG = $zc"
+    echo "############################################################"
+    prep_target "$zc"
+    prep_host   "$zc"
+    for size in "${SIZES[@]}"; do
+      run_one "$zc" "$size"
+      if [ $? -eq 2 ]; then                        # bad cold start -> restart whole sweep
+        host_disconnect
+        return 2
+      fi
+    done
+    host_disconnect
   done
-  host_disconnect
+  return 0
+}
+
+MAX_RESTART="${MAX_RESTART:-3}"                     # full-sweep restarts before giving up
+RESTART_SETTLE="${RESTART_SETTLE:-5}"
+attempt=1
+while :; do
+  run_sweep && break                               # all configs/sizes good -> done
+  if [ "$attempt" -ge "$MAX_RESTART" ]; then
+    warn "still bad after ${MAX_RESTART} full restarts — proceeding with last results"
+    break
+  fi
+  warn "bad cold start detected — disconnect + clean_slate, restart sweep from scratch ($((attempt+1))/${MAX_RESTART})"
+  sudo nvme disconnect-all 2>/dev/null || true     # drop the stale connection
+  clean_slate                                      # full verified teardown, host + target
+  sleep "$RESTART_SETTLE"
+  attempt=$((attempt+1))
 done
 
 echo
