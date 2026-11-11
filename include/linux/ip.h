@@ -41,10 +41,8 @@ static inline unsigned int iph_totlen(const struct sk_buff *skb, const struct ip
 
 static inline unsigned int ip_transport_len(const struct sk_buff *skb)
 {
-	/*------------------------------------------------------------*/
-	// return ntohs(ip_hdr(skb)->tot_len) - skb_network_header_len(skb);
+	/* tot_len is 0 for an hw-GRO skb over 64KB (as for BIG TCP) */
 	return iph_totlen(skb, ip_hdr(skb)) - skb_network_header_len(skb);
-	/*------------------------------------------------------------*/
 }
 
 static inline unsigned int skb_ip_totlen(const struct sk_buff *skb)
