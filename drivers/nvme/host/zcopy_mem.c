@@ -39,18 +39,18 @@ static void zcopy_free_inv_range(struct zcopy_inv_range *ir, struct zcopy_ctx *c
 //      if (atomic_cmpxchg(&page->_refcount, 2 , 1 ) == 2) {
 
       spin_lock(&ctx->lock);
-      pr_info("[0]FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+      pr_debug("[0]FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
     //  if (page_ref_count(page) > 2) {
      //   put_page(page);
      // }
       if (page_ref_count(page) > 1) {
         put_page(page);
-        pr_info("[1]FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+        pr_debug("[1]FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
         if (page->pp) {
           page_pool_put_full_page(page->pp, page, false);
         }
       }
-      pr_info("[2]FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+      pr_debug("[2]FREE_INV_RANGE: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
       spin_unlock(&ctx->lock);
       b->pages[i] = NULL;
       /*
@@ -228,7 +228,7 @@ static struct page *zcopy_peek_pp_page_get(struct mm_struct *mm, unsigned long a
     page = pte_page(*pte);
     if (page && is_pp_page(page)) {
       if (get_page_unless_zero(page)) {
-        pr_info("[peek_pp_page_get] [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+        pr_debug("[peek_pp_page_get] [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
         ret_page = page;
       }
     }
@@ -295,7 +295,7 @@ static int zcopy_mn_invalidate_range_start(struct mmu_notifier *mn, const struct
     }
 
     b->pages[b->nr++] = page;
-    trace_printk("INVALIDATE_RANGE_START: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
+    pr_debug("INVALIDATE_RANGE_START: [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
 
     if (b->nr == ZC_INV_BATCH) {
 //      pr_info("ZeroCopy: add batch: %px\n", b);

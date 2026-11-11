@@ -1466,7 +1466,7 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	chunk_base = page_idx;
 //	trace_printk("**** do_zerocopy: consumed: %zu , total_bytes: %zu, page_idx: %zu, chunk_base: %zu\n", consumed, ctx->total_bytes, page_idx, chunk_base);
 	if ((consumed & (PAGE_SIZE - 1)) != 0) {
-   		trace_printk("ZC forbid: consumed not aligned: %zu\n", consumed);
+   		pr_debug("ZC forbid: consumed not aligned: %zu\n", consumed);
 	 //return -1;
 	}
 
@@ -1477,7 +1477,7 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
      * 여기서는 partial 상태면 그냥 fallback 권장.
      */
     if (ctx->remaining_bytes > 0) {
-        pr_info("remaining_bytes: %ld -> fallback\n", ctx->remaining_bytes);
+        pr_debug("remaining_bytes: %ld -> fallback\n", ctx->remaining_bytes);
         return -1;
     }
 
@@ -1504,7 +1504,7 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
         skb_frag_t *frag = &skb_shinfo(owner)->frags[frag_index];
         /* 이중 체크 */
         if (unlikely(skb_frag_size(frag) != PAGE_SIZE || skb_frag_off(frag) != 0)) {
-            pr_info("found frag not remappable? size=%u off=%u\n",
+            pr_debug("found frag not remappable? size=%u off=%u\n",
                     skb_frag_size(frag), skb_frag_off(frag));
             goto error;
         }
@@ -1512,7 +1512,7 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
         struct page *fp = skb_frag_page(frag);
 
         if (unlikely(!is_pp_page(fp))) {
-            pr_info("not pp page: %px\n", fp);
+            pr_debug("not pp page: %px\n", fp);
             goto error;
         }
 
@@ -1572,7 +1572,7 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
     return 0;
 
 error:
-    pr_info("[ctx:%px] error - consumed:%zu total:%zu iter_left:%zu\n",
+    pr_debug("[ctx:%px] error - consumed:%zu total:%zu iter_left:%zu\n",
             ctx, consumed, ctx->total_bytes, iov_iter_count(&req->iter));
 	zc_cursor_invalidate(queue);
 	zc_unwind_pages(new_pages, chunk_cnt);
@@ -1849,7 +1849,7 @@ static inline bool can_use_zerocopy(struct nvme_tcp_queue *queue, struct nvme_tc
 	}
 
 	if (ctx->head_aligned == false) {
-		pr_info("[can_use_zerocopy] ctx->head_aligned is false\n");
+		pr_debug("[can_use_zerocopy] ctx->head_aligned is false\n");
 		return false;
 	}
 
@@ -1865,18 +1865,18 @@ static inline bool can_use_zerocopy(struct nvme_tcp_queue *queue, struct nvme_tc
 	}
 
 	if (req->zc_policy != ZC_ENABLED){
-		pr_info("[can_use_zerocopy] req->zc_policy is not ZC_ENABLED\n");
+		pr_debug("[can_use_zerocopy] req->zc_policy is not ZC_ENABLED\n");
 		return false;
 	}
 
 	if (ctx->tail_aligned == false) {
-		trace_printk("[can_use_zerocopy][ctx: %px] ctx->tail_aligned is false\n", ctx);
+		pr_debug("[can_use_zerocopy][ctx: %px] ctx->tail_aligned is false\n", ctx);
 	}
 	/* we only remap when the amount of data to be remapped is at least PAGE_SIZE */
 	if (recv_len < PAGE_SIZE) {
-		trace_printk("[can_use_zerocopy] recv_len < PAGE_SIZE\n");
+		pr_debug("[can_use_zerocopy] recv_len < PAGE_SIZE\n");
 		if (ctx->total_bytes < PAGE_SIZE) {
-			trace_printk("[can_use_zerocopy] ctx->total_bytes < PAGE_SIZE: %zu\n", ctx->total_bytes);
+			pr_debug("[can_use_zerocopy] ctx->total_bytes < PAGE_SIZE: %zu\n", ctx->total_bytes);
 			//req->zc_policy = ZC_DISABLED;
 			return false;
 		}
@@ -1956,7 +1956,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 				ret = 0;
 			}
 			else if (zcopy_len == -1){
-				pr_info("[Fallback to skb_copy_datagram_iter], recv_len: %d\n", recv_len);
+				pr_debug("[Fallback to skb_copy_datagram_iter], recv_len: %d\n", recv_len);
 				ret = skb_copy_datagram_iter(skb, *offset,
 						&req->iter, recv_len);
 			}
@@ -1965,7 +1965,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			// zcopy_len > 0 is amount of data this need to be copied to req->iter
 			else if (zcopy_len > 0)
 			{
-				trace_printk("[nvme_tcp_recv_data] recv_len: %d, zcopy_len: %d\n", recv_len, zcopy_len);
+				pr_debug("[nvme_tcp_recv_data] recv_len: %d, zcopy_len: %d\n", recv_len, zcopy_len);
 				if (recv_len - zcopy_len > 0){ // already mapped to req->iter = recv_len - zcopy_len
 					iov_iter_advance(&req->iter, recv_len - zcopy_len);
 				}
