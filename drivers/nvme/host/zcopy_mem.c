@@ -11,7 +11,10 @@
  * Dropping it while the page is still mapped (e.g. mremap() moves the PTE)
  * is safe: page_pool does not recycle a page whose refcount is above one,
  * it releases it, and the page then lives on as an ordinary page owned by
- * its PTE.
+ * its PTE.  It must be dropped only once, though: if the driver still holds
+ * fragment references, the page stays a page-pool page after we let go and
+ * is seen again when its new mapping goes away.  zc_rx_test_clear_held()
+ * tells whether we still hold it.
  */
 #include <linux/zcopy_mem.h>
 #include <linux/zcopy_ctx.h>
@@ -71,8 +74,12 @@ static void zcopy_collect_pmd(struct mm_struct *mm, pmd_t *pmd,
 		    !pfn_valid(pte_pfn(pteval)))
 			continue;
 		page = pte_page(pteval);
-		if (!zc_rx_page_is_pp(page) || !get_page_unless_zero(page))
+		if (!zc_rx_page_is_pp(page) || !zc_rx_test_clear_held(page))
+			continue;	/* not ours, or already given back */
+		if (WARN_ON_ONCE(!get_page_unless_zero(page))) {
+			page_pool_put_full_page(page->pp, page, false);
 			continue;
+		}
 
 		if (!*bp) {
 			/* under the PTE lock: no sleeping allocation */
@@ -196,7 +203,7 @@ static int zcopy_release_pmd_entry(pmd_t *pmd, unsigned long addr,
 		if (!pte_present(pteval))
 			continue;
 		page = vm_normal_page(walk->vma, addr, pteval);
-		if (page && zc_rx_page_is_pp(page))
+		if (page && zc_rx_page_is_pp(page) && zc_rx_test_clear_held(page))
 			page_pool_put_full_page(page->pp, page, false);
 	}
 	pte_unmap_unlock(start_pte, ptl);

@@ -968,13 +968,18 @@ static pmd_t *zc_find_pmd(struct mm_struct *mm, unsigned long addr)
 /*
  * The user page a remap replaced.  A normal page only loses its PTE
  * reference here; the bio still pins it until completion, which follows
- * the TLB flush.  A page-pool page from an earlier zero-copy read must not
- * go back to its pool before the flush, so it is returned at bio
- * completion through ctx->old_pages.
+ * the TLB flush.  A page-pool page from an earlier zero-copy read whose pp
+ * reference we still hold must not go back to its pool before the flush,
+ * so it is returned at bio completion through ctx->old_pages.
  */
 static void zc_ctx_put_old_page(struct my_ctx *ctx, struct page *page)
 {
-	if (!zc_rx_page_is_pp(page)) {
+	/*
+	 * Not ours (any more): only the PTE reference goes.  A page-pool page
+	 * whose pp reference was already given back, e.g. by the notifier
+	 * after an mremap(), is in this case too.
+	 */
+	if (!zc_rx_page_is_pp(page) || !zc_rx_test_clear_held(page)) {
 		put_page(page);
 		return;
 	}
@@ -1071,6 +1076,7 @@ static int zc_remap_pages(struct my_ctx *ctx, size_t start_idx,
 				entry = pte_mkdirty(pte_mkwrite(entry, vma));
 			folio_add_anon_rmap_ptes(nf, new, 1, vma, a, RMAP_NONE);
 			set_pte_at(mm, a, pte, entry);
+			zc_rx_set_held(new);	/* our pp reference, see zc_rx.h */
 			ctx->zc_rss_delta[mm_counter(nf)]++;
 		}
 		pte_unmap_unlock(start_pte, ptl);
