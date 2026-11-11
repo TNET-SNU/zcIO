@@ -1330,7 +1330,14 @@ static void mlx5e_shampo_update_hdr(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
 	if (is_ipv4) {
 		int nhoff = rq->hw_gro_data->fk.control.thoff - sizeof(struct iphdr);
 		struct iphdr *ipv4 = (struct iphdr *)(skb->data + nhoff);
-		__be16 newlen = htons(skb->len - nhoff);
+		/*
+		 * hw-GRO can aggregate past 64KB; htons() would truncate the
+		 * length and the stack would trim the payload to it. Use 0
+		 * instead: iph_totlen() then takes the length from skb->len
+		 * (as for IPv4 BIG TCP).
+		 */
+		// __be16 newlen = htons(skb->len - nhoff);
+		__be16 newlen = ((skb->len - nhoff) > 0xFFFF) ? 0 : htons(skb->len - nhoff);
 
 		csum_replace2(&ipv4->check, ipv4->tot_len, newlen);
 		ipv4->tot_len = newlen;
