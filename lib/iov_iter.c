@@ -12,6 +12,8 @@
 #include <linux/scatterlist.h>
 #include <linux/instrumented.h>
 #include <linux/iov_iter.h>
+#include <linux/zcopy_ctx.h>
+#include <net/zc_rx.h>
 
 static __always_inline
 size_t copy_to_user_iter(void __user *iter_to, size_t progress,
@@ -1543,43 +1545,27 @@ static ssize_t iov_iter_extract_kvec_pages(struct iov_iter *i,
 	return size;
 }
 
-/* rx-zcopy*/
-/* zcIO: host(initiator) RX zero-copy toggle, defined in drivers/nvme/host/tcp.c. */
-extern int nvme_host_rx_zc;
-static bool set_user_address_page(struct page **page, unsigned long first_addr, unsigned long addr, int page_count)
+/*
+ * zcIO host RX zero-copy: record the user address of each pinned page so
+ * the bio can hand it to nvme-tcp (see __bio_iov_iter_get_pages()).  A
+ * page-pool page from an earlier zero-copy read keeps it in the padding
+ * word of its page_pool fields, any other page in page->private.
+ */
+static void zc_stamp_user_addr(struct page **pages, unsigned long first_addr,
+			       unsigned long addr, int nr)
 {
+	int i;
 
-	// store user address to page
-	// 1. page is pp_page : page->_pp_mapping_pad
-	// 2. page is not pp_page : page->private
-	//pr_info("[ set_user_address_page: page_count = %d ]\n", page_count);
-	
-	// save user address to each page 
-	// cosider offset of start address and total size
-	if (page[0]) {
-		if ((page[0]->pp_magic & ~0x3UL) == PP_SIGNATURE)
-		{
-			page[0]->_pp_mapping_pad = first_addr;
-		}
-		else {
-			set_page_private(page[0], first_addr);
-		}
+	for (i = 0; i < nr; i++) {
+		unsigned long uaddr = i ? addr + i * PAGE_SIZE : first_addr;
 
-		//pr_info("---- [ 0 ] : user_addr = %lx ]\n", first_addr);
+		if (!pages[i])
+			continue;
+		if (zc_rx_page_is_pp(pages[i]))
+			pages[i]->_pp_mapping_pad = uaddr;
+		else
+			set_page_private(pages[i], uaddr);
 	}
-	for (int i = 1; i < page_count; i++) {
-		if (!page[i]) continue;
-		unsigned long user_addr = (unsigned long)addr + i * PAGE_SIZE;
-		//pr_info("---- [ %d ] : user_addr = %lx ]\n", i, user_addr);
-		if ( (page[i]->pp_magic & ~0x3UL) == PP_SIGNATURE)
-		{
-			page[i]->_pp_mapping_pad = user_addr;
-		}
-		else {
-			set_page_private(page[i], user_addr);
-		}
-	}
-	return true;
 }
 
 /*
@@ -1616,7 +1602,6 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
 	addr = first_iovec_segment(i, &maxsize);
 	first_addr = addr;
 	*offset0 = offset = addr % PAGE_SIZE;
-//	pr_info("[iov_iter_extract_user_pages] original_start_addr = %lx - offset = %zu\n", addr, offset);
 	addr &= PAGE_MASK;
 	maxpages = want_pages_array(pages, maxsize, offset, maxpages);
 	if (!maxpages)
@@ -1625,13 +1610,8 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
 	if (unlikely(res <= 0))
 		return res;
 	maxsize = min_t(size_t, maxsize, res * PAGE_SIZE - offset);
-	/* zcIO: only stamp the user address into page->private/_pp_mapping_pad
-	 * when host RX zero-copy is enabled. When off, leave every extracted
-	 * page untouched -> exact vanilla direct-I/O behaviour.
-	 */
 	if (READ_ONCE(nvme_host_rx_zc))
-		set_user_address_page(*pages, first_addr, addr, res);
-
+		zc_stamp_user_addr(*pages, first_addr, addr, res);
 	iov_iter_advance(i, maxsize);
 	return maxsize;
 }

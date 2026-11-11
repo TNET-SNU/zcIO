@@ -1,66 +1,66 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * zcIO host RX zero-copy: per-bio state shared by the block layer (which
+ * records the reader's user addresses) and nvme-tcp (which remaps received
+ * page-pool pages there).
+ */
 #ifndef __LINUX_ZCOPY_CTX_H
 #define __LINUX_ZCOPY_CTX_H
 
 #include <linux/types.h>
 #include <linux/mm_types.h>
-#include <linux/pagevec.h>
-#include <linux/workqueue.h>
-#include <linux/jiffies.h>
 #include <linux/blk_types.h>
-
-
-// small i/o does not need to alloc pages (4pages = 16KB)
-#define MYCTX_INLINE_PAGES 4
-
 
 #define MY_CTX_MAGIC 0x12345678
 struct my_ctx {
-  u32 magic;
-  bool inline_ctx;
+	u32 magic;
 
-  int nr_pages;
-  int old_nr_pages;
-  unsigned long *user_addr;
-  struct page **old_pages;
-  unsigned long inline_user_addr[MYCTX_INLINE_PAGES];
-  struct page *inline_old_pages[MYCTX_INLINE_PAGES];
-  
-  struct mm_struct *mm;
+	int nr_pages;			/* capacity of user_addr[] and old_pages[] */
+	int index;			/* pages recorded so far */
+	int old_nr_pages;
+	unsigned long *user_addr;	/* user address of each page of the bio */
+	struct page **old_pages;	/* replaced page-pool pages, returned at completion */
 
-  bool tail_aligned;
-  bool head_aligned;
-  size_t total_bytes;
-  int index;
-  bool can_use_zerocopy;
-  size_t remaining_bytes;
+	struct mm_struct *mm;		/* reader's mm, mmgrab()ed */
 
-  /* remap result */
-  bool zc_staged;
-  unsigned long zc_flush_min;
-  unsigned long zc_flush_max;
-  long zc_rss_delta[NR_MM_COUNTERS];
+	bool head_aligned;
+	bool tail_aligned;
+	size_t total_bytes;
 
-  int error; 
+	/* remaps not yet made visible: TLB range and RSS change */
+	bool zc_staged;
+	unsigned long zc_flush_min;
+	unsigned long zc_flush_max;
+	long zc_rss_delta[NR_MM_COUNTERS];
+
+	int error;			/* non-zero: do not use for zero-copy */
 };
 
+/* Replaces bi_private / bi_end_io of a read bio prepared for zero-copy. */
 #define MY_BIO_PRIVATE_MAGIC 0x5a5a5a5a
-struct my_bio_private{
-    int magic;
-	  struct my_ctx *ctx;
-    struct my_ctx inline_ctx;
-    void *orig_private;
-    bio_end_io_t *orig_end_io;
+struct my_bio_private {
+	int magic;
+	struct my_ctx *ctx;
+	void *orig_private;
+	bio_end_io_t *orig_end_io;
 };
 
-
-/* zcIO: host(initiator) RX zero-copy master toggle.
- * Defined in drivers/nvme/host/tcp.c (nvme-tcp, built-in when CONFIG_NVME_TCP=y).
- * Declared here so every host-side TU (block/fops, iomap, iov_iter, zcopy_*)
- * shares one consistently-typed (int) view and gates on it identically.
- */
+/* Host RX zero-copy switch, a module param of nvme-tcp (built-in). */
 extern int nvme_host_rx_zc;
 
-struct my_ctx *init_my_ctx(struct my_bio_private *priv, int nr_pages, struct mm_struct *mm);
-struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm);
-void free_my_ctx(struct my_ctx *ctx);
+static inline struct my_ctx *zc_bio_ctx(struct bio *bio)
+{
+	struct my_bio_private *priv = bio->bi_private;
+
+	if (!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)
+		return NULL;
+	if (!priv->ctx || priv->ctx->magic != MY_CTX_MAGIC)
+		return NULL;
+	return priv->ctx;
+}
+
+void zc_bio_prepare(struct bio *bio, int nr_pages);
+void zc_bio_abort(struct bio *bio);
+void zc_bio_pages_added(struct bio *bio);
+
 #endif /* __LINUX_ZCOPY_CTX_H */

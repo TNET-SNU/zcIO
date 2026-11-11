@@ -3,8 +3,7 @@
  * NVMe over Fabrics TCP host.
  * Copyright (c) 2018 Lightbits Labs. All rights reserved.
  */
-#include <linux/limits.h>
-#include <linux/sysctl.h>
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
@@ -25,15 +24,12 @@
 #include "nvme.h"
 #include "fabrics.h"
 
-/* rx-zcopy */
+#include <linux/mmu_notifier.h>
 #include <linux/rmap.h>
+#include <linux/sched/mm.h>
+#include <linux/zcopy_ctx.h>
 #include <net/page_pool/helpers.h>
 #include <net/zc_rx.h>
-#include <linux/hugetlb.h>
-#include <linux/zcopy_ctx.h>
-#include <linux/mm.h>
-#include <linux/mm_types.h> 
-
 
 struct nvme_tcp_queue;
 
@@ -66,34 +62,31 @@ MODULE_PARM_DESC(tls_handshake_timeout,
 #endif
 
 /*
- * rx-zcopy: zerocopy 성능 최적화 설정
+ * zcIO host RX zero-copy: remap received page-pool pages into the reader's
+ * buffer instead of copying them (see the comment above zc_account_ctx()).
+ * Also needs the mlx5 rx_zc_stride priv-flag and a sender that marks
+ * PDU-header segments (net.ipv4.nvme_pdu_align=2).
  */
-#define ZC_MAX_STAGE_PAGES 64
-
-
-int nvme_host_rx_zc = 0;
+int nvme_host_rx_zc;
 module_param(nvme_host_rx_zc, int, 0644);
-MODULE_PARM_DESC(nvme_host_rx_zc, "Enable RX zerocopy");
-EXPORT_SYMBOL_GPL(nvme_host_rx_zc); /* 여러 오브젝트에서 쓰면 export 필요 */
+MODULE_PARM_DESC(nvme_host_rx_zc, "zcIO: remap received data into the reader's buffer: Default 0");
+EXPORT_SYMBOL_GPL(nvme_host_rx_zc);
 
-
-static bool nvme_tcp_rx_zc_batch_flush = false;
+static bool nvme_tcp_rx_zc_batch_flush;
 module_param_named(rx_zc_batch_flush, nvme_tcp_rx_zc_batch_flush, bool, 0644);
+MODULE_PARM_DESC(rx_zc_batch_flush,
+		 "zcIO: flush the TLB for a batch of requests from a worker (needs reconnect): Default N");
 
 static int nvme_tcp_rx_zc_batch_pages = 64;
 module_param_named(rx_zc_batch_pages, nvme_tcp_rx_zc_batch_pages, int, 0644);
+MODULE_PARM_DESC(rx_zc_batch_pages, "zcIO: staged pages that start a batch flush: Default 64");
 
 static int nvme_tcp_rx_zc_idle_us = 50;
 module_param_named(rx_zc_idle_us, nvme_tcp_rx_zc_idle_us, int, 0644);
+MODULE_PARM_DESC(rx_zc_idle_us, "zcIO: flush a partial batch after this idle time: Default 50");
 
-static bool nvme_tcp_rx_zc_debug;
-module_param_named(rx_zc_debug, nvme_tcp_rx_zc_debug, bool, 0644);
-
-#define ZC_LOG(fmt, ...) \
-	do { if (unlikely(nvme_tcp_rx_zc_debug)) pr_info("[rxzc] " fmt, ##__VA_ARGS__); } while (0)
-
-#define ZC_LOG_RL(fmt, ...) \
-	do { if (unlikely(nvme_tcp_rx_zc_debug)) pr_info_ratelimited("[rxzc] " fmt, ##__VA_ARGS__); } while (0)
+/* pages remapped per mmap_lock / page table pass */
+#define ZC_MAX_STAGE_PAGES 64
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 /* lockdep can detect a circular dependency of the form
@@ -141,9 +134,9 @@ enum nvme_tcp_send_state {
 };
 
 enum nvme_tcp_zc_policy {
-    ZC_UNDECIDED = 0,
-    ZC_DISABLED,
-    ZC_ENABLED,
+	ZC_UNDECIDED = 0,
+	ZC_DISABLED,
+	ZC_ENABLED,
 };
 
 struct nvme_tcp_request {
@@ -169,9 +162,9 @@ struct nvme_tcp_request {
 	size_t			data_sent;
 	enum nvme_tcp_send_state state;
 
-	/* rx-zcopy */
-	enum nvme_tcp_zc_policy zc_policy;
-	u32 zc_staged_pages;
+	/* zcIO host RX zero-copy */
+	enum nvme_tcp_zc_policy	zc_policy;
+	u32			zc_staged_pages; /* remapped, TLB not flushed yet */
 };
 
 enum nvme_tcp_queue_flags {
@@ -184,12 +177,6 @@ enum nvme_tcp_recv_state {
 	NVME_TCP_RECV_PDU = 0,
 	NVME_TCP_RECV_DATA,
 	NVME_TCP_RECV_DDGST,
-};
-
-
-struct nvme_tcp_zc_pend_ent {
-	struct request *rq;
-	u32 pages;  /* staged pages 힌트 */
 };
 
 struct nvme_tcp_ctrl;
@@ -230,22 +217,21 @@ struct nvme_tcp_queue {
 	int                     tls_err;
 	struct page_frag_cache	pf_cache;
 
-	/* rx-zcopy */
-	spinlock_t zc_lock;
-	struct workqueue_struct *zc_wq;
-	bool zc_prepared;
-    u32 zc_head, zc_tail, zc_cnt;
-    u32 zc_pending_pages;
-	u16 *zc_pend_cids;
-	u32 zc_queue_depth;
-    struct work_struct zc_flush_work;
-	/* idle tail flush (µs) */
-    struct hrtimer zc_idle_timer;
-    u64 zc_last_defer_ns;   /* last enqueue timestamp */
-	bool zc_shutting_down;
-	atomic_t zc_idle_armed;
-	struct zc_rx_cursor zc_cur;
-
+	/* zcIO host RX zero-copy */
+	struct zc_rx_cursor	zc_cur;		/* valid within one recv_skb call */
+	/* rx_zc_batch_flush: ring of cids waiting for a batched TLB flush */
+	spinlock_t		zc_lock;
+	u16			*zc_pend_cids;
+	u32			zc_queue_depth;
+	u32			zc_head, zc_tail, zc_cnt;
+	u32			zc_pending_pages;
+	struct workqueue_struct	*zc_wq;
+	struct work_struct	zc_flush_work;
+	struct hrtimer		zc_idle_timer;	/* flushes a partial batch */
+	atomic_t		zc_idle_armed;
+	u64			zc_last_defer_ns;
+	bool			zc_prepared;
+	bool			zc_shutting_down;
 
 	void (*state_change)(struct sock *);
 	void (*data_ready)(struct sock *);
@@ -409,7 +395,6 @@ static void nvme_tcp_init_iter(struct nvme_tcp_request *req,
 
 	iov_iter_bvec(&req->iter, dir, vec, nr_bvec, size);
 	req->iter.iov_offset = offset;
-
 }
 
 static inline void nvme_tcp_advance_req(struct nvme_tcp_request *req,
@@ -830,7 +815,7 @@ static int nvme_tcp_recv_pdu(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	char *pdu = queue->pdu;
 	size_t rcv_len = min_t(size_t, *len, queue->pdu_remaining);
 	int ret;
-	
+
 	ret = skb_copy_bits(skb, *offset,
 		&pdu[queue->pdu_offset], rcv_len);
 	if (unlikely(ret))
@@ -890,17 +875,6 @@ static inline void nvme_tcp_end_request(struct request *rq, u16 status)
  * with rx_zc_batch_flush.  Either way it happens before the request
  * completes (nvme_tcp_zc_flush_rq()).
  */
-
-static struct my_ctx *zc_bio_ctx(struct bio *bio)
-{
-	struct my_bio_private *priv = bio->bi_private;
-
-	if (!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)
-		return NULL;
-	if (!priv->ctx || priv->ctx->magic != MY_CTX_MAGIC)
-		return NULL;
-	return priv->ctx;
-}
 
 /* Apply the RSS change of the staged remaps of @ctx, after its TLB flush. */
 static void zc_account_ctx(struct my_ctx *ctx)
@@ -1096,17 +1070,16 @@ static int zc_remap_pages(struct my_ctx *ctx, size_t start_idx,
 	return done;
 }
 
-static inline void zc_unwind_pages(struct page **pages, int nr)
+/* Drop the references nvme_tcp_do_zerocopy() took on pages it did not map. */
+static void zc_unwind_pages(struct page **pages, int nr)
 {
-    for (int i = 0; i < nr; i++) {
-        struct page *p = pages[i];
-        if (!p) continue;
-        put_page(p);
-        page_pool_unref_page(p, 1);
-        pages[i] = NULL;
-    }
-}
+	int i;
 
+	for (i = 0; i < nr; i++) {
+		put_page(pages[i]);
+		page_pool_unref_page(pages[i], 1);	/* the skb still holds one */
+	}
+}
 
 /* Remap one staged chunk; on a partial remap drop the refs of the rest. */
 static int zc_map_chunk(struct nvme_tcp_request *req, struct my_ctx *ctx,
@@ -1126,114 +1099,70 @@ static int zc_map_chunk(struct nvme_tcp_request *req, struct my_ctx *ctx,
 	return 0;
 }
 
-static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb, struct nvme_tcp_request *req,
-                              int recv_len, unsigned int offset)
+/*
+ * Remap @len (a multiple of PAGE_SIZE) bytes at @offset of @skb, the next
+ * data of @req, into the reader's buffer.  Returns 0, or -1 if the caller
+ * must copy them instead: pages remapped before a failure already hold
+ * their data, the copy then lands in the replaced, still pinned pages.
+ */
+static int nvme_tcp_do_zerocopy(struct nvme_tcp_queue *queue,
+				struct sk_buff *skb,
+				struct nvme_tcp_request *req,
+				size_t len, unsigned int offset)
 {
-    struct my_ctx *ctx;
-    struct my_bio_private *priv;
-    size_t need = recv_len;
+	struct my_ctx *ctx = zc_bio_ctx(req->curr_bio);
+	size_t done = ctx->total_bytes - iov_iter_count(&req->iter);
+	struct page *pages[ZC_MAX_STAGE_PAGES];
+	size_t idx, base;
+	int nr = 0;
 
-	/* main change: new_pages is passed as an argument*/
-	struct page *new_pages[ZC_MAX_STAGE_PAGES];
-	int chunk_cnt = 0;
-    size_t chunk_base = 0;
-
-    if (unlikely(!req->curr_bio)) {
-        pr_debug("req->curr_bio is null\n");
-        return -1;
-    }
-
-    priv = req->curr_bio->bi_private;
-    if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)) {
-        pr_debug("priv is null or priv->magic is not MY_BIO_PRIVATE_MAGIC\n");
-        return -1;
-    }
-
-    ctx = priv->ctx;
-    if (unlikely(!ctx)) {
-        pr_debug("ctx is null\n");
-        return -1;
-    }
-
-    /* 4K 미만은 여기서 zc 못함: caller가 copy 하도록 */
-    if (recv_len < PAGE_SIZE)
-        return recv_len;
-
-    /* iov_iter_count is the amount of data bytes left to copy */
-    size_t consumed      = ctx->total_bytes - iov_iter_count(&req->iter);
-    size_t page_idx = consumed >> PAGE_SHIFT;
-	unsigned int cur_off = offset;
-
-	chunk_base = page_idx;
-//	trace_printk("**** do_zerocopy: consumed: %zu , total_bytes: %zu, page_idx: %zu, chunk_base: %zu\n", consumed, ctx->total_bytes, page_idx, chunk_base);
-	if ((consumed & (PAGE_SIZE - 1)) != 0) {
-   		pr_debug("ZC forbid: consumed not aligned: %zu\n", consumed);
-	 //return -1;
-	}
-
-
-    /*
-     * 기존 로직은 remaining_bytes/start_frag_page_index로 이어붙였는데,
-     * frag_list까지 고려하면 “frag_index 재개”가 의미가 없어짐.
-     * 여기서는 partial 상태면 그냥 fallback 권장.
-     */
-    if (ctx->remaining_bytes > 0) {
-        pr_debug("remaining_bytes: %ld -> fallback\n", ctx->remaining_bytes);
-        return -1;
-    }
-
-    while (need >= PAGE_SIZE) {
-        unsigned long uaddr = ctx->user_addr[page_idx];
-
-        if (unlikely(!uaddr || !access_ok((void __user*)uaddr, PAGE_SIZE))) {
-            pr_debug(" [user address] %px is not valid\n", (void __user*)uaddr);
-            goto error;
-        }
-		if (unlikely(uaddr & (PAGE_SIZE-1))) {
-			pr_debug("ZC BAD: uaddr not aligned: uaddr=%lx\n", uaddr);
-		}
-
-        /* only a whole page-pool page frag starting exactly at cur_off */
-        struct page *fp = zc_rx_skb_page_at(&queue->zc_cur, skb, cur_off);
-
-        if (!fp)
-            goto error;
-
-        if (!get_page_unless_zero(fp)) {
-            pr_debug("failed to get_page: %px\n", fp);
-            goto error;
-        }
-
-        page_pool_ref_page(fp);
-		/* main change: new_pages is passed as an argument*/
-        //ctx->pages[base_page_idx + count] = fp;
-		new_pages[chunk_cnt++] = fp;
-
-        need -= PAGE_SIZE;
-        page_idx++;
-		cur_off += PAGE_SIZE;
-
-		if (chunk_cnt == ZC_MAX_STAGE_PAGES) {
-			if (zc_map_chunk(req, ctx, chunk_base, new_pages, chunk_cnt))
-				return -1;
-			chunk_cnt = 0;
-			chunk_base = page_idx;
-		}
-    }
-
-
-	if (chunk_cnt > 0 && zc_map_chunk(req, ctx, chunk_base, new_pages, chunk_cnt))
+	/* received pages line up with the reader's pages only at page boundaries */
+	if (!IS_ALIGNED(done, PAGE_SIZE))
 		return -1;
 
-    /* 여기 오면 아직 flush 타이밍이 아니라는 뜻: 성공적으로 stage 됐다고 보고 0 */
-    return 0;
+	base = idx = done >> PAGE_SHIFT;
+	for (; len; len -= PAGE_SIZE, offset += PAGE_SIZE, idx++) {
+		unsigned long uaddr = ctx->user_addr[idx];
+		struct page *page;
 
-error:
-    pr_debug("[ctx:%px] error - consumed:%zu total:%zu iter_left:%zu\n",
-            ctx, consumed, ctx->total_bytes, iov_iter_count(&req->iter));
-	zc_unwind_pages(new_pages, chunk_cnt);
+		if (!uaddr || !access_ok((void __user *)uaddr, PAGE_SIZE))
+			goto unwind;
+		page = zc_rx_skb_page_at(&queue->zc_cur, skb, offset);
+		if (!page || !get_page_unless_zero(page))	/* PTE reference */
+			goto unwind;
+		page_pool_ref_page(page);	/* held while mapped, see zc_rx.h */
+		pages[nr++] = page;
 
-    return -1;
+		if (nr == ZC_MAX_STAGE_PAGES) {
+			if (zc_map_chunk(req, ctx, base, pages, nr))
+				return -1;
+			nr = 0;
+			base = idx + 1;
+		}
+	}
+	if (nr && zc_map_chunk(req, ctx, base, pages, nr))
+		return -1;
+	return 0;
+
+unwind:
+	zc_unwind_pages(pages, nr);
+	return -1;
+}
+
+/* Can the data of @req go to the reader's buffer by remapping? */
+static bool nvme_tcp_zc_usable(struct nvme_tcp_request *req)
+{
+	struct my_ctx *ctx;
+
+	if (!READ_ONCE(nvme_host_rx_zc) || !req->curr_bio)
+		return false;
+	ctx = zc_bio_ctx(req->curr_bio);
+	if (!ctx || ctx->error || !ctx->head_aligned)
+		return false;
+	/* the payload starts on a page: so must the buffer, at its first data */
+	if (req->zc_policy == ZC_UNDECIDED)
+		req->zc_policy = req->iter.iov_offset ? ZC_DISABLED : ZC_ENABLED;
+	return req->zc_policy == ZC_ENABLED;
 }
 
 #define ZC_FLUSH_CHUNK	64	/* requests completed per worker pass */
@@ -1344,175 +1273,77 @@ static void nvme_tcp_zc_flush_workfn(struct work_struct *work)
 
 static enum hrtimer_restart nvme_tcp_zc_idle_timer_fn(struct hrtimer *t)
 {
-    struct nvme_tcp_queue *q = container_of(t, struct nvme_tcp_queue, zc_idle_timer);
-    u64 now = ktime_get_ns();
-    u64 last = READ_ONCE(q->zc_last_defer_ns);
-    u64 idle_ns = (u64)nvme_tcp_rx_zc_idle_us * 1000ULL;
-    u64 delta = now - last;
+	struct nvme_tcp_queue *q = container_of(t, struct nvme_tcp_queue, zc_idle_timer);
+	u64 idle_ns = (u64)nvme_tcp_rx_zc_idle_us * NSEC_PER_USEC;
+	u64 delta = ktime_get_ns() - READ_ONCE(q->zc_last_defer_ns);
 
-	if (atomic_read(&q->zc_idle_armed) == 0)
-  	  return HRTIMER_NORESTART;
-
-	if (READ_ONCE(q->zc_shutting_down)){
+	if (!atomic_read(&q->zc_idle_armed))
+		return HRTIMER_NORESTART;
+	if (READ_ONCE(q->zc_shutting_down)) {
 		atomic_set(&q->zc_idle_armed, 0);
 		return HRTIMER_NORESTART;
 	}
-
-    /* 아직 defer가 들어오고 있으면(=idle 아님) 타이머를 뒤로 미룸 */
-    if (delta < idle_ns) {
-        u64 remain = idle_ns - delta;
-        hrtimer_forward_now(t, ns_to_ktime(remain));
-        return HRTIMER_RESTART;
-    }
-
-	//pr_info("[nvme_tcp_zc_idle_timer_fn] flush (QID:%d) - q->zc_cnt: %d\n", nvme_tcp_queue_id(q), q->zc_cnt);
-    /* idle 상태에서만 flush: 링에 뭐라도 남아있을 때만 */
-    if (READ_ONCE(q->zc_cnt) && likely(q->zc_wq)){
-		//queue_work_on(q->io_cpu, q->zc_wq, &q->zc_flush_work);
-		queue_work(q->zc_wq, &q->zc_flush_work);
+	/* requests are still being deferred: not idle yet */
+	if (delta < idle_ns) {
+		hrtimer_forward_now(t, ns_to_ktime(idle_ns - delta));
+		return HRTIMER_RESTART;
 	}
-
+	if (READ_ONCE(q->zc_cnt))
+		queue_work(q->zc_wq, &q->zc_flush_work);
 	atomic_set(&q->zc_idle_armed, 0);
-    return HRTIMER_NORESTART;
+	return HRTIMER_NORESTART;
 }
 
-
+/*
+ * rx_zc_batch_flush: complete @rq from nvme_tcp_zc_flush_workfn(), which
+ * flushes the TLB once for a batch of requests, instead of right away.
+ * Falls back to completing it now, with its own flush.
+ */
 static void nvme_tcp_defer_complete(struct nvme_tcp_queue *q, u16 cid,
-                                    struct request *rq) {
-	unsigned long flags;
-	u32 depth = q->zc_queue_depth;
+				    struct request *rq)
+{
 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
 	u32 pages = READ_ONCE(req->zc_staged_pages);
-	bool arm_idle = false;
-							
-	if (unlikely(READ_ONCE(q->zc_shutting_down)))
-	    goto fallback_complete;
+	u32 depth = q->zc_queue_depth;
+	unsigned long flags;
+	bool arm_idle, trigger;
 
-	if (unlikely(!depth || !q->zc_pend_cids)){
-		goto fallback_complete;	
-	}
-
-	/* zc가 실제로 staged된 게 없으면 굳이 defer할 이유가 없음 */
-	if (!pages)
-		goto fallback_complete;
+	if (!pages || !depth || !q->zc_pend_cids || !q->zc_wq ||
+	    READ_ONCE(q->zc_shutting_down))
+		goto complete_now;
 
 	spin_lock_irqsave(&q->zc_lock, flags);
-
-	if (unlikely(q->zc_cnt == depth)) {
-		/* FULL: drop 금지. flush 스케줄 후, 여기서는 즉시 complete로 fallback */
+	if (q->zc_cnt == depth) {
 		spin_unlock_irqrestore(&q->zc_lock, flags);
-	    atomic_set(&q->zc_idle_armed, 0);
-
-		if (likely(q->zc_wq))
-			//queue_work_on(q->io_cpu, q->zc_wq, &q->zc_flush_work);
-			queue_work(q->zc_wq, &q->zc_flush_work);
-		goto fallback_complete;
+		atomic_set(&q->zc_idle_armed, 0);
+		queue_work(q->zc_wq, &q->zc_flush_work);
+		goto complete_now;
 	}
-
-	if (q->zc_cnt == 0)
-		arm_idle = true;
-
+	arm_idle = !q->zc_cnt;
 	q->zc_pend_cids[q->zc_tail] = cid;
-
 	q->zc_tail = (q->zc_tail + 1) % depth;
 	q->zc_cnt++;
-
 	q->zc_pending_pages += pages;
-	bool trigger = (q->zc_pending_pages >= (u32)nvme_tcp_rx_zc_batch_pages);
-
+	trigger = q->zc_pending_pages >= (u32)nvme_tcp_rx_zc_batch_pages;
 	spin_unlock_irqrestore(&q->zc_lock, flags);
 
 	if (trigger) {
-        if (likely(q->zc_wq))
-            //queue_work_on(q->io_cpu, q->zc_wq, &q->zc_flush_work);
-			queue_work(q->zc_wq, &q->zc_flush_work);
-
-		 atomic_set(&q->zc_idle_armed, 0);
-//        if (atomic_xchg(&q->zc_idle_armed, 0) == 1)
- //          hrtimer_try_to_cancel(&q->zc_idle_timer);
-
-        return;
-    }
-	if (!trigger)
-    	WRITE_ONCE(q->zc_last_defer_ns, ktime_get_ns());
-
-	if (arm_idle) {
-        if (atomic_cmpxchg(&q->zc_idle_armed, 0, 1) == 0) {
-            hrtimer_start(&q->zc_idle_timer,
-                          ns_to_ktime((u64)nvme_tcp_rx_zc_idle_us * 1000ULL),
-                          HRTIMER_MODE_REL_PINNED);
-        }
-    }
+		queue_work(q->zc_wq, &q->zc_flush_work);
+		atomic_set(&q->zc_idle_armed, 0);
+		return;
+	}
+	WRITE_ONCE(q->zc_last_defer_ns, ktime_get_ns());
+	if (arm_idle && atomic_cmpxchg(&q->zc_idle_armed, 0, 1) == 0)
+		hrtimer_start(&q->zc_idle_timer,
+			      ns_to_ktime((u64)nvme_tcp_rx_zc_idle_us * NSEC_PER_USEC),
+			      HRTIMER_MODE_REL_PINNED);
 	return;
 
-fallback_complete:
-	/* defer 실패하면 반드시 즉시 complete로 빠져야 “안 끝나는 I/O”가 안 생김 */
+complete_now:
 	nvme_tcp_end_request(rq, le16_to_cpu(req->status));
 	q->nr_cqe++;
 }
 
-static inline bool can_use_zerocopy(struct nvme_tcp_queue *queue, struct nvme_tcp_request *req, int recv_len){
-	if (nvme_host_rx_zc != 1)
-		return false;
-	struct my_bio_private *priv = req->curr_bio->bi_private;
-	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)){
-		pr_debug("[zerocopy] can_use_zerocopy FAIL: priv=NULL or priv->magic != MY_BIO_PRIVATE_MAGIC\n");
-		return false;
-	}
-	struct my_ctx *ctx = priv->ctx;
-	if (unlikely(!ctx || ctx->magic != MY_CTX_MAGIC || ctx->error != 0)) {
-		pr_debug("[can_use_zerocopy] ctx is null\n");
-		return false;
-	}
-
-	if (unlikely( nvme_tcp_rx_zc_batch_flush && queue->zc_pend_cids == NULL))
-	{
-		pr_debug("[can_use_zerocopy] queue->zc_pend_cids is null\n");
-		return false;
-	}
-
-	if (queue->data_digest) {
-		req->zc_policy = ZC_DISABLED;
-		return false;
-	}
-
-	if (ctx->head_aligned == false) {
-		pr_debug("[can_use_zerocopy] ctx->head_aligned is false\n");
-		return false;
-	}
-
-	if (req->zc_policy == ZC_UNDECIDED) {
-		/*
-		 * Design assumption for rx-zcopy:
-		 * - NVMe/TCP data payload starts 4K-aligned (offset 0)
-		 * - Remap is only possible when the destination user buffer
-		 *   is also 4K-aligned at the start of this req.
-		 */
-		req->zc_policy = (req->iter.iov_offset == 0) ? ZC_ENABLED : ZC_DISABLED;
-		//pr_info("[can_use_zerocopy] req->zc_policy : %d, req->iter.iov_offset : %d\n", req->zc_policy, req->iter.iov_offset);
-	}
-
-	if (req->zc_policy != ZC_ENABLED){
-		pr_debug("[can_use_zerocopy] req->zc_policy is not ZC_ENABLED\n");
-		return false;
-	}
-
-	if (ctx->tail_aligned == false) {
-		pr_debug("[can_use_zerocopy][ctx: %px] ctx->tail_aligned is false\n", ctx);
-	}
-	/* we only remap when the amount of data to be remapped is at least PAGE_SIZE */
-	if (recv_len < PAGE_SIZE) {
-		pr_debug("[can_use_zerocopy] recv_len < PAGE_SIZE\n");
-		if (ctx->total_bytes < PAGE_SIZE) {
-			pr_debug("[can_use_zerocopy] ctx->total_bytes < PAGE_SIZE: %zu\n", ctx->total_bytes);
-			//req->zc_policy = ZC_DISABLED;
-			return false;
-		}
-		//return false;
-	}
-
-	return true;
-}
 
 static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			      unsigned int *offset, size_t *len)
@@ -1521,11 +1352,10 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 	struct request *rq =
 		nvme_cid_to_rq(nvme_tcp_tagset(queue), pdu->command_id);
 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
-	int zcopy_len = 0;
-	//trace_printk("---------[0]nvme_tcp_recv_data: start - len: %zu\n", *len);
+
 	while (true) {
-		int recv_len, ret, zc_recv_len;
-		// 이번 pdu에서 필요한 만큼 
+		int recv_len, zc_len, ret;
+
 		recv_len = min_t(size_t, *len, queue->data_remaining);
 		if (!recv_len)
 			break;
@@ -1546,60 +1376,25 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			}
 			nvme_tcp_init_iter(req, ITER_DEST);
 		}
+
 		/* we can read only from what is left in this bio */
 		recv_len = min_t(size_t, recv_len,
 				iov_iter_count(&req->iter));
-		//trace_printk("[1] nvme_tcp_recv_data: recv_len: %d, iov_iter_count: %zu, queue->data_remaining: %zu\n", recv_len, iov_iter_count(&req->iter), queue->data_remaining);
-		// set recv_len to PAGE_SIZE aligned
-		zc_recv_len = recv_len & ~(PAGE_SIZE - 1);
-		//trace_printk("[2]nvme_tcp_recv_data: zc_recv_len: %d\n", zc_recv_len);
-	
-		if (queue->data_digest){
+
+		/* zcIO: remap the whole pages, the rest is copied next round */
+		zc_len = recv_len & PAGE_MASK;
+
+		if (queue->data_digest) {
 			ret = skb_copy_and_hash_datagram_iter(skb, *offset,
 				&req->iter, recv_len, queue->rcv_hash);
-		}
-		else if (!can_use_zerocopy(queue, req, recv_len)){
-			//trace_printk("[3] [nvme_tcp_recv_data] can_use_zerocopy, recv_len: %d\n", recv_len);
+		} else if (zc_len && nvme_tcp_zc_usable(req) &&
+			   !nvme_tcp_do_zerocopy(queue, skb, req, zc_len, *offset)) {
+			recv_len = zc_len;
+			iov_iter_advance(&req->iter, recv_len);
+			ret = 0;
+		} else {
 			ret = skb_copy_datagram_iter(skb, *offset,
 					&req->iter, recv_len);
-		}
-		else if (zc_recv_len == 0)
-		{
-			//trace_printk("[4] [nvme_tcp_recv_data] zc_recv_len == 0, recv_len: %d\n", recv_len);
-			// zc_recv_len == 0 means that the data is not aligned to PAGE_SIZE
-			// so we need to copy the data to req->iter
-			ret = skb_copy_datagram_iter(skb, *offset,
-					&req->iter, recv_len);
-		}
-		else {
-			// set recv_len to PAGE_SIZE aligned
-			recv_len = zc_recv_len;
-			zcopy_len = do_zerocopy(queue, skb, req, recv_len, *offset);
-			//trace_printk("==> [nvme_tcp_recv_data] zc done - recv_len: %d, zcopy_len: %d\n", recv_len, zcopy_len);
-			// remap/queueing done; completion is deferred (do not copy)
-			if (zcopy_len ==0) 
-			{
-				//trace_printk("[4] [nvme_tcp_recv_data] zcopy_len == 0\n");
-				iov_iter_advance(&req->iter, recv_len);
-				ret = 0;
-			}
-			else if (zcopy_len == -1){
-				pr_debug("[Fallback to skb_copy_datagram_iter], recv_len: %d\n", recv_len);
-				ret = skb_copy_datagram_iter(skb, *offset,
-						&req->iter, recv_len);
-			}
-
-			// partial copy required due tail unaligned or error occured (partial remap)
-			// zcopy_len > 0 is amount of data this need to be copied to req->iter
-			else if (zcopy_len > 0)
-			{
-				pr_debug("[nvme_tcp_recv_data] recv_len: %d, zcopy_len: %d\n", recv_len, zcopy_len);
-				if (recv_len - zcopy_len > 0){ // already mapped to req->iter = recv_len - zcopy_len
-					iov_iter_advance(&req->iter, recv_len - zcopy_len);
-				}
-				ret = skb_copy_datagram_iter(skb, *offset + (recv_len - zcopy_len), &req->iter, zcopy_len);
-			}
-
 		}
 		if (ret) {
 			dev_err(queue->ctrl->ctrl.device,
@@ -1619,20 +1414,20 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			queue->ddgst_remaining = NVME_TCP_DIGEST_LENGTH;
 		} else {
 			if (pdu->hdr.flags & NVME_TCP_F_DATA_SUCCESS) {
-				if (!nvme_tcp_rx_zc_batch_flush || !nvme_host_rx_zc /*|| req->zc_policy != ZC_ENABLED*/) {
-					//trace_printk("==> [nvme_tcp_recv_data] end_request - req->status: %d\n", le16_to_cpu(req->status));
-
-					nvme_tcp_end_request(rq, le16_to_cpu(req->status));
-					queue->nr_cqe++;
+				if (nvme_tcp_rx_zc_batch_flush &&
+				    READ_ONCE(nvme_host_rx_zc)) {
+					nvme_tcp_defer_complete(queue,
+						pdu->command_id, rq);
 				} else {
-					//trace_printk("==> [nvme_tcp_recv_data] defer_complete - req->status: %d\n", le16_to_cpu(req->status));
-
-					nvme_tcp_defer_complete(queue, pdu->command_id, rq);
+					nvme_tcp_end_request(rq,
+						le16_to_cpu(req->status));
+					queue->nr_cqe++;
 				}
 			}
 			nvme_tcp_init_recv_ctx(queue);
 		}
 	}
+
 	return 0;
 }
 
@@ -2142,7 +1937,6 @@ static void nvme_tcp_free_queue(struct nvme_ctrl *nctrl, int qid)
 	memalloc_noreclaim_restore(noreclaim_flag);
 
 	kfree(queue->pdu);
-	
 	mutex_destroy(&queue->send_mutex);
 	mutex_destroy(&queue->queue_lock);
 }
@@ -2577,8 +2371,9 @@ static void nvme_tcp_restore_sock_ops(struct nvme_tcp_queue *queue)
 	write_unlock_bh(&sock->sk->sk_callback_lock);
 }
 
-static void nvme_tcp_zc_destroy_queue(struct nvme_tcp_queue *queue) {
-	pr_debug("nvme_tcp_zc_destroy_queue qid=%d\n", nvme_tcp_queue_id(queue));
+/* rx_zc_batch_flush: tear down what nvme_tcp_zc_{prepare,init}_queue() set up */
+static void nvme_tcp_zc_destroy_queue(struct nvme_tcp_queue *queue)
+{
 	if (READ_ONCE(queue->zc_prepared)) {
 		WRITE_ONCE(queue->zc_shutting_down, true);
 		hrtimer_cancel(&queue->zc_idle_timer);
@@ -2587,22 +2382,10 @@ static void nvme_tcp_zc_destroy_queue(struct nvme_tcp_queue *queue) {
 		queue->zc_wq = NULL;
 		WRITE_ONCE(queue->zc_prepared, false);
 	}
-/*
-	while (queue->zc_cnt) {
-//        struct request *rq = queue->zc_pending_rq[queue->zc_head];
-        queue->zc_pend_cids[queue->zc_head] = 0;
-        queue->zc_head = (queue->zc_head + 1) % queue->zc_queue_depth;
-        queue->zc_cnt--;
-    }
-*/
-	if (queue->zc_pend_cids) {
-		kvfree(queue->zc_pend_cids);
-		queue->zc_pend_cids = NULL;
-	}
-
+	kvfree(queue->zc_pend_cids);
+	queue->zc_pend_cids = NULL;
 	queue->zc_head = queue->zc_tail = queue->zc_cnt = 0;
 	queue->zc_pending_pages = 0;
-
 }
 
 static void __nvme_tcp_stop_queue(struct nvme_tcp_queue *queue)
@@ -2645,60 +2428,39 @@ static void nvme_tcp_setup_sock_ops(struct nvme_tcp_queue *queue)
 	write_unlock_bh(&queue->sock->sk->sk_callback_lock);
 }
 
-static inline void nvme_tcp_zc_prepare_queue(struct nvme_tcp_queue *q)
+/* rx_zc_batch_flush: the flush worker and idle timer of an I/O queue */
+static void nvme_tcp_zc_prepare_queue(struct nvme_tcp_queue *q)
 {
-	if (cmpxchg(&q->zc_prepared, 0, 1) != 0){
-        return;
-	}
-	pr_debug("zc prepare qid=%d\n", nvme_tcp_queue_id(q));
-    spin_lock_init(&q->zc_lock);
-	q->zc_wq = alloc_workqueue("nvme_tcp_zc_wq",
-                            WQ_HIGHPRI, 1);
+	if (cmpxchg(&q->zc_prepared, false, true))
+		return;
+	spin_lock_init(&q->zc_lock);
+	q->zc_wq = alloc_workqueue("nvme_tcp_zc_wq", WQ_HIGHPRI, 1);
 	if (!q->zc_wq) {
-		pr_debug("failed to allocate zc_wq\n");
-		WRITE_ONCE(q->zc_prepared, 0); 
+		WRITE_ONCE(q->zc_prepared, false);
 		return;
 	}
 	INIT_WORK(&q->zc_flush_work, nvme_tcp_zc_flush_workfn);
-
-	/* idle tail flush */
 	atomic_set(&q->zc_idle_armed, 0);
-    WRITE_ONCE(q->zc_last_defer_ns, ktime_get_ns());
-    hrtimer_init(&q->zc_idle_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
-    q->zc_idle_timer.function = nvme_tcp_zc_idle_timer_fn;
-
-    WRITE_ONCE(q->zc_prepared, true);
+	WRITE_ONCE(q->zc_last_defer_ns, ktime_get_ns());
+	hrtimer_init(&q->zc_idle_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+	q->zc_idle_timer.function = nvme_tcp_zc_idle_timer_fn;
 }
 
+/* rx_zc_batch_flush: the ring of deferred cids, sized to the tag set */
 static void nvme_tcp_zc_init_queue(struct nvme_tcp_queue *queue)
 {
-    u32 depth;
+	u32 depth;
 
-    if (!nvme_tcp_rx_zc_batch_flush || !nvme_host_rx_zc || !queue){
-        return;
-	}
-
-	if (queue->zc_pend_cids){
+	if (queue->zc_pend_cids || !queue->zc_wq)
 		return;
-	}
-
-    depth = nvme_tcp_tagset(queue)->nr_tags;
+	depth = nvme_tcp_tagset(queue)->nr_tags;
 	queue->zc_pend_cids = kvcalloc(depth, sizeof(u16), GFP_KERNEL);
-	if (!queue->zc_pend_cids) {
-		pr_debug("failed to allocate zc_pend_cids\n");
+	if (!queue->zc_pend_cids)
 		return;
-	}
-
 	queue->zc_head = queue->zc_tail = queue->zc_cnt = 0;
 	queue->zc_pending_pages = 0;
 	queue->zc_queue_depth = depth;
-
-	pr_debug("zc init qid=%d tags=%u pend=%p\n",
-        nvme_tcp_queue_id(queue),
-        nvme_tcp_tagset(queue)->nr_tags,
-        queue->zc_pend_cids);
 }
-
 
 static int nvme_tcp_start_queue(struct nvme_ctrl *nctrl, int idx)
 {
@@ -2712,17 +2474,15 @@ static int nvme_tcp_start_queue(struct nvme_ctrl *nctrl, int idx)
 	nvme_tcp_init_recv_ctx(queue);
 	nvme_tcp_setup_sock_ops(queue);
 
-	if (idx){
+	if (idx)
 		ret = nvmf_connect_io_queue(nctrl, idx);
-	}else
+	else
 		ret = nvmf_connect_admin_queue(nctrl);
 
 	if (!ret) {
 		set_bit(NVME_TCP_Q_LIVE, &queue->flags);
-
-		if (idx && nvme_tcp_rx_zc_batch_flush && nvme_host_rx_zc){
+		if (idx && nvme_tcp_rx_zc_batch_flush && nvme_host_rx_zc)
 			nvme_tcp_zc_init_queue(queue);
-		}
 	} else {
 		if (test_bit(NVME_TCP_Q_ALLOCATED, &queue->flags))
 			__nvme_tcp_stop_queue(queue);
@@ -3744,4 +3504,3 @@ module_exit(nvme_tcp_cleanup_module);
 
 MODULE_DESCRIPTION("NVMe host TCP transport driver");
 MODULE_LICENSE("GPL v2");
-

@@ -16,14 +16,44 @@
  * is seen again when its new mapping goes away.  zc_rx_test_clear_held()
  * tells whether we still hold it.
  */
-#include <linux/zcopy_mem.h>
+#include <linux/hashtable.h>
+#include <linux/mmu_notifier.h>
+#include <linux/pagewalk.h>
+#include <linux/sched/mm.h>
+#include <linux/slab.h>
 #include <linux/zcopy_ctx.h>
+#include <linux/zcopy_mem.h>
 #include <net/page_pool/helpers.h>
 #include <net/zc_rx.h>
 
+#define ZC_INV_BATCH 256
+
+/* pages collected at invalidate_range_start, released at _end */
+struct zcopy_inv_batch {
+	struct list_head node;
+	u16 nr;
+	struct page *pages[ZC_INV_BATCH];
+};
+
+struct zcopy_inv_range {
+	struct list_head node;
+	const struct mmu_notifier_range *cookie;
+	struct list_head batches;
+};
+
+/* one per registered mm */
+struct zcopy_ctx {
+	struct mmu_notifier mn;
+	struct mm_struct *mm;
+	struct hlist_node node;		/* in zcopy_ctx_hash */
+	struct rcu_head rcu;
+	spinlock_t lock;		/* protects inv_ranges */
+	struct list_head inv_ranges;
+};
+
 /* mm -> zcopy_ctx, for a lock-free "already registered?" check per I/O */
-DEFINE_HASHTABLE(zcopy_ctx_hash, 8);
-DEFINE_SPINLOCK(zcopy_ctx_lock);
+static DEFINE_HASHTABLE(zcopy_ctx_hash, 8);
+static DEFINE_SPINLOCK(zcopy_ctx_lock);
 
 /* Drop the temporary refs taken at invalidate_range_start and the pp refs. */
 static void zcopy_free_inv_range_pages(struct zcopy_inv_range *ir)

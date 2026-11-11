@@ -1,83 +1,121 @@
-#include <linux/zcopy_ctx.h>
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * zcIO host RX zero-copy: prepare user-memory read bios so nvme-tcp can
+ * remap received page-pool pages into the reader's buffer, and give the
+ * replaced page-pool pages back when the bio completes.
+ */
+#include <linux/bio.h>
 #include <linux/slab.h>
 #include <linux/sched/mm.h>
+#include <linux/zcopy_ctx.h>
+#include <linux/zcopy_mem.h>
+#include <net/page_pool/helpers.h>
+#include <net/zc_rx.h>
 
-
-extern int nvme_host_rx_zc;
-
-
-struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
+static struct my_ctx *zc_ctx_alloc(int nr_pages, struct mm_struct *mm)
 {
-    size_t u_sz, p_sz, total;
-    void *mem, *p;
-    struct my_ctx *ctx;
-    gfp_t gfp = GFP_KERNEL;
+	size_t u_sz = array_size(nr_pages, sizeof(unsigned long));
+	size_t p_sz = array_size(nr_pages, sizeof(struct page *));
+	struct my_ctx *ctx;
 
-    if (!READ_ONCE(nvme_host_rx_zc))
-        return NULL;
+	if (u_sz == SIZE_MAX || p_sz == SIZE_MAX)
+		return NULL;
+	/* the arrays are written before they are read: only clear the ctx */
+	ctx = kvmalloc(sizeof(*ctx) + u_sz + p_sz, GFP_KERNEL);
+	if (!ctx)
+		return NULL;
+	memset(ctx, 0, sizeof(*ctx));
 
-#ifdef __GFP_SKIP_ZERO
-    gfp |= __GFP_SKIP_ZERO;   /* init_on_alloc 등의 자동 memset을 스킵 */
-#endif
-
-    u_sz = array_size(nr_pages, sizeof(unsigned long));
-    p_sz = array_size(nr_pages, sizeof(struct page *));
-    if (u_sz == SIZE_MAX || p_sz == SIZE_MAX)
-        return NULL;
-
-    total = sizeof(*ctx) + u_sz + p_sz; /* user_addr + old_pages */
-
-    mem = kvmalloc(total, gfp);  /* 0-init 아님 */
-    if (!mem)
-        return NULL;
-
-    /* ctx만 0으로 초기화 (배열은 0-init 안 함) */
-    memset(mem, 0, sizeof(*ctx));
-    ctx = mem;
-
-    p = (void *)(ctx + 1);
-    ctx->user_addr = p;
-    p += u_sz;
-    ctx->old_pages = p;
-
-    ctx->magic = MY_CTX_MAGIC;
-    ctx->nr_pages = nr_pages;
-    ctx->tail_aligned = true;
-    ctx->head_aligned = true;
-    ctx->can_use_zerocopy = true;
-    ctx->zc_flush_min = ULONG_MAX;
-    ctx->inline_ctx = false;
-    ctx->index = 0;
-    ctx->old_nr_pages = 0;
-    
-    // init zc_rss_delta
-    for (int i = 0; i < NR_MM_COUNTERS; i++) {
-        ctx->zc_rss_delta[i] = 0;
-    }
-
-    /* the remap and TLB flush may run after the reader has exited */
-    mmgrab(mm);
-    ctx->mm = mm;
-
-    return ctx;
+	ctx->magic = MY_CTX_MAGIC;
+	ctx->nr_pages = nr_pages;
+	ctx->user_addr = (void *)(ctx + 1);
+	ctx->old_pages = (void *)ctx->user_addr + u_sz;
+	ctx->head_aligned = true;
+	ctx->tail_aligned = true;
+	ctx->zc_flush_min = ULONG_MAX;
+	/* the remap and TLB flush may run after the reader has exited */
+	mmgrab(mm);
+	ctx->mm = mm;
+	return ctx;
 }
 
-struct my_ctx *init_my_ctx(struct my_bio_private *priv, int nr_pages, struct mm_struct *mm)
+static void zc_ctx_free(struct my_ctx *ctx)
 {
-    return init_my_ctx_heap(nr_pages, mm);
+	mmdrop(ctx->mm);
+	kvfree(ctx);
 }
 
-
-void free_my_ctx(struct my_ctx *ctx)
+static void zc_bio_end_io(struct bio *bio)
 {
-    if (!ctx || ctx->magic != MY_CTX_MAGIC)
-        return;
+	struct my_bio_private *priv = bio->bi_private;
+	struct my_ctx *ctx = priv->ctx;
+	int i;
 
-    ctx->index = 0;
-    if (!ctx->inline_ctx) {
-        mmdrop(ctx->mm);
-        kvfree(ctx);
-    }
+	bio->bi_private = priv->orig_private;
+	bio->bi_end_io = priv->orig_end_io;
+	/* first: this unpins the bio's pages */
+	priv->orig_end_io(bio);
+
+	/* page-pool pages replaced by a re-read: their PTE and pp references */
+	for (i = 0; i < ctx->old_nr_pages; i++) {
+		struct page *page = ctx->old_pages[i];
+
+		put_page(page);
+		page_pool_put_full_page(page->pp, page, false);
+	}
+	zc_ctx_free(ctx);
+	kfree(priv);
 }
 
+/*
+ * Prepare @bio, a read into the current task's memory spanning at most
+ * @nr_pages pages, for host RX zero-copy.  Call before
+ * bio_iov_iter_get_pages(); a no-op when zero-copy is off.
+ */
+void zc_bio_prepare(struct bio *bio, int nr_pages)
+{
+	struct my_bio_private *priv;
 
+	if (!READ_ONCE(nvme_host_rx_zc) || !current->mm)
+		return;
+
+	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return;
+	priv->ctx = zc_ctx_alloc(nr_pages, current->mm);
+	if (!priv->ctx) {
+		kfree(priv);
+		return;
+	}
+	priv->magic = MY_BIO_PRIVATE_MAGIC;
+	priv->orig_private = bio->bi_private;
+	priv->orig_end_io = bio->bi_end_io;
+	bio->bi_private = priv;
+	bio->bi_end_io = zc_bio_end_io;
+
+	zcopy_try_register(current->mm);
+}
+
+/* bio_iov_iter_get_pages() failed: undo zc_bio_prepare(). */
+void zc_bio_abort(struct bio *bio)
+{
+	struct my_bio_private *priv = bio->bi_private;
+
+	if (!zc_bio_ctx(bio))
+		return;
+	bio->bi_private = priv->orig_private;
+	bio->bi_end_io = priv->orig_end_io;
+	zc_ctx_free(priv->ctx);
+	kfree(priv);
+}
+
+/* After bio_iov_iter_get_pages(): record how much the bio covers. */
+void zc_bio_pages_added(struct bio *bio)
+{
+	struct my_ctx *ctx = zc_bio_ctx(bio);
+
+	if (!ctx)
+		return;
+	ctx->total_bytes = bio->bi_iter.bi_size;
+	ctx->nr_pages = ctx->index;
+}
