@@ -115,18 +115,6 @@ int sysctl_tcp_max_orphans __read_mostly = NR_FILE;
 #define REXMIT_LOST	1 /* retransmit packets marked lost */
 #define REXMIT_NEW	2 /* FRTO-style transmit of unsent/new packets */
 
-// NVME_TCP_PDU_ALIGN
-// static inline bool nvmet_giant_skb(const struct sock *sk,
-// 				   const struct sk_buff *skb)
-// {
-// 	/* nvme/tcp target local port 4420만 필터 */
-// 	if (inet_sk(sk)->inet_num != 4420)
-// 		return false;
-
-// 	/* __skb_pull() 이후라 skb->len만 봐도 충분 */
-// 	return skb->len > 0xFFFF;
-// }
-
 #if IS_ENABLED(CONFIG_TLS_DEVICE)
 static DEFINE_STATIC_KEY_DEFERRED_FALSE(clean_acked_data_enabled, HZ);
 
@@ -4841,20 +4829,6 @@ static void tcp_sack_remove(struct tcp_sock *tp)
 	tp->rx_opt.num_sacks = num_sacks;
 }
 
-static bool is_nvme_tcp_recv_pdu(struct sk_buff *skb)
-{
-    if (!skb || !skb->data)
-        return false;
-
-    // NVMe-TCP PDU header magic은 0x0 or 0x1, type field 확인 (offset 0)
-    u8 pdu_type = skb->data[0];
-    if (pdu_type == 0x07 || pdu_type == 0x05){
-        return true;
-	}
-
-    return false;
-}
-
 /**
  * tcp_try_coalesce - try to merge skb to prior one
  * @sk: socket
@@ -4883,26 +4857,9 @@ static bool tcp_try_coalesce(struct sock *sk,
 
 	if (!tcp_skb_can_collapse_rx(to, from))
 		return false;
-	// if skb linear data is pdu header dont merge
-	if (is_nvme_tcp_recv_pdu(from)){
-		//pr_info("[skb linear data is pdu header dont merge]\n");
-		//pr_info("========== skb to: %px ==========\n", to);
-		//skb_dump(KERN_INFO, to, false);
-		//pr_info("========== skb from: %px ==========\n", from);
-		//skb_dump(KERN_INFO, from, false);
 
-		//return false;
-	}
-	// skb dump 
-	//pr_info("[tcp_try_coalesce] nr_frags: %d\n", skb_shinfo(to)->nr_frags);
 	if (!skb_try_coalesce(to, from, fragstolen, &delta))
 		return false;
-
-//	pr_info("[tcp_try_coalesce] success nr_frags: %d \n", skb_shinfo(to)->nr_frags);
-	//pr_info("========== skb from: %px ==========\n", from);
-	//skb_dump(KERN_INFO, from, true);
-	//pr_info("========== skb to: %px ==========\n", to);
-	//skb_dump(KERN_INFO, to, false);
 
 	atomic_add(delta, &sk->sk_rmem_alloc);
 	sk_mem_charge(sk, delta);
@@ -4958,9 +4915,6 @@ static void tcp_ofo_queue(struct sock *sk)
 	p = rb_first(&tp->out_of_order_queue);
 	while (p) {
 		skb = rb_to_skb(p);
-		//pr_info("========== tcp_ofo_queue skb: %px ==========\n", skb);
-	//	skb_dump(KERN_INFO, skb, true);
-		//pr_info("========== tcp_ofo_queue end ==========\n");
 		if (after(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
 			break;
 
@@ -4977,12 +4931,9 @@ static void tcp_ofo_queue(struct sock *sk)
 			tcp_drop_reason(sk, skb, SKB_DROP_REASON_TCP_OFO_DROP);
 			continue;
 		}
-		//pr_info_ratelimited("tcp_ofo_queue - skb data payload size: %d, total size: %d\n", skb->data_len, skb->len);
+
 		tail = skb_peek_tail(&sk->sk_receive_queue);
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
-		if (eaten) {
-			//pr_info("tcp_ofo_queue - coalesce success\n");
-		}
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
 		fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
 		if (!eaten)
@@ -5160,10 +5111,6 @@ end:
 		/* For non sack flows, do not grow window to force DUPACK
 		 * and trigger fast retransmit.
 		 */
-		//pr_info("========== tcp_data_queue_ofo coalesce success ==========\n");
-		//pr_info("========== tcp_data_queue_ofo skb: %px ==========\n", skb);
-		//skb_dump(KERN_INFO, skb, true);
-		//pr_info("========== tcp_data_queue_ofo end ==========\n");
 		if (tcp_is_sack(tp))
 			tcp_grow_window(sk, skb, false);
 		skb_condense(skb);
@@ -5277,24 +5224,6 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	 */
 	if (TCP_SKB_CB(skb)->seq == tp->rcv_nxt) {
 		if (tcp_receive_window(tp) == 0) {
-			// NVME_TCP_PDU_ALIGN
-			// if (nvmet_giant_skb(sk, skb)) {
-			// 	pr_info("tcp_data_queue ZERO-WIN giant: "
-			// 			    "seq=%u end_seq=%u rcv_nxt=%u "
-			// 			    "len=%u truesize=%u "
-			// 			    "rmem=%d rcvbuf=%d "
-			// 			    "copied_seq=%u rcv_wup=%u rxq=%u\n",
-			// 		TCP_SKB_CB(skb)->seq,
-			// 		TCP_SKB_CB(skb)->end_seq,
-			// 		tp->rcv_nxt,
-			// 		skb->len,
-			// 		skb->truesize,
-			// 		atomic_read(&sk->sk_rmem_alloc),
-			// 		sk->sk_rcvbuf,
-			// 		tp->copied_seq,
-			// 		tp->rcv_wup,
-			// 		skb_queue_len(&sk->sk_receive_queue));
-			// }
 			/* Some stacks are known to send bare FIN packets
 			 * in a loop even if we send RWIN 0 in our ACK.
 			 * Accepting this FIN does not hurt memory pressure
@@ -5313,21 +5242,6 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 		/* Ok. In sequence. In window. */
 queue_and_out:
 		if (tcp_try_rmem_schedule(sk, skb, skb->truesize)) {
-			// NVME_TCP_PDU_ALIGN
-			// if (nvmet_giant_skb(sk, skb)) {
-			// 	pr_info("tcp_data_queue NOMEM giant: "
-			// 			    "seq=%u end_seq=%u rcv_nxt=%u "
-			// 			    "len=%u truesize=%u "
-			// 			    "rmem=%d rcvbuf=%d rxq=%u\n",
-			// 		TCP_SKB_CB(skb)->seq,
-			// 		TCP_SKB_CB(skb)->end_seq,
-			// 		tp->rcv_nxt,
-			// 		skb->len,
-			// 		skb->truesize,
-			// 		atomic_read(&sk->sk_rmem_alloc),
-			// 		sk->sk_rcvbuf,
-			// 		skb_queue_len(&sk->sk_receive_queue));
-			// }
 			/* TODO: maybe ratelimit these WIN 0 ACK ? */
 			inet_csk(sk)->icsk_ack.pending |=
 					(ICSK_ACK_NOMEM | ICSK_ACK_NOW);
@@ -5406,24 +5320,6 @@ drop:
 		}
 		goto queue_and_out;
 	}
-
-	// NVME_TCP_PDU_ALIGN
-	// if (nvmet_giant_skb(sk, skb)) {
-	// 	pr_info("tcp_data_queue OFO giant: "
-	// 			    "seq=%u end_seq=%u rcv_nxt=%u "
-	// 			    "len=%u truesize=%u "
-	// 			    "rcv_wnd=%u rmem=%d rcvbuf=%d rxq=%u ofo_nonempty=%d\n",
-	// 		TCP_SKB_CB(skb)->seq,
-	// 		TCP_SKB_CB(skb)->end_seq,
-	// 		tp->rcv_nxt,
-	// 		skb->len,
-	// 		skb->truesize,
-	// 		tcp_receive_window(tp),
-	// 		atomic_read(&sk->sk_rmem_alloc),
-	// 		sk->sk_rcvbuf,
-	// 		skb_queue_len(&sk->sk_receive_queue),
-	// 		!RB_EMPTY_ROOT(&tp->out_of_order_queue));
-	// }
 
 	tcp_data_queue_ofo(sk, skb);
 }
@@ -5842,43 +5738,6 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
 			return;
 		}
 send_now:
-		// // NVME_TCP_PDU_ALIGN
-		// if (inet_sk(sk)->inet_num == 4420) {
-		// 	struct inet_connection_sock *icsk = inet_csk(sk);
-		// 	u32 rcv_wnd = tcp_receive_window(tp);
-
-		// 	/*
-		// 	* giant skb를 받은 직후,
-		// 	* 실제로 ACK를 보내기로 결정하는 경우만 로그.
-		// 	*
-		// 	* 특히 보고 싶은 것:
-		// 	* - zero window
-		// 	* - ACK number 진전 없음 (rcv_nxt == rcv_wup)
-		// 	* - OFO 가능성이 있는 ACK
-		// 	* - quickack / pending 상태
-		// 	*/
-		// 	if (rcv_wnd == 0 ||
-		// 		(tp->rcv_nxt == tp->rcv_wup &&
-		// 		(icsk->icsk_ack.pending & ICSK_ACK_NOW))) {
-		// 		pr_info_ratelimited("__tcp_ack_snd_check suspicious: "
-		// 					"ack=%u rcv_nxt=%u rcv_wup=%u "
-		// 					"wnd=%u ofo_possible=%d "
-		// 					"quick=%u pingpong=%u ato=%u pending=0x%x "
-		// 					"advmss=%u rmem=%d rcvbuf=%d\n",
-		// 			tp->rcv_nxt,
-		// 			tp->rcv_nxt,
-		// 			tp->rcv_wup,
-		// 			rcv_wnd,
-		// 			ofo_possible,
-		// 			icsk->icsk_ack.quick,
-		// 			icsk->icsk_ack.pingpong,
-		// 			icsk->icsk_ack.ato,
-		// 			icsk->icsk_ack.pending,
-		// 			tp->advmss,
-		// 			atomic_read(&sk->sk_rmem_alloc),
-		// 			sk->sk_rcvbuf);
-		// 	}
-		// }
 		tcp_send_ack(sk);
 		return;
 	}
@@ -6198,7 +6057,6 @@ reset:
  */
 void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 {
-
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	const struct tcphdr *th = (const struct tcphdr *)skb->data;
 	struct tcp_sock *tp = tcp_sk(sk);

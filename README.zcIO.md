@@ -87,32 +87,27 @@ nvme_tcp.nvme_host_rx_zc=1
 
 ## 3. Target (nvmet) RX zero-copy
 
-Run on the **target** machine. The knob lives in the built-in `tcp_zc`
-object (the symbol is `EXPORT_SYMBOL`'d for nvmet-tcp and mlx5):
+Run on the **target** machine. The knob is an `nvmet_tcp` module param:
 
 ```bash
 # turn ON
-echo 1 | sudo tee /sys/module/tcp_zc/parameters/nvmet_rx_zc
+echo 1 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
 
 # turn OFF -> exact vanilla target RX path
-echo 0 | sudo tee /sys/module/tcp_zc/parameters/nvmet_rx_zc
+echo 0 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
 
 # check
-cat /sys/module/tcp_zc/parameters/nvmet_rx_zc
+cat /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
 ```
 
-Or at boot:
+Or at load time: `modprobe nvmet-tcp nvmet_rx_zc=1`.
 
-```
-tcp_zc.nvmet_rx_zc=1
-```
-
-> The exact `/sys/module/<name>/parameters/` path for the built-in target
-> flag depends on `KBUILD_MODNAME` for `net/ipv4/tcp_zc.o`. If `tcp_zc` is
-> not present, find it with:
-> ```bash
-> sudo grep -rl nvmet_rx_zc /sys/module/*/parameters/ 2>/dev/null
-> ```
+With it on, nvmet-tcp receives data PDUs (H2C and in-capsule) with
+`read_sock()`. Every page-aligned 4K of the transfer that arrived as one
+whole page-pool page replaces the `req->sg` page at that index, and
+everything else is copied. This works on any listener port. It is off on
+TLS queues, and data digest works because the digest is computed over
+`req->sg`.
 
 **Full target zero-copy =** `rx_zc_stride on` (§1) **AND** `nvmet_rx_zc=1`.
 
@@ -131,13 +126,13 @@ echo 1 | sudo tee /sys/module/nvme_tcp/parameters/nvme_host_rx_zc
 ```bash
 # on target:
 sudo ethtool --set-priv-flags <dev> rx_zc_stride on
-echo 1 | sudo tee /sys/module/tcp_zc/parameters/nvmet_rx_zc
+echo 1 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
 ```
 
 **Back to full vanilla** (either machine):
 ```bash
 echo 0 | sudo tee /sys/module/nvme_tcp/parameters/nvme_host_rx_zc   # host
-echo 0 | sudo tee /sys/module/tcp_zc/parameters/nvmet_rx_zc         # target
+echo 0 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc     # target
 sudo ethtool --set-priv-flags <dev> rx_zc_stride off
 ```
 
@@ -148,9 +143,8 @@ sudo ethtool --set-priv-flags <dev> rx_zc_stride off
 * **`rx_zc_stride` reopens channels** — expect a momentary RX pause when you
   flip it. The two software flags (`nvme_host_rx_zc`, `nvmet_rx_zc`) are
   cheap runtime reads and do **not** reopen anything.
-* The two software toggles are **separate symbols** (`int nvme_host_rx_zc`
-  vs `bool nvmet_rx_zc`) so host and target can be enabled independently and
-  there is no symbol collision.
+* The two software toggles are separate module params (`nvme_tcp.nvme_host_rx_zc`,
+  `nvmet_tcp.nvmet_rx_zc`), so host and target are enabled independently.
 * The sender marks each doff-inflated data-PDU segment with IP ToS / IPv6
   TClass bit `0x04` (DSCP LSB, clear of the ECN bits). The receiver matches it
   with the mlx5 module param `rx_zc_tos_mask` (default `0x04`, `0` disables;
@@ -165,8 +159,9 @@ sudo ethtool --set-priv-flags <dev> rx_zc_stride off
 
 * Host: `drivers/nvme/host/tcp.c`, `zcopy_mem.c`, `block/{fops,bio,zcopy_ctx}.c`,
   `fs/iomap/direct-io.c`, `lib/iov_iter.c`, `include/linux/zcopy_*.h`
-* Target: `drivers/nvme/target/tcp.c`, `net/ipv4/{tcp,tcp_input,ip_input,tcp_zc}.c`,
-  `include/linux/nvmet_tcp_zc.h`
+* Target: `drivers/nvme/target/tcp.c` (no TCP core changes)
+* Shared: `net/core/zc_rx.c`, `include/net/zc_rx.h` (page lookup),
+  `include/linux/ip.h` (`ip_transport_len()` for `tot_len == 0`)
 * Shared NIC: `drivers/net/ethernet/mellanox/mlx5/core/{en.h,en_main.c,en_rx.c,en_ethtool.c,en/params.c}`
 
 See the `[zcIO]` commits for the integration-specific changes (renames,
