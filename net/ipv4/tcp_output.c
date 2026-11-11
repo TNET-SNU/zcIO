@@ -1625,10 +1625,10 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 		tp->nvme_flow && tcb->has_l5_hdr && tcb->is_l5_data_pdu) {
 		*(((__be16 *)th) + 6) = htons((((tcp_header_size + 24) >> 2) << 12) |
 						tcb->tcp_flags);
-		inet->tos |= 0x01;
+		inet->tos |= NVME_PDU_TOS_MARK;
 	}
 	else
-		inet->tos &= ~0x01;
+		inet->tos &= ~NVME_PDU_TOS_MARK;
 #endif
 /*----------------------------------------------------------------------------*/
 
