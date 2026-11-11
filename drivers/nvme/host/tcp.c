@@ -1133,19 +1133,19 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
     size_t chunk_base = 0;
 
     if (unlikely(!req->curr_bio)) {
-        pr_info("req->curr_bio is null\n");
+        pr_debug("req->curr_bio is null\n");
         return -1;
     }
 
     priv = req->curr_bio->bi_private;
     if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)) {
-        pr_info("priv is null or priv->magic is not MY_BIO_PRIVATE_MAGIC\n");
+        pr_debug("priv is null or priv->magic is not MY_BIO_PRIVATE_MAGIC\n");
         return -1;
     }
 
     ctx = priv->ctx;
     if (unlikely(!ctx)) {
-        pr_info("ctx is null\n");
+        pr_debug("ctx is null\n");
         return -1;
     }
 
@@ -1180,11 +1180,11 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
         unsigned long uaddr = ctx->user_addr[page_idx];
 
         if (unlikely(!uaddr || !access_ok((void __user*)uaddr, PAGE_SIZE))) {
-            pr_info(" [user address] %px is not valid\n", (void __user*)uaddr);
+            pr_debug(" [user address] %px is not valid\n", (void __user*)uaddr);
             goto error;
         }
 		if (unlikely(uaddr & (PAGE_SIZE-1))) {
-			trace_printk("ZC BAD: uaddr not aligned: uaddr=%lx\n", uaddr);
+			pr_debug("ZC BAD: uaddr not aligned: uaddr=%lx\n", uaddr);
 		}
 
         /* only a whole page-pool page frag starting exactly at cur_off */
@@ -1194,7 +1194,7 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
             goto error;
 
         if (!get_page_unless_zero(fp)) {
-            pr_info("failed to get_page: %px\n", fp);
+            pr_debug("failed to get_page: %px\n", fp);
             goto error;
         }
 
@@ -1450,18 +1450,18 @@ static inline bool can_use_zerocopy(struct nvme_tcp_queue *queue, struct nvme_tc
 		return false;
 	struct my_bio_private *priv = req->curr_bio->bi_private;
 	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)){
-		pr_info("[zerocopy] can_use_zerocopy FAIL: priv=NULL or priv->magic != MY_BIO_PRIVATE_MAGIC\n");
+		pr_debug("[zerocopy] can_use_zerocopy FAIL: priv=NULL or priv->magic != MY_BIO_PRIVATE_MAGIC\n");
 		return false;
 	}
 	struct my_ctx *ctx = priv->ctx;
 	if (unlikely(!ctx || ctx->magic != MY_CTX_MAGIC || ctx->error != 0)) {
-		pr_info("[can_use_zerocopy] ctx is null\n");
+		pr_debug("[can_use_zerocopy] ctx is null\n");
 		return false;
 	}
 
 	if (unlikely( nvme_tcp_rx_zc_batch_flush && queue->zc_pend_cids == NULL))
 	{
-		pr_info("[can_use_zerocopy] queue->zc_pend_cids is null\n");
+		pr_debug("[can_use_zerocopy] queue->zc_pend_cids is null\n");
 		return false;
 	}
 
@@ -2572,7 +2572,7 @@ static void nvme_tcp_restore_sock_ops(struct nvme_tcp_queue *queue)
 }
 
 static void nvme_tcp_zc_destroy_queue(struct nvme_tcp_queue *queue) {
-	pr_info("nvme_tcp_zc_destroy_queue qid=%d\n", nvme_tcp_queue_id(queue));
+	pr_debug("nvme_tcp_zc_destroy_queue qid=%d\n", nvme_tcp_queue_id(queue));
 	if (READ_ONCE(queue->zc_prepared)) {
 		WRITE_ONCE(queue->zc_shutting_down, true);
 		hrtimer_cancel(&queue->zc_idle_timer);
@@ -2644,12 +2644,12 @@ static inline void nvme_tcp_zc_prepare_queue(struct nvme_tcp_queue *q)
 	if (cmpxchg(&q->zc_prepared, 0, 1) != 0){
         return;
 	}
-	pr_info("zc prepare qid=%d\n", nvme_tcp_queue_id(q));
+	pr_debug("zc prepare qid=%d\n", nvme_tcp_queue_id(q));
     spin_lock_init(&q->zc_lock);
 	q->zc_wq = alloc_workqueue("nvme_tcp_zc_wq",
                             WQ_HIGHPRI, 1);
 	if (!q->zc_wq) {
-		pr_info("failed to allocate zc_wq\n");
+		pr_debug("failed to allocate zc_wq\n");
 		WRITE_ONCE(q->zc_prepared, 0); 
 		return;
 	}
@@ -2679,7 +2679,7 @@ static void nvme_tcp_zc_init_queue(struct nvme_tcp_queue *queue)
     depth = nvme_tcp_tagset(queue)->nr_tags;
 	queue->zc_pend_cids = kvcalloc(depth, sizeof(u16), GFP_KERNEL);
 	if (!queue->zc_pend_cids) {
-		pr_info("failed to allocate zc_pend_cids\n");
+		pr_debug("failed to allocate zc_pend_cids\n");
 		return;
 	}
 
@@ -2687,7 +2687,7 @@ static void nvme_tcp_zc_init_queue(struct nvme_tcp_queue *queue)
 	queue->zc_pending_pages = 0;
 	queue->zc_queue_depth = depth;
 
-	pr_info("zc init qid=%d tags=%u pend=%p\n",
+	pr_debug("zc init qid=%d tags=%u pend=%p\n",
         nvme_tcp_queue_id(queue),
         nvme_tcp_tagset(queue)->nr_tags,
         queue->zc_pend_cids);

@@ -303,7 +303,7 @@ static void blkdev_my_bio_end_io_async(struct bio *bio)
 			struct page *page = ctx->old_pages[i];
 			if (!page) continue;
 			if (unlikely(!zc_rx_page_is_pp(page))) {
-				pr_info("page is not pp page: %px\n", page);
+				pr_debug("page is not pp page: %px\n", page);
 				//put_page(page);
 			}
 			else {

@@ -169,7 +169,7 @@ void iomap_my_dio_bio_end_io(struct bio *bio)
 {
 	struct my_bio_private *priv = bio->bi_private;
 	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)){
-		pr_info("[iomap_my_dio_bio_end_io] priv is NULL or magic is not MY_BIO_PRIVATE_MAGIC\n");
+		pr_debug("[iomap_my_dio_bio_end_io] priv is NULL or magic is not MY_BIO_PRIVATE_MAGIC\n");
 		return;	
 	}
 	struct my_ctx *ctx = priv->ctx;
@@ -190,7 +190,7 @@ void iomap_my_dio_bio_end_io(struct bio *bio)
 				continue;
 			}
 			if (unlikely(!zc_rx_page_is_pp(page))){
-				pr_info("[bio_end_io] [page: %px], is not pp page\n", page);
+				pr_debug("[bio_end_io] [page: %px], is not pp page\n", page);
 				//put_page(page);
 			}
 			else{
@@ -461,24 +461,24 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 				bio->bi_end_io = iomap_my_dio_bio_end_io;
 				ret = zcopy_try_register(current->mm);
 				if (ret < 0){
-					pr_info("iomap_dio_bio_iter: zcopy_try_register failed\n");
+					pr_debug("iomap_dio_bio_iter: zcopy_try_register failed\n");
 					//kfree(priv);
 					//priv = NULL;
 				}
 			}
 			else {
-				pr_info("iomap_dio_bio_iter: kmalloc failed\n");
+				pr_debug("iomap_dio_bio_iter: kmalloc failed\n");
 			}
 		}
 
 		ret = bio_iov_iter_get_pages(bio, dio->submit.iter);
 		if (unlikely(ret)) {
-			pr_info("[failed] [bio: %px] bio_iov_iter_get_pages: ret: %d\n", bio, ret);
+			pr_debug("[failed] [bio: %px] bio_iov_iter_get_pages: ret: %d\n", bio, ret);
 			// syeon
 			if (!(dio->flags & IOMAP_DIO_WRITE) && priv && priv->magic == MY_BIO_PRIVATE_MAGIC){
 				struct my_ctx *ctx = priv->ctx;
 				if (ctx && ctx->magic == MY_CTX_MAGIC){
-					pr_info("[failed] bio_iov_iter_get_pages: bio: %px\n", bio);
+					pr_debug("[failed] bio_iov_iter_get_pages: bio: %px\n", bio);
 					free_my_ctx(ctx);
 					ctx = NULL;
 

@@ -1187,7 +1187,7 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 //			if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
 				//pr_info("[bio_release_page] page: %px - pp_ref_count: %ld - page_ref_count: %d", page, pp, page_ref_count(page));
 		/*		if (atomic_long_read(&page->pp_ref_count) == 1) {
-					trace_printk("**[7]** bio_release_page - calling skb_page_unref : page: %px - pp_ref_count: %ld\n", page, atomic_long_read(&page->pp_ref_count));
+					pr_debug("**[7]** bio_release_page - calling skb_page_unref : page: %px - pp_ref_count: %ld\n", page, atomic_long_read(&page->pp_ref_count));
 					//pr_info("skb_page_unref: %px - pp: %ld", page, pp);
 					skb_page_unref(page, true);
 
