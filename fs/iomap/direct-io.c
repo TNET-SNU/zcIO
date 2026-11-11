@@ -454,7 +454,8 @@ static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
 				priv->magic = MY_BIO_PRIVATE_MAGIC;
 				priv->orig_private = bio->bi_private;
 				priv->orig_end_io = bio->bi_end_io;
-				nr_pages = DIV_ROUND_UP(iov_iter_count(dio->submit.iter), PAGE_SIZE);
+				/* pages spanned, counting an unaligned start; the loop recomputes nr_pages before the next bio */
+				nr_pages = iov_iter_npages(dio->submit.iter, INT_MAX);
 				priv->ctx = init_my_ctx(priv, nr_pages, current->mm);
 				bio->bi_private = priv;
 				bio->bi_end_io = iomap_my_dio_bio_end_io;

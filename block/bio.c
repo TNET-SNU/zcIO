@@ -1340,41 +1340,38 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 			if (ret)
 				break;
 		} else {
-			// store user address to bio->bi_private
-			if (ctx && ctx->magic == MY_CTX_MAGIC){
-				if (base_idx + i >= ctx->nr_pages){
-					trace_printk("[error] [bio: %px] base_idx(%d) + i(%d) >= ctx->nr_pages(%d)\n", bio, base_idx, i, ctx->nr_pages);
+			/*
+			 * zcIO: move the user address that iov_iter stamped
+			 * into the page to ctx->user_addr[].  Every slot is
+			 * written (0 = unknown, never remapped), and a ctx
+			 * that turns out too small is disabled, not overrun.
+			 */
+			if (ctx && ctx->magic == MY_CTX_MAGIC) {
+				unsigned long uaddr;
+
+				if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE) {
+					uaddr = page->_pp_mapping_pad;
+					page->_pp_mapping_pad = 0;
+				} else {
+					uaddr = page->private;
+					page->private = 0;
 				}
-			//	else {
-					if ((page->pp_magic & ~0x3UL) == PP_SIGNATURE){
-						if (page->_pp_mapping_pad){
-							ctx->user_addr[base_idx + i] = (unsigned long)page->_pp_mapping_pad;
-							page->_pp_mapping_pad = 0;
-						}
-					}
-					else {
-						if (page->private){
-							ctx->user_addr[base_idx + i] = (unsigned long)page->private;
-							page->private = 0;
-						}
-					}
-					if (offset != 0) {
-						ctx->head_aligned = false;
-						trace_printk("[ctx: %px] head_aligned: false - offset: %zu\n", ctx, offset);
-					}
-			//	}
+				if (base_idx + i < ctx->nr_pages)
+					ctx->user_addr[base_idx + i] = uaddr;
+				else
+					ctx->error = -E2BIG;
+				if (offset != 0)
+					ctx->head_aligned = false;
 			}
 			bio_iov_add_page(bio, page, len, offset);
 		}
 		offset = 0;
 	}
-	if (ctx && ctx->magic == MY_CTX_MAGIC){
-		ctx->index = base_idx + i;
+	if (ctx && ctx->magic == MY_CTX_MAGIC) {
+		/* later users size their loops by index; keep it in bounds */
+		ctx->index = min_t(int, base_idx + i, ctx->nr_pages);
 		if (len != PAGE_SIZE)
-		{
 			ctx->tail_aligned = false;
-			trace_printk("[ctx: %px] tail_aligned: false - len: %d\n", ctx, len);
-		}
 	}
 
 	iov_iter_revert(iter, left);
