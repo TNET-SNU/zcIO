@@ -43,7 +43,7 @@ static bool zc_rx_cursor_next_skb(struct zc_rx_cursor *c)
  * @off: offset within @root
  *
  * Returns the page-pool page holding bytes [@off, @off + PAGE_SIZE) of
- * @root if that range is exactly one frag with offset 0 and size PAGE_SIZE,
+ * @root if that range is exactly one frag covering a whole order-0 page,
  * or NULL (the caller then copies).  No reference is taken.
  *
  * Calls with increasing @off for the same @root resume where the previous
@@ -71,7 +71,10 @@ struct page *zc_rx_skb_page_at(struct zc_rx_cursor *c,
 				    skb_frag_off(f) != 0)
 					return NULL;
 				page = skb_frag_page(f);
-				return zc_rx_page_is_pp(page) ? page : NULL;
+				/* an order-0 page; not 4K of a larger pool page */
+				if (PageCompound(page) || !zc_rx_page_is_pp(page))
+					return NULL;
+				return page;
 			}
 			c->pos = end;
 			c->frag++;
