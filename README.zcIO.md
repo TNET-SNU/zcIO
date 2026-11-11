@@ -1,176 +1,186 @@
-# zcIO — NVMe-over-TCP RX Zero-Copy (host + target)
+# zcIO: NVMe/TCP RX zero-copy (host and target)
 
-This kernel integrates **two independent RX zero-copy features** on top of a
-shared NIC-side mechanism:
+This kernel (v6.11 + zcIO, `EXTRAVERSION = -zcio`) adds receive-side zero-copy
+to both ends of NVMe/TCP, on top of a shared mlx5 mechanism:
 
-| Feature | What it does | Software toggle |
+| Feature | What it does | Switch |
 |---|---|---|
-| **Initiator (host)** RX zero-copy | NVMe-oF *host* delivers received data straight into the I/O / user buffer (no `skb_copy_datagram_iter`) | `nvme_host_rx_zc` (int, nvme-tcp) |
-| **Target (nvmet)** RX zero-copy | NVMe-oF *target* places received NIC pages in the command SGL (`read_sock()` actor, no copy) | `nvmet_rx_zc` (bool, nvmet-tcp) |
-| **NIC stride** (shared substrate) | Forces 4K (PAGE_SIZE) mlx5 MPWQE RX stride + SHAMPO doff/gso fixup of ToS-marked PDU-header segments that *both* features depend on | `rx_zc_stride` (mlx5 ethtool priv-flag) |
+| **Host (initiator) RX zero-copy** | Read data arriving from the target is remapped into the reader's buffer instead of copied | `nvme_tcp.nvme_host_rx_zc` (int) |
+| **Target (nvmet) RX zero-copy** | Write data arriving from the host is put into the I/O scatterlist instead of copied | `nvmet_tcp.nvmet_rx_zc` (bool) |
+| **NIC: 4K stride + PDU-header fixup** | mlx5 receives payload into whole 4K page-pool pages and hands a ToS-marked PDU header back to the payload | `rx_zc_stride` (mlx5 ethtool priv-flag), `mlx5_core.rx_zc_tos_mask` |
 
-> **Key idea:** the two software toggles are fully independent, but **both
-> require the shared `rx_zc_stride` NIC flag to be ON** to actually do
-> zero-copy. With every flag OFF the data path is byte-for-byte vanilla 6.11.
+All switches default to off. With them off, the receive paths behave as in
+vanilla v6.11; only a few "is zero-copy on?" checks are left in them.
 
-All three default to **OFF**.
-
----
-
-## 0. Prerequisites
-
-* mlx5 NIC (ConnectX) with **HW-GRO / SHAMPO** and **striding RQ**.
-* Kernel config (this tree was validated with):
-  * `CONFIG_NVME_TCP=y` (built-in — required: some host-side functions must be built-in)
-  * `CONFIG_NVME_TARGET_TCP=m`, `CONFIG_MLX5_CORE=m`
-* `ethtool` installed.
-
-Replace `<dev>` below with your NIC interface (e.g. `enp1s0f0np0`).
+How it works: the **sender** puts the 24-byte header of each NVMe/TCP data PDU
+into the TCP header (doff +6 words) of the PDU's first segment and marks that
+segment with ToS (IPv4) / Traffic Class (IPv6) bit `0x04`. The receiving mlx5
+then splits the headers off (SHAMPO), so the PDU data starts at offset 0 of a
+4K stride page. It also turns the 24 bytes back into payload and clears the
+mark. Each page-aligned 4K of PDU data is then one whole page-pool page, which
+nvme-tcp / nvmet-tcp take instead of copying it. Anything else is copied as
+usual.
 
 ---
 
-## 1. Shared NIC flag: `rx_zc_stride` (do this first, on BOTH machines)
+## 0. Requirements
 
-The 4K stride is decided when the RX queue is created, so toggling it
-**reopens the NIC channels** (brief link blip). It also needs striding RQ.
+* mlx5 (ConnectX) NIC with striding RQ and hardware GRO (SHAMPO) on the
+  **receiving** side; MTU 9000 was used.
+* Kernel config: `CONFIG_NVME_TCP=y` (block/ and iomap call into it, so it must
+  be built in), `CONFIG_NVME_TARGET_TCP=m`, `CONFIG_MLX5_CORE=m`. x86-64.
+* Install kernel and modules **from the same build** (`make install` and
+  `make modules_install`): with `CONFIG_MODVERSIONS` a module from a newer build
+  fails to load with `Invalid argument`.
+* A **sender that marks PDU-header segments**: a kernel with PDU-aligned send
+  (branch `pdu_align_only`, or the `5.15.189-pduwin` kernel) and
+  `sysctl -w net.ipv4.nvme_pdu_align=2`. Its mark bit must equal the receiver's
+  `rx_zc_tos_mask` (both `0x04`). Without it nothing breaks, but every byte is
+  copied.
+
+| Zero-copy on | receives | sender that must mark |
+|---|---|---|
+| host | C2H data (reads) | the target node |
+| target | H2C / in-capsule data (writes) | the host node |
+
+---
+
+## 1. NIC (receiving node)
 
 ```bash
-# striding RQ must be on (it is by default on mlx5)
+# hw-GRO must be on: enable it at MTU 1500, then raise the MTU
+sudo ip link set <dev> mtu 1500
+sudo ethtool -K <dev> rx-gro-hw on gro on tso on
+sudo ip link set <dev> mtu 9000
+
 sudo ethtool --set-priv-flags <dev> rx_striding_rq on
-
-# enable the zero-copy 4K stride
-sudo ethtool --set-priv-flags <dev> rx_zc_stride on
-
-# verify
-sudo ethtool --show-priv-flags <dev> | grep -E 'rx_striding_rq|rx_zc_stride'
-#   rx_striding_rq : on
-#   rx_zc_stride   : on
+sudo ethtool --set-priv-flags <dev> rx_zc_stride on      # reopens the channels
+cat /sys/module/mlx5_core/parameters/rx_zc_tos_mask      # 4
 ```
 
-Turn the NIC behaviour back to **vanilla**:
-
-```bash
-sudo ethtool --set-priv-flags <dev> rx_zc_stride off
-```
-
-When `rx_zc_stride` is off, `mlx5e_mpwqe_get_log_stride_size()` returns the
-stock `MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev)` and the per-packet SHAMPO
-doff/gso rewrite in `en_rx.c` is skipped (`rq->mpwqe.zc_stride == 0`).
+`rx_zc_stride` is applied when the RX queues are created, so changing it
+reopens the NIC channels (a short link blip). Change it before connecting.
+With it off, the stride is the stock one and the PDU-header fixup is skipped.
+`rx_zc_tos_mask` (0 = never match) can be changed at runtime.
 
 ---
 
-## 2. Initiator (host) RX zero-copy
-
-Run on the **host / initiator** machine. The knob is a parameter of the
-(built-in) `nvme_tcp` module.
+## 2. Host (initiator) RX zero-copy
 
 ```bash
-# turn ON  (runtime, takes effect for new I/O)
 echo 1 | sudo tee /sys/module/nvme_tcp/parameters/nvme_host_rx_zc
-
-# turn OFF -> exact vanilla host RX path
-echo 0 | sudo tee /sys/module/nvme_tcp/parameters/nvme_host_rx_zc
-
-# check
-cat /sys/module/nvme_tcp/parameters/nvme_host_rx_zc
+# optional batched TLB flush; read at connect time, so set it before connecting
+echo Y | sudo tee /sys/module/nvme_tcp/parameters/rx_zc_batch_flush
 ```
 
-Or at boot via kernel cmdline:
+| Parameter | Default | Meaning |
+|---|---|---|
+| `nvme_host_rx_zc` | 0 | remap received read data into the reader's buffer |
+| `rx_zc_batch_flush` | N | complete requests from a per-queue worker that flushes the TLB once per batch (applies to queues connected afterwards) |
+| `rx_zc_batch_pages` | 64 | staged pages that start a batch flush |
+| `rx_zc_idle_us` | 50 | flush a partial batch after this idle time |
 
-```
-nvme_tcp.nvme_host_rx_zc=1
-```
+**Covered reads:** async `O_DIRECT` on a raw block device (libaio, io_uring)
+and filesystem direct I/O through iomap (ext4, xfs). They must land in
+**private anonymous memory**, such as a `malloc()`ed buffer, and the buffer
+must start on a page boundary. Other reads are copied: buffered I/O,
+synchronous raw block DIO, io_uring fixed buffers (bvec iterators), shared or
+file mappings, unaligned buffers.
 
-**Full host zero-copy =** `rx_zc_stride on` (§1) **AND** `nvme_host_rx_zc=1`.
+**How:**
+1. While the bio pins the user pages, the block layer records each page's user
+   address (`lib/iov_iter.c`, `block/bio.c`).
+2. `nvme_tcp_recv_data()` replaces the reader's PTEs with the received
+   page-pool pages (`zc_remap_pages()`).
+3. The TLB is flushed before the request completes, on every completion path.
+   This happens right away, or per batch with `rx_zc_batch_flush`.
 
-Covered I/O: async raw block `O_DIRECT` (aio / io_uring) and filesystem
-DIO (iomap), into private anonymous memory (e.g. a `malloc()`ed buffer).
-Other reads are copied. Received pages are remapped into the reader's
-buffer. The TLB is flushed before the request completes, either right
-away or in batches with `rx_zc_batch_flush=1`. The flush happens on the
-CQE path as well, so `--disable-sqflow` is only needed for the batched
-`DATA_SUCCESS` completion. The pages go back to the NIC page pool when
-they are unmapped (munmap, `madvise(MADV_DONTNEED)`, exit), or when the
-same buffer is read again.
+A remapped page holds a page-pool reference while it is mapped. It goes back
+to its pool when the same buffer is read again (at bio completion), when the
+mapping goes away (munmap, `madvise(MADV_DONTNEED)`, COW; mmu notifier in
+`zcopy_mem.c`), or when the process exits. `PG_owner_priv_1` records that the
+reference is still held, so it is returned exactly once, also after mremap().
 
 ---
 
 ## 3. Target (nvmet) RX zero-copy
 
-Run on the **target** machine. The knob is an `nvmet_tcp` module param:
-
 ```bash
-# turn ON
-echo 1 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
-
-# turn OFF -> exact vanilla target RX path
-echo 0 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
-
-# check
-cat /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
-```
-
-Or at load time: `modprobe nvmet-tcp nvmet_rx_zc=1`.
-
-With it on, nvmet-tcp receives data PDUs (H2C and in-capsule) with
-`read_sock()`. Every page-aligned 4K of the transfer that arrived as one
-whole page-pool page replaces the `req->sg` page at that index, and
-everything else is copied. This works on any listener port. It is off on
-TLS queues, and data digest works because the digest is computed over
-`req->sg`.
-
-**Full target zero-copy =** `rx_zc_stride on` (§1) **AND** `nvmet_rx_zc=1`.
-
----
-
-## 4. Typical setups
-
-**Host-only zero-copy** (target stays vanilla):
-```bash
-# on host:
-sudo ethtool --set-priv-flags <dev> rx_zc_stride on
-echo 1 | sudo tee /sys/module/nvme_tcp/parameters/nvme_host_rx_zc
-```
-
-**Target-only zero-copy** (host stays vanilla):
-```bash
-# on target:
-sudo ethtool --set-priv-flags <dev> rx_zc_stride on
+sudo modprobe nvmet-tcp
 echo 1 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
 ```
 
-**Back to full vanilla** (either machine):
-```bash
-echo 0 | sudo tee /sys/module/nvme_tcp/parameters/nvme_host_rx_zc   # host
-echo 0 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc     # target
-sudo ethtool --set-priv-flags <dev> rx_zc_stride off
-```
+**How:**
+1. For a write on a non-TLS queue, the command gets a scatterlist **without
+   pages**.
+2. nvmet-tcp receives the PDU data with `read_sock()`. Each page-aligned 4K
+   that arrived as one whole page-pool page becomes the `req->sg` entry at
+   that index; the rest is copied into a page allocated for that entry.
+3. When the command completes, the page-pool pages go back to their pool.
+
+Whether a command uses zero-copy is decided when it arrives, so changing
+`nvmet_rx_zc` at runtime is safe. Any listener port works. Data digest works,
+because it is computed over `req->sg`. Reads and TLS queues stay on the
+vanilla path.
 
 ---
 
-## 5. Notes / gotchas
+## 4. Checking it
 
-* **`rx_zc_stride` reopens channels** — expect a momentary RX pause when you
-  flip it. The two software flags (`nvme_host_rx_zc`, `nvmet_rx_zc`) are
-  cheap runtime reads and do **not** reopen anything.
-* The two software toggles are separate module params (`nvme_tcp.nvme_host_rx_zc`,
-  `nvmet_tcp.nvmet_rx_zc`), so host and target are enabled independently.
-* The sender marks each doff-inflated data-PDU segment with IP ToS / IPv6
-  TClass bit `0x04` (DSCP LSB, clear of the ECN bits). The receiver matches it
-  with the mlx5 module param `rx_zc_tos_mask` (default `0x04`, `0` disables;
-  `/sys/module/mlx5_core/parameters/rx_zc_tos_mask`), hands the 24-byte PDU
-  header back to the payload and clears the mark. Sender and receiver must
-  agree on the bit.
-* Debug output on the ZC paths is `pr_debug` (enable with dynamic debug).
+Lab scripts live outside the tree, in `~/nvme-tcp-scripts` on creek1/creek2:
 
-## 6. Source map (what changed vs vanilla v6.11)
+| Script | Node | Purpose |
+|---|---|---|
+| `initiator-zc-enable.sh` / `-disable.sh` | host | `nvme_host_rx_zc`, batch flush, `rx_zc_stride` |
+| `initiator-zc-leak-test.sh` (+ `zc-leak-test.c`) | host | page-pool `inflight` before/after 2000 x 1MB reads per release path: reuse, munmap, madvise, mremap, exit. A leak shows as ~512000 pages |
+| `target-zc-enable.sh` / `-disable.sh` | target | `nvmet_rx_zc`, `rx_zc_stride` |
+| `target-zc-check.sh` | target | bpftrace count of 4K chunks taken by zero-copy vs. copied. Start it before the load when the target has one core |
+| `target-ssd-clean.sh` | target | nvme-format the 9100 PRO SSDs before a write run |
+| `initiator-pdu-align.sh` | sender | `net.ipv4.nvme_pdu_align` |
 
-* Host: `drivers/nvme/host/tcp.c`, `zcopy_mem.c`, `block/{fops,bio,zcopy_ctx}.c`,
-  `fs/iomap/direct-io.c`, `lib/iov_iter.c`, `include/linux/zcopy_*.h`
-* Target: `drivers/nvme/target/tcp.c` (no TCP core changes)
-* Shared: `net/core/zc_rx.c`, `include/net/zc_rx.h` (page lookup),
-  `include/linux/ip.h` (`ip_transport_len()` for `tot_len == 0`)
-* Shared NIC: `drivers/net/ethernet/mellanox/mlx5/core/{en.h,en_main.c,en_rx.c,en_ethtool.c,en/params.c}`
+Page-pool `inflight` without the scripts:
 
-See the `[zcIO]` commits for the integration-specific changes (renames,
-the `rx_zc_stride` priv-flag, and the off==vanilla gating).
+```bash
+python3 tools/net/ynl/cli.py --spec Documentation/netlink/specs/netdev.yaml \
+    --dump page-pool-get
+```
+
+Reference numbers (creek1 / creek2, ConnectX, 8x Samsung 9100 PRO, one CPU core
+on the receiving node):
+
+| Workload | copy (switches off) | zcIO |
+|---|---|---|
+| host: 1MB random read, libaio O_DIRECT | ~34 Gbps | ~75 Gbps |
+| target: 128k write | ~21 Gbps | ~83 Gbps |
+
+Both nodes run with `init_on_alloc` on (the Ubuntu default), which zeroes
+every page allocation.
+
+---
+
+## 5. Notes
+
+* With the switches off the paths match vanilla, but `rx_zc_stride` also
+  changes the RX stride for all traffic on that NIC.
+* After a reboot the NIC settings (MTU, hw-GRO, `rx_zc_stride`) and the module
+  params are gone: set them again.
+* Do not change CPU hotplug state (offline/online cores) around NVMe/TCP host
+  connections: connecting with some cores offline fails with `-EXDEV`, and
+  onlining cores after a disconnect has oopsed. Use `nr_cpus=N` at boot, or
+  connect with 1 core or all cores online.
+* Debug output on the zero-copy paths is `pr_debug` (dynamic debug).
+
+---
+
+## 6. Source map (vs. vanilla v6.11)
+
+| Area | Files |
+|---|---|
+| mlx5 | `drivers/net/ethernet/mellanox/mlx5/core/en_rx.c` (PDU-header fixup, `tot_len = 0` above 64KB), `en/params.c`, `en.h`, `en_main.c`, `en_ethtool.c` (`rx_zc_stride`) |
+| shared | `net/core/zc_rx.c`, `include/net/zc_rx.h` (page lookup in an skb, held-reference flag), `include/linux/ip.h` (`ip_transport_len()` with `tot_len == 0`) |
+| target | `drivers/nvme/target/tcp.c` |
+| host driver | `drivers/nvme/host/tcp.c` (remap, TLB flush, batched completion), `drivers/nvme/host/zcopy_mem.c` (mmu notifier) |
+| host block / fs | `block/zcopy_ctx.c`, `include/linux/zcopy_ctx.h`, `include/linux/zcopy_mem.h`, `block/bio.c`, `block/fops.c`, `fs/iomap/direct-io.c`, `lib/iov_iter.c` |
+
+The TCP core (`net/ipv4`), `net/core/{gro,page_pool,skbuff}.c` and `mm/` are
+unchanged.
