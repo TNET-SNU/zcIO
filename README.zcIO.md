@@ -5,7 +5,7 @@ to both ends of NVMe/TCP, on top of a shared mlx5 mechanism:
 
 | Feature | What it does | Switch |
 |---|---|---|
-| **Host (initiator) RX zero-copy** | Read data arriving from the target is remapped into the reader's buffer instead of copied | `nvme_tcp.rx_zc` (int) |
+| **Host (initiator) RX zero-copy** | Read data arriving from the target is remapped into the reader's buffer instead of copied | `nvme_tcp.rx_zc` (bool) |
 | **Target (nvmet) RX zero-copy** | Write data arriving from the host is put into the I/O scatterlist instead of copied | `nvmet_tcp.rx_zc` (bool) |
 | **NIC: 4K stride + PDU-header fixup** | mlx5 receives payload into whole 4K page-pool pages and hands a ToS-marked PDU header back to the payload | `rx_zc_stride` (mlx5 ethtool priv-flag), `mlx5_core.rx_zc_tos_mask` |
 
@@ -77,7 +77,7 @@ echo Y | sudo tee /sys/module/nvme_tcp/parameters/rx_zc_batch_flush
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `rx_zc` | 0 | remap received read data into the reader's buffer |
+| `rx_zc` | N | remap received read data into the reader's buffer |
 | `rx_zc_batch_flush` | N | complete requests from a per-queue worker that flushes the TLB once per batch (applies to queues connected afterwards) |
 | `rx_zc_batch_pages` | 64 | staged pages that start a batch flush |
 | `rx_zc_idle_us` | 50 | flush a partial batch after this idle time |

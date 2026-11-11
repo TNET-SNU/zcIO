@@ -46,7 +46,7 @@ struct my_bio_private {
 };
 
 /* Host RX zero-copy switch, a module param of nvme-tcp (built-in). */
-extern int nvme_host_rx_zc;
+extern bool nvme_host_rx_zc;
 
 static inline struct my_ctx *zc_bio_ctx(struct bio *bio)
 {

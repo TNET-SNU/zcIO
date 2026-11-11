@@ -67,10 +67,10 @@ MODULE_PARM_DESC(tls_handshake_timeout,
  * Also needs the mlx5 rx_zc_stride priv-flag and a sender that marks
  * PDU-header segments (net.ipv4.nvme_pdu_align=2).
  */
-int nvme_host_rx_zc;
+bool nvme_host_rx_zc;
 /* "rx_zc" in sysfs; the symbol stays unique as block/ and iomap use it */
-module_param_named(rx_zc, nvme_host_rx_zc, int, 0644);
-MODULE_PARM_DESC(rx_zc, "zcIO: remap received data into the reader's buffer: Default 0");
+module_param_named(rx_zc, nvme_host_rx_zc, bool, 0644);
+MODULE_PARM_DESC(rx_zc, "zcIO: remap received data into the reader's buffer: Default false");
 EXPORT_SYMBOL_GPL(nvme_host_rx_zc);
 
 static bool nvme_tcp_rx_zc_batch_flush;
