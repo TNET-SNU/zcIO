@@ -119,6 +119,7 @@ enum nvmet_tcp_recv_state {
 enum {
 	NVMET_TCP_F_INIT_FAILED = (1 << 0),
 	NVMET_TCP_F_ZC_PAGES	= (1 << 1),	/* req->sg holds page-pool pages */
+	NVMET_TCP_F_ZC_LAZY	= (1 << 2),	/* req->sg pages filled on receive */
 };
 
 struct nvmet_tcp_cmd {
@@ -248,6 +249,12 @@ static inline bool nvmet_tcp_has_data_in(struct nvmet_tcp_cmd *cmd)
 {
 	return nvme_is_write(cmd->req.cmd) &&
 		cmd->rbytes_done < cmd->req.transfer_len;
+}
+
+static bool nvmet_tcp_zc_enabled(struct nvmet_tcp_queue *queue)
+{
+	return READ_ONCE(nvmet_rx_zc) && !queue->tls_pskid &&
+	       queue->sock->ops->read_sock;
 }
 
 static inline bool nvmet_tcp_need_data_in(struct nvmet_tcp_cmd *cmd)
@@ -386,7 +393,8 @@ static void nvmet_tcp_free_cmd_buffers(struct nvmet_tcp_cmd *cmd)
 	kfree(cmd->iov);
 	if (cmd->flags & NVMET_TCP_F_ZC_PAGES)
 		nvmet_tcp_zc_put_pages(cmd);
-	sgl_free(cmd->req.sg);
+	cmd->flags &= ~NVMET_TCP_F_ZC_LAZY;
+	sgl_free(cmd->req.sg);	/* skips entries that never got a page */
 	cmd->iov = NULL;
 	cmd->req.sg = NULL;
 }
@@ -439,6 +447,32 @@ static void nvmet_tcp_socket_error(struct nvmet_tcp_queue *queue, int status)
 		nvmet_tcp_fatal_error(queue);
 }
 
+/*
+ * A scatterlist of @len bytes in page-sized entries without pages: with RX
+ * zero-copy most of them get a page-pool page from the network, the rest
+ * a page when their data is copied (nvmet_tcp_zc_recv_actor()).  Allocating
+ * and zeroing pages up front only to free them on receive was the main
+ * cost of the zero-copy path.  Freed with sgl_free().
+ */
+static struct scatterlist *nvmet_tcp_zc_sgl_alloc(u32 len, unsigned int *nents)
+{
+	unsigned int n = DIV_ROUND_UP(len, PAGE_SIZE), i;
+	struct scatterlist *sgl, *sg;
+
+	sgl = kmalloc_array(n, sizeof(*sgl), GFP_KERNEL);
+	if (!sgl)
+		return NULL;
+	sg_init_table(sgl, n);
+	for_each_sg(sgl, sg, n, i) {
+		u32 l = min_t(u32, len, PAGE_SIZE);
+
+		sg_set_page(sg, NULL, l, 0);
+		len -= l;
+	}
+	*nents = n;
+	return sgl;
+}
+
 static int nvmet_tcp_map_data(struct nvmet_tcp_cmd *cmd)
 {
 	struct nvme_sgl_desc *sgl = &cmd->req.cmd->common.dptr.sgl;
@@ -458,7 +492,13 @@ static int nvmet_tcp_map_data(struct nvmet_tcp_cmd *cmd)
 	}
 	cmd->req.transfer_len += len;
 
-	cmd->req.sg = sgl_alloc(len, GFP_KERNEL, &cmd->req.sg_cnt);
+	if (nvmet_tcp_has_data_in(cmd) && nvmet_tcp_zc_enabled(cmd->queue)) {
+		cmd->req.sg = nvmet_tcp_zc_sgl_alloc(len, &cmd->req.sg_cnt);
+		if (cmd->req.sg)
+			cmd->flags |= NVMET_TCP_F_ZC_LAZY;
+	} else {
+		cmd->req.sg = sgl_alloc(len, GFP_KERNEL, &cmd->req.sg_cnt);
+	}
 	if (!cmd->req.sg)
 		return NVME_SC_INTERNAL;
 	cmd->cur_sg = cmd->req.sg;
@@ -1280,18 +1320,13 @@ static void nvmet_tcp_prep_recv_ddgst(struct nvmet_tcp_cmd *cmd)
 	queue->rcv_state = NVMET_TCP_RECV_DDGST;
 }
 
-static bool nvmet_tcp_zc_enabled(struct nvmet_tcp_queue *queue)
-{
-	return READ_ONCE(nvmet_rx_zc) && !queue->tls_pskid &&
-	       queue->sock->ops->read_sock;
-}
-
 /*
- * read_sock() actor for the data of the current PDU.  Walks the transfer in
- * page steps: a page-aligned 4K that is one whole page-pool frag replaces
- * the req->sg page at that index, anything else is copied into req->sg via
- * the PDU iovec.  Consumes at most desc->count bytes, i.e. never past the
- * end of the PDU data.
+ * read_sock() actor for the data of the current PDU of a NVMET_TCP_F_ZC_LAZY
+ * command.  Walks the transfer in page steps: a page-aligned 4K that is one
+ * whole page-pool frag becomes the req->sg page at that index, anything
+ * else is copied into that entry's page, allocated on first use.  The PDU
+ * iovec only tracks progress.  Consumes at most desc->count bytes, i.e.
+ * never past the end of the PDU data.
  */
 static int nvmet_tcp_zc_recv_actor(read_descriptor_t *desc,
 				   struct sk_buff *skb, unsigned int offset,
@@ -1321,7 +1356,8 @@ static int nvmet_tcp_zc_recv_actor(read_descriptor_t *desc,
 			if (page) {
 				/* hold it until nvmet_tcp_zc_put_pages() */
 				page_pool_ref_page(page);
-				__free_page(sg_page(sg));
+				if (sg_page(sg))
+					__free_page(sg_page(sg));
 				sg_set_page(sg, page, PAGE_SIZE, 0);
 				cmd->flags |= NVMET_TCP_F_ZC_PAGES;
 				iov_iter_advance(iter, PAGE_SIZE);
@@ -1332,9 +1368,29 @@ static int nvmet_tcp_zc_recv_actor(read_descriptor_t *desc,
 
 		/* copy up to the next page boundary of the transfer */
 		chunk = min_t(size_t, left, PAGE_SIZE - offset_in_page(xoff));
-		if (skb_copy_datagram_iter(skb, offset + done, iter, chunk)) {
-			desc->error = -EFAULT;
-			break;
+		{
+			struct scatterlist *sg = &cmd->req.sg[xoff >> PAGE_SHIFT];
+			void *dst;
+			int err;
+
+			if (!sg_page(sg)) {
+				struct page *p = alloc_page(GFP_KERNEL);
+
+				if (!p) {
+					desc->error = -ENOMEM;
+					break;
+				}
+				sg_set_page(sg, p, sg->length, 0);
+			}
+			dst = kmap_local_page(sg_page(sg));
+			err = skb_copy_bits(skb, offset + done,
+					    dst + offset_in_page(xoff), chunk);
+			kunmap_local(dst);
+			if (err) {
+				desc->error = -EFAULT;
+				break;
+			}
+			iov_iter_advance(iter, chunk);
 		}
 next:
 		done += chunk;
@@ -1374,7 +1430,7 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
 	struct nvmet_tcp_cmd  *cmd = queue->cmd;
 	int len, ret;
 
-	if (nvmet_tcp_zc_enabled(queue)) {
+	if (cmd->flags & NVMET_TCP_F_ZC_LAZY) {
 		ret = nvmet_tcp_try_recv_data_zc(queue);
 		if (ret)
 			return ret;
