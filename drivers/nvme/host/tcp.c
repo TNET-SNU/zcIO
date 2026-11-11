@@ -68,8 +68,9 @@ MODULE_PARM_DESC(tls_handshake_timeout,
  * PDU-header segments (net.ipv4.nvme_pdu_align=2).
  */
 int nvme_host_rx_zc;
-module_param(nvme_host_rx_zc, int, 0644);
-MODULE_PARM_DESC(nvme_host_rx_zc, "zcIO: remap received data into the reader's buffer: Default 0");
+/* "rx_zc" in sysfs; the symbol stays unique as block/ and iomap use it */
+module_param_named(rx_zc, nvme_host_rx_zc, int, 0644);
+MODULE_PARM_DESC(rx_zc, "zcIO: remap received data into the reader's buffer: Default 0");
 EXPORT_SYMBOL_GPL(nvme_host_rx_zc);
 
 static bool nvme_tcp_rx_zc_batch_flush;

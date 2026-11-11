@@ -83,9 +83,9 @@ MODULE_PARM_DESC(idle_poll_period_usecs,
  * data PDU header in the TCP header (ToS-marked, see mlx5 rx_zc_tos_mask).
  */
 static bool nvmet_rx_zc;
-module_param(nvmet_rx_zc, bool, 0644);
-MODULE_PARM_DESC(nvmet_rx_zc,
-		 "Place received data pages in the I/O scatterlist instead of copying: Default false");
+module_param_named(rx_zc, nvmet_rx_zc, bool, 0644);
+MODULE_PARM_DESC(rx_zc,
+		 "zcIO: place received data pages in the I/O scatterlist instead of copying: Default false");
 
 #ifdef CONFIG_NVME_TARGET_TCP_TLS
 /*

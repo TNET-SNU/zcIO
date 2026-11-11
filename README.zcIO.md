@@ -5,11 +5,13 @@ to both ends of NVMe/TCP, on top of a shared mlx5 mechanism:
 
 | Feature | What it does | Switch |
 |---|---|---|
-| **Host (initiator) RX zero-copy** | Read data arriving from the target is remapped into the reader's buffer instead of copied | `nvme_tcp.nvme_host_rx_zc` (int) |
-| **Target (nvmet) RX zero-copy** | Write data arriving from the host is put into the I/O scatterlist instead of copied | `nvmet_tcp.nvmet_rx_zc` (bool) |
+| **Host (initiator) RX zero-copy** | Read data arriving from the target is remapped into the reader's buffer instead of copied | `nvme_tcp.rx_zc` (int) |
+| **Target (nvmet) RX zero-copy** | Write data arriving from the host is put into the I/O scatterlist instead of copied | `nvmet_tcp.rx_zc` (bool) |
 | **NIC: 4K stride + PDU-header fixup** | mlx5 receives payload into whole 4K page-pool pages and hands a ToS-marked PDU header back to the payload | `rx_zc_stride` (mlx5 ethtool priv-flag), `mlx5_core.rx_zc_tos_mask` |
 
-All switches default to off. With them off, the receive paths behave as in
+Both modules name their switch `rx_zc`; the other host parameters are
+`rx_zc_batch_*` / `rx_zc_idle_us` next to it. (Builds before 2026-11-11 called
+them `nvme_host_rx_zc` and `nvmet_rx_zc`.) All switches default to off. With them off, the receive paths behave as in
 vanilla v6.11; only a few "is zero-copy on?" checks are left in them.
 
 How it works: the **sender** puts the 24-byte header of each NVMe/TCP data PDU
@@ -68,14 +70,14 @@ With it off, the stride is the stock one and the PDU-header fixup is skipped.
 ## 2. Host (initiator) RX zero-copy
 
 ```bash
-echo 1 | sudo tee /sys/module/nvme_tcp/parameters/nvme_host_rx_zc
+echo 1 | sudo tee /sys/module/nvme_tcp/parameters/rx_zc
 # optional batched TLB flush; read at connect time, so set it before connecting
 echo Y | sudo tee /sys/module/nvme_tcp/parameters/rx_zc_batch_flush
 ```
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `nvme_host_rx_zc` | 0 | remap received read data into the reader's buffer |
+| `rx_zc` | 0 | remap received read data into the reader's buffer |
 | `rx_zc_batch_flush` | N | complete requests from a per-queue worker that flushes the TLB once per batch (applies to queues connected afterwards) |
 | `rx_zc_batch_pages` | 64 | staged pages that start a batch flush |
 | `rx_zc_idle_us` | 50 | flush a partial batch after this idle time |
@@ -107,7 +109,7 @@ reference is still held, so it is returned exactly once, also after mremap().
 
 ```bash
 sudo modprobe nvmet-tcp
-echo 1 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
+echo 1 | sudo tee /sys/module/nvmet_tcp/parameters/rx_zc
 ```
 
 **How:**
@@ -119,7 +121,7 @@ echo 1 | sudo tee /sys/module/nvmet_tcp/parameters/nvmet_rx_zc
 3. When the command completes, the page-pool pages go back to their pool.
 
 Whether a command uses zero-copy is decided when it arrives, so changing
-`nvmet_rx_zc` at runtime is safe. Any listener port works. Data digest works,
+`rx_zc` at runtime is safe. Any listener port works. Data digest works,
 because it is computed over `req->sg`. Reads and TLS queues stay on the
 vanilla path.
 
@@ -131,9 +133,9 @@ Lab scripts live outside the tree, in `~/nvme-tcp-scripts` on creek1/creek2:
 
 | Script | Node | Purpose |
 |---|---|---|
-| `initiator-zc-enable.sh` / `-disable.sh` | host | `nvme_host_rx_zc`, batch flush, `rx_zc_stride` |
+| `initiator-zc-enable.sh` / `-disable.sh` | host | `nvme_tcp.rx_zc`, batch flush, `rx_zc_stride` |
 | `initiator-zc-leak-test.sh` (+ `zc-leak-test.c`) | host | page-pool `inflight` before/after 2000 x 1MB reads per release path: reuse, munmap, madvise, mremap, exit. A leak shows as ~512000 pages |
-| `target-zc-enable.sh` / `-disable.sh` | target | `nvmet_rx_zc`, `rx_zc_stride` |
+| `target-zc-enable.sh` / `-disable.sh` | target | `nvmet_tcp.rx_zc`, `rx_zc_stride` |
 | `target-zc-check.sh` | target | bpftrace count of 4K chunks taken by zero-copy vs. copied. Start it before the load when the target has one core |
 | `target-ssd-clean.sh` | target | nvme-format the 9100 PRO SSDs before a write run |
 | `initiator-pdu-align.sh` | sender | `net.ipv4.nvme_pdu_align` |
