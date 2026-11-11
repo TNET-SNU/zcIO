@@ -23,7 +23,7 @@ DEFINE_HASHTABLE(zcopy_ctx_hash, 8);
 DEFINE_SPINLOCK(zcopy_ctx_lock);
 
 /* Drop the temporary refs taken at invalidate_range_start and the pp refs. */
-static void zcopy_free_inv_range(struct zcopy_inv_range *ir)
+static void zcopy_free_inv_range_pages(struct zcopy_inv_range *ir)
 {
 	struct zcopy_inv_batch *b, *bn;
 	int i;
@@ -38,23 +38,65 @@ static void zcopy_free_inv_range(struct zcopy_inv_range *ir)
 		list_del(&b->node);
 		kfree(b);
 	}
+}
+
+static void zcopy_free_inv_range(struct zcopy_inv_range *ir)
+{
+	zcopy_free_inv_range_pages(ir);
 	kfree(ir);
 }
 
-/* Page-pool page mapped at @addr, with a reference taken, or NULL. */
-static struct page *zcopy_peek_pp_page_get(struct vm_area_struct *vma,
-					   unsigned long addr)
+/*
+ * Add the page-pool pages mapped in [@addr, @end) of one PMD to @ir, each
+ * with a temporary reference.  Called from invalidate_range_start, which
+ * may run without mmap_lock (e.g. a COW fault under the per-VMA lock), so
+ * this walks the page table directly instead of looking up VMAs.
+ */
+static void zcopy_collect_pmd(struct mm_struct *mm, pmd_t *pmd,
+			      unsigned long addr, unsigned long end,
+			      struct zcopy_inv_range *ir,
+			      struct zcopy_inv_batch **bp)
 {
-	struct mm_struct *mm = vma->vm_mm;
-	struct page *page, *ret = NULL;
+	pte_t *start_pte, *pte;
 	spinlock_t *ptl;
-	pgd_t *pgd;
+
+	start_pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!start_pte)
+		return;		/* none, or a huge PMD (never ours) */
+	for (pte = start_pte; addr < end; addr += PAGE_SIZE, pte++) {
+		pte_t pteval = ptep_get(pte);
+		struct page *page;
+
+		if (!pte_present(pteval) || pte_special(pteval) ||
+		    !pfn_valid(pte_pfn(pteval)))
+			continue;
+		page = pte_page(pteval);
+		if (!zc_rx_page_is_pp(page) || !get_page_unless_zero(page))
+			continue;
+
+		if (!*bp) {
+			/* under the PTE lock: no sleeping allocation */
+			*bp = kmalloc(sizeof(**bp), GFP_ATOMIC);
+			if (!*bp) {
+				put_page(page);	/* this page stays out of its pool */
+				continue;
+			}
+			(*bp)->nr = 0;
+			list_add_tail(&(*bp)->node, &ir->batches);
+		}
+		(*bp)->pages[(*bp)->nr++] = page;
+		if ((*bp)->nr == ZC_INV_BATCH)
+			*bp = NULL;
+	}
+	pte_unmap_unlock(start_pte, ptl);
+}
+
+static pmd_t *zcopy_find_pmd(struct mm_struct *mm, unsigned long addr)
+{
+	pgd_t *pgd = pgd_offset(mm, addr);
 	p4d_t *p4d;
 	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
 
-	pgd = pgd_offset(mm, addr);
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		return NULL;
 	p4d = p4d_offset(pgd, addr);
@@ -63,18 +105,7 @@ static struct page *zcopy_peek_pp_page_get(struct vm_area_struct *vma,
 	pud = pud_offset(p4d, addr);
 	if (pud_none(*pud) || pud_bad(*pud))
 		return NULL;
-	pmd = pmd_offset(pud, addr);
-
-	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
-	if (!pte)
-		return NULL;
-	if (pte_present(ptep_get(pte))) {
-		page = vm_normal_page(vma, addr, ptep_get(pte));
-		if (page && zc_rx_page_is_pp(page) && get_page_unless_zero(page))
-			ret = page;
-	}
-	pte_unmap_unlock(pte, ptl);
-	return ret;
+	return pmd_offset(pud, addr);
 }
 
 /*
@@ -86,59 +117,40 @@ static int zcopy_mn_invalidate_range_start(struct mmu_notifier *mn,
 					   const struct mmu_notifier_range *range)
 {
 	struct zcopy_ctx *ctx = container_of(mn, struct zcopy_ctx, mn);
-	struct zcopy_inv_range *ir = NULL;
+	struct zcopy_inv_range local, *ir;
 	struct zcopy_inv_batch *b = NULL;
-	struct vm_area_struct *vma = NULL;
-	unsigned long addr;
+	unsigned long addr, next;
 
-	/* munmap (UNMAP) and zap_page_range_single(), e.g. madvise (CLEAR) */
+	/* munmap (UNMAP); zap_page_range_single() e.g. madvise, and COW (CLEAR) */
 	if (range->event != MMU_NOTIFY_UNMAP && range->event != MMU_NOTIFY_CLEAR)
 		return 0;
 	if (!mmu_notifier_range_blockable(range))
 		return 0;
 
-	for (addr = range->start & PAGE_MASK; addr < range->end; addr += PAGE_SIZE) {
-		struct page *page;
+	/* this runs on every COW fault: allocate only if a pool page is found */
+	INIT_LIST_HEAD(&local.batches);
+	for (addr = range->start & PAGE_MASK; addr < range->end; addr = next) {
+		pmd_t *pmd;
 
-		if (!vma || addr >= vma->vm_end) {
-			vma = find_vma(range->mm, addr);
-			if (!vma || vma->vm_start >= range->end)
-				break;
-			if (addr < vma->vm_start)
-				addr = vma->vm_start;
-		}
-
-		page = zcopy_peek_pp_page_get(vma, addr);
-		if (!page)
-			continue;
-
-		if (!ir) {
-			ir = kmalloc(sizeof(*ir), GFP_KERNEL);
-			if (!ir)
-				goto drop;
-			INIT_LIST_HEAD(&ir->batches);
-			ir->cookie = range;
-		}
-		if (!b) {
-			b = kmalloc(sizeof(*b), GFP_KERNEL);
-			if (!b)
-				goto drop;
-			b->nr = 0;
-			list_add_tail(&b->node, &ir->batches);
-		}
-		b->pages[b->nr++] = page;
-		if (b->nr == ZC_INV_BATCH)
-			b = NULL;
-		continue;
-drop:
-		put_page(page);	/* out of memory: this page stays out of its pool */
+		next = pmd_addr_end(addr, range->end);
+		pmd = zcopy_find_pmd(range->mm, addr);
+		if (pmd && !pmd_none(*pmd))
+			zcopy_collect_pmd(range->mm, pmd, addr, next, &local, &b);
 	}
+	if (list_empty(&local.batches))
+		return 0;
 
-	if (ir) {
-		spin_lock(&ctx->lock);
-		list_add_tail(&ir->node, &ctx->inv_ranges);
-		spin_unlock(&ctx->lock);
+	ir = kmalloc(sizeof(*ir), GFP_KERNEL);
+	if (!ir) {
+		zcopy_free_inv_range_pages(&local);	/* give them back right away */
+		return 0;
 	}
+	INIT_LIST_HEAD(&ir->batches);
+	list_splice(&local.batches, &ir->batches);
+	ir->cookie = range;
+	spin_lock(&ctx->lock);
+	list_add_tail(&ir->node, &ctx->inv_ranges);
+	spin_unlock(&ctx->lock);
 	return 0;
 }
 
