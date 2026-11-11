@@ -1,5 +1,6 @@
 #include <linux/zcopy_ctx.h>
 #include <linux/slab.h>
+#include <linux/sched/mm.h>
 
 
 extern int nvme_host_rx_zc;
@@ -54,28 +55,8 @@ struct my_ctx *init_my_ctx_heap(int nr_pages, struct mm_struct *mm)
         ctx->zc_rss_delta[i] = 0;
     }
 
-    //mmgrab(mm);
-    ctx->mm = mm;
-
-    return ctx;
-}
-
-static struct my_ctx *init_my_ctx_inline(struct my_bio_private *priv, int nr_pages, struct mm_struct *mm)
-{
-    if (!READ_ONCE(nvme_host_rx_zc))
-        return NULL;
-
-    struct my_ctx *ctx = &priv->inline_ctx;
-
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->inline_ctx = true;
-    ctx->user_addr = ctx->inline_user_addr;
-    ctx->old_pages = ctx->inline_old_pages;
-
-    ctx->magic = MY_CTX_MAGIC;
-    ctx->nr_pages = nr_pages;
-    ctx->index = 0;
-
+    /* the remap and TLB flush may run after the reader has exited */
+    mmgrab(mm);
     ctx->mm = mm;
 
     return ctx;
@@ -83,14 +64,6 @@ static struct my_ctx *init_my_ctx_inline(struct my_bio_private *priv, int nr_pag
 
 struct my_ctx *init_my_ctx(struct my_bio_private *priv, int nr_pages, struct mm_struct *mm)
 {
-    if (!READ_ONCE(nvme_host_rx_zc))
-        return NULL;
-
-    /* 작은 I/O는 inline으로: 4K/8K/16K(1/2/4 pages)에서 kvmalloc 제거 */
-    //if ((unsigned)nr_pages <= MYCTX_INLINE_PAGES) {
-     //   return init_my_ctx_inline(priv, nr_pages, mm);
-   // }
-
     return init_my_ctx_heap(nr_pages, mm);
 }
 
@@ -101,9 +74,9 @@ void free_my_ctx(struct my_ctx *ctx)
         return;
 
     ctx->index = 0;
-    //ctx->old_nr_pages = 0;
     if (!ctx->inline_ctx) {
-        kvfree(ctx); 
+        mmdrop(ctx->mm);
+        kvfree(ctx);
     }
 }
 

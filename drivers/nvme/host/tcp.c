@@ -655,6 +655,8 @@ static void nvme_tcp_error_recovery(struct nvme_ctrl *ctrl)
 	queue_work(nvme_reset_wq, &to_tcp_ctrl(ctrl)->err_work);
 }
 
+static void nvme_tcp_zc_flush_rq(struct request *rq);
+
 static int nvme_tcp_process_nvme_cqe(struct nvme_tcp_queue *queue,
 		struct nvme_completion *cqe)
 {
@@ -674,6 +676,7 @@ static int nvme_tcp_process_nvme_cqe(struct nvme_tcp_queue *queue,
 	if (req->status == cpu_to_le16(NVME_SC_SUCCESS))
 		req->status = cqe->status;
 
+	nvme_tcp_zc_flush_rq(rq);
 	if (!nvme_try_complete_req(rq, req->status, cqe->result))
 		nvme_complete_rq(rq);
 	queue->nr_cqe++;
@@ -874,403 +877,217 @@ static inline void nvme_tcp_end_request(struct request *rq, u16 status)
 {
 	union nvme_result res = {};
 
+	nvme_tcp_zc_flush_rq(rq);
 	if (!nvme_try_complete_req(rq, cpu_to_le16(status << 1), res))
 		nvme_complete_rq(rq);
 }
 
-static inline void apply_rss_delta_vec(struct mm_struct *mm, long *rss)
-{
-	int c;
-	for (c = 0; c < NR_MM_COUNTERS; c++) {
-		long d = rss[c];
-		if (d)
-			add_mm_counter(mm, c, d);
-	}
-}
+/*
+ * zcIO host RX zero-copy: received page-pool pages are mapped into the
+ * reader's buffer in place of its own pages.  The old PTEs are cleared
+ * without a TLB flush; the range is accumulated in the ctx and flushed
+ * (zc_flush_ctx()) right away, or in batches by nvme_tcp_zc_flush_workfn()
+ * with rx_zc_batch_flush.  Either way it happens before the request
+ * completes (nvme_tcp_zc_flush_rq()).
+ */
 
-static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **new_pages, int nr_pages) {
-	struct my_bio_private *priv = bio->bi_private;
-	struct my_ctx *ctx;
-	struct mm_struct *mm;
-	int success_count = 0;
-	size_t i;
-
-	size_t start = start_idx;
-	size_t end = start + nr_pages;
-	
-	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC))	return 0;
-
-	ctx = priv->ctx;
-	if (unlikely(!ctx)) return 0;
-
-	mm = ctx->mm;
-	if (unlikely(!mm))	return 0;
-
-	if (in_softirq() || in_interrupt()) {
-		if (unlikely(!down_read_trylock(&mm->mmap_lock)))
-			return 0;
-	}
-	else {
-		if (unlikely(!down_read_trylock(&mm->mmap_lock)))
-			down_read(&mm->mmap_lock);
-	}
-
-	unsigned long mm_flush_min = ULONG_MAX, mm_flush_max = 0;
-	long *rss_delta = ctx->zc_rss_delta;
-
-	struct vm_area_struct *cur_vma = NULL;
-	unsigned long vma_end = 0;
-	for (i = start; i < end;) {
-		unsigned long addr = ctx->user_addr[i];
-		struct vm_area_struct *vma = NULL;
-
-		if (cur_vma && addr < vma_end && addr >= cur_vma->vm_start){
-			vma = cur_vma;
-		}
-		else {
-			vma = vma_lookup(mm, addr);
-			if (!vma || addr < vma->vm_start || addr >= vma->vm_end) {i++; continue;}
-			if (unlikely(vma->vm_flags & VM_PFNMAP)) {i++; continue;}
-			cur_vma = vma;
-			vma_end = cur_vma->vm_end;
-		}
-
-        unsigned long run_start = addr;
-		unsigned long run_end = addr + PAGE_SIZE;
-		unsigned long pmd_cap = pmd_addr_end(run_start, vma->vm_end);
-
-		size_t j = i + 1;
-		for (; j < end; j++) {
-			unsigned long a = ctx->user_addr[j];
-			if (unlikely(!a)) {
-				pr_info("a is NULL\n");
-				break;
-			}
-			if (a != run_end)
-				break;
-			if (run_end >= pmd_cap)
-				break;
-			run_end += PAGE_SIZE;
-		}
-
-		pmd_t *pmd = pmd_offset(
-			pud_offset(p4d_offset(pgd_offset(mm, run_start), run_start), run_start),
-			run_start);
-		if (unlikely(pmd_none(*pmd) || pmd_bad(*pmd))) {
-			i = j;
-			continue;
-		}
-		if (unlikely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd))) {
-			split_huge_pmd(vma, pmd, run_start);
-			if (unlikely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd))) {
-				i = j;
-				continue;
-			}
-		}
-
-		spinlock_t *ptl;
-		pte_t *ptep0 = pte_offset_map_lock(mm, pmd, run_start, &ptl);
-		pte_t *pbase = ptep0 - pte_index(run_start);
-
-		bool vma_write = !!(vma->vm_flags & VM_WRITE);
-		bool is_anon   = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
-
-		pte_t *p = pbase + pte_index(run_start);
-		unsigned long a = run_start;
-
-		for (size_t k = i; k < j; k++, a += PAGE_SIZE, p++) {
-			pte_t old = READ_ONCE(*p);
-
-			if (likely(pte_present(old))) {
-				old = ptep_get_and_clear(mm, a, p);
-
-				struct page  *old_page = pte_page(old);
-				struct folio *old_f    = page_folio(old_page);
-
-				rss_delta[mm_counter(old_f)]--;
-				folio_remove_rmap_ptes(old_f, old_page, 1, vma);
-
-				// old page 관리: pp만 모으고, normal은 여기서 put 
-				if (likely(ctx->old_nr_pages < ctx->nr_pages)) {
-					if (unlikely(!zc_rx_page_is_pp(old_page))) {
-						//pr_info("[stage_remap_pages] old_page: %px, ref count: %d\n", old_page, page_ref_count(old_page), atomic_long_read(&old_page->pp_ref_count));
-						put_page(old_page);
-					} else {
-						ctx->old_pages[ctx->old_nr_pages++] = old_page;
-						//trace_printk("[stage_remap_pages] old_page: %px\n", old_page);
-					}
-				} else {
-					// overflow면 안전하게 normal 처리 
-					pr_info("[overflow] old_page: %px\n", old_page);
-					//if (unlikely(!zc_rx_page_is_pp(old_page)))
-						//put_page(old_page);
-				}
-			}
-		
-			if (pte_none(old) || pte_present(old)) {
-				struct page *new_page = new_pages[k-start];
-				struct folio *new_f = page_folio(new_page);
-				pte_t np = mk_pte(new_page, vma->vm_page_prot);
-				//if (vma_write) {
-				if (vma->vm_flags & VM_WRITE) {
-					np = pte_mkwrite(np, vma);
-					np = pte_mkdirty(np);
-				}
-				np = pte_mkyoung(np);
-
-				set_pte_at(mm, a, p, np);
-
-				bool is_anon = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
-				if (is_anon) {
-					folio_add_anon_rmap_ptes(new_f, new_page, 1, vma, a, RMAP_NONE);
-				}
-				else {
-					folio_add_file_rmap_ptes(new_f, new_page, 1, vma);
-				}
-				rss_delta[mm_counter(new_f)]++;
-			}
-
-			//ctx->user_addr[k] = 0;
-		}
-
-		pte_unmap_unlock(ptep0, ptl);
-
-		if (run_start < mm_flush_min)
-			mm_flush_min = run_start;
-		if (run_end > mm_flush_max)
-			mm_flush_max = run_end;
-
-		success_count += (j - i);
-		i = j;
-	}
-
-	up_read(&mm->mmap_lock);
-
-	if (mm_flush_min < mm_flush_max) {
-		ctx->zc_staged = true;
-		ctx->zc_flush_min = mm_flush_min;
-		ctx->zc_flush_max = mm_flush_max;
-		ctx->zc_staged_pages = success_count;
-	} 
-
-	//pr_info("stage_remap_pages success_count=%d\n", success_count);
-	return success_count;
-}
-static int zc_finish_cleanup_ctx(struct request *rq)
-{
-	int done_pages = 0;
-	for (struct bio *bio = rq->bio; bio; bio = bio->bi_next) {
-		struct my_bio_private *priv = bio->bi_private;
-		if (!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)
-			continue;
-		struct my_ctx *ctx = priv->ctx;
-		if (!ctx || ctx->magic != MY_CTX_MAGIC)
-			continue;
-	
-		struct mm_struct *mm = ctx->mm;
-
-		/* RSS 적용 */
-		apply_rss_delta_vec(mm, ctx->zc_rss_delta);
-
-		ctx->zc_staged = false;
-		done_pages += ctx->zc_staged_pages;
-		ctx->zc_staged_pages = 0;
-	}
-    return done_pages;
-}
-
-
-//static int batch_remap_pages(struct bio *bio)
-static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **new_pages, int nr_pages)
+static struct my_ctx *zc_bio_ctx(struct bio *bio)
 {
 	struct my_bio_private *priv = bio->bi_private;
-	struct my_ctx *ctx = NULL;
-	struct mm_struct *mm = NULL;
-	int success_count = 0;
-	size_t i;
 
+	if (!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)
+		return NULL;
+	if (!priv->ctx || priv->ctx->magic != MY_CTX_MAGIC)
+		return NULL;
+	return priv->ctx;
+}
 
-	size_t start = start_idx;
-	size_t end = start + (size_t)nr_pages;
-	
+/* Apply the RSS change of the staged remaps of @ctx, after its TLB flush. */
+static void zc_account_ctx(struct my_ctx *ctx)
+{
+	int i;
 
-	if (unlikely(!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)){
-		pr_info("[zerocopy] batch_remap FAIL: priv=NULL or priv->magic != MY_BIO_PRIVATE_MAGIC\n");
-		return 0;
+	for (i = 0; i < NR_MM_COUNTERS; i++) {
+		if (ctx->zc_rss_delta[i])
+			add_mm_counter(ctx->mm, i, ctx->zc_rss_delta[i]);
+		ctx->zc_rss_delta[i] = 0;
 	}
+	ctx->zc_flush_min = ULONG_MAX;
+	ctx->zc_flush_max = 0;
+	ctx->zc_staged = false;
+}
 
-	ctx = priv->ctx;
-	if (unlikely(!ctx)){
-		pr_info("[zerocopy] batch_remap FAIL: ctx=NULL\n");
-		return 0;
+static void zc_flush_ctx(struct my_ctx *ctx)
+{
+	if (!ctx->zc_staged)
+		return;
+	if (ctx->zc_flush_min < ctx->zc_flush_max)
+		flush_tlb_mm_range(ctx->mm, ctx->zc_flush_min, ctx->zc_flush_max,
+				   PAGE_SHIFT, false);
+	zc_account_ctx(ctx);
+}
+
+/*
+ * A request with staged remaps must have its TLB flushed before it
+ * completes: the reader could otherwise still see its old pages through a
+ * stale TLB entry, and those pages are unpinned on completion.
+ */
+static void nvme_tcp_zc_flush_rq(struct request *rq)
+{
+	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
+	struct bio *bio;
+
+	if (likely(!req->zc_staged_pages))
+		return;
+	for (bio = rq->bio; bio; bio = bio->bi_next) {
+		struct my_ctx *ctx = zc_bio_ctx(bio);
+
+		if (ctx)
+			zc_flush_ctx(ctx);
 	}
+	req->zc_staged_pages = 0;
+}
 
-	mm = ctx->mm;
-//	int start = ctx->next_flush_index; // mostly 0
-//	int end = start + ctx->pending_cnt;
+static pmd_t *zc_find_pmd(struct mm_struct *mm, unsigned long addr)
+{
+	pgd_t *pgd = pgd_offset(mm, addr);
+	p4d_t *p4d;
+	pud_t *pud;
 
-	if (unlikely(!mm )){
-		pr_info("[zerocopy] batch_remap FAIL: mm=%p\n", 
-			mm);
-		return 0;
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return NULL;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return NULL;
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return NULL;
+	return pmd_offset(pud, addr);
+}
+
+/*
+ * The user page a remap replaced.  A normal page only loses its PTE
+ * reference here; the bio still pins it until completion, which follows
+ * the TLB flush.  A page-pool page from an earlier zero-copy read must not
+ * go back to its pool before the flush, so it is returned at bio
+ * completion through ctx->old_pages.
+ */
+static void zc_ctx_put_old_page(struct my_ctx *ctx, struct page *page)
+{
+	if (!zc_rx_page_is_pp(page)) {
+		put_page(page);
+		return;
 	}
+	/* each user page is replaced at most once per ctx */
+	if (WARN_ON_ONCE(ctx->old_nr_pages >= ctx->nr_pages))
+		return;
+	ctx->old_pages[ctx->old_nr_pages++] = page;
+}
 
-	// 소프트IRQ 문맥이면 절대 sleep 금지: trylock 실패시 빠르게 탈출 
-	if (in_softirq() || in_interrupt()) {
-		if (unlikely(!down_read_trylock(&mm->mmap_lock)))
+/*
+ * Map @new_pages[0..@nr_pages) at ctx->user_addr[@start_idx...], each
+ * holding a page reference for its PTE.  Stops at the first page it cannot
+ * map and returns how many leading pages were mapped; the caller drops the
+ * references of the rest and copies their data instead.
+ */
+static int zc_remap_pages(struct my_ctx *ctx, size_t start_idx,
+			  struct page **new_pages, int nr_pages)
+{
+	struct mm_struct *mm = ctx->mm;
+	struct vm_area_struct *vma = NULL;
+	int done = 0;
+
+	if (unlikely(!mm || !mmget_not_zero(mm)))
+		return 0;
+	if (!mmap_read_trylock(mm)) {
+		if (in_interrupt()) {
+			mmput_async(mm);
 			return 0;
-	} else {
-		// workqueue/kthread 문맥이면 실패 시 블로킹락 폴백 
-		if (unlikely(!down_read_trylock(&mm->mmap_lock)))
-			down_read(&mm->mmap_lock);
+		}
+		mmap_read_lock(mm);
 	}
 
-	//pr_info("[[[ batch remap start : page count = %d\n", end - start);
-	unsigned long mm_flush_min = ULONG_MAX, mm_flush_max = 0;
-	long rss_delta[NR_MM_COUNTERS] = {0}; 
-
-	struct vm_area_struct *cur_vma = NULL;
-	unsigned long vma_end = 0;	
-	for (i = start; i < end;) {
-		unsigned long addr = ctx->user_addr[i];
-		struct vm_area_struct *vma = NULL;
-
-		if (cur_vma && addr < vma_end && addr >= cur_vma->vm_start){
-			vma = cur_vma;
-		}
-		else {
-			vma = vma_lookup(mm, addr);
-			if (!vma || addr < vma->vm_start || addr >= vma->vm_end) {i++; continue;}
-			if (unlikely(vma->vm_flags & VM_PFNMAP)) {i++; continue;}
-			cur_vma = vma;
-			vma_end = cur_vma->vm_end;
-		}
-
-		// 같은 pmd 안에서 연속인 run 경계를 찾자
-		unsigned long run_start = addr;
-		unsigned long run_end   = addr + PAGE_SIZE;
-		unsigned long pmd_cap = pmd_addr_end(run_start, vma->vm_end);
-
-		size_t j = i + 1;
-		for (; j < end; j++) {
-			unsigned long a = ctx->user_addr[j];
-			if (unlikely(!a)) {
-				pr_info("a is NULL\n");
-				break;
-			}
-			if (a != run_end) break;               // 비연속이면 중단
-			// pmd 경계 넘어가면 중단
-			if (run_end >= pmd_cap) break;
-			run_end += PAGE_SIZE;
-		}
-
-		// 이제 [i..j-1]가 같은 pmd의 연속 페이지 run
-		pmd_t *pmd = pmd_offset(
-			pud_offset(p4d_offset(pgd_offset(mm, run_start), run_start), run_start), run_start);
-		if (unlikely(pmd_none(*pmd) || pmd_bad(*pmd))) {
-			i = j;
-			continue;
-		}
-		if (unlikely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd))) {
-			split_huge_pmd(vma, pmd, run_start);
-			if (unlikely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd))) {
-				// split 지연/실패: 안전하게 이 run은 건너뛰기
-				i = j; 
-				continue;
-			}
-		}
-		
+	while (done < nr_pages) {
+		unsigned long addr = ctx->user_addr[start_idx + done];
+		unsigned long end;
+		pte_t *start_pte, *pte;
 		spinlock_t *ptl;
-		pte_t *ptep0 = pte_offset_map_lock(mm, pmd, run_start, &ptl);
-		pte_t *pbase = ptep0 - pte_index(run_start);
+		pmd_t *pmd;
+		int run, k;
 
-		// 1) old PTE들 clear (flush 보류)
-		for (size_t k = i; k < j; k++) {
-			unsigned long a = ctx->user_addr[k];
-			//pr_info("user_address: %lx\n", a);
-			pte_t *p = pbase + pte_index(a);
-
-			if (likely(k + 1 < j)) {
-				unsigned long na = ctx->user_addr[k + 1];
-				prefetchw(pbase + pte_index(na));
-
-				int ni = (int)((k + 1) - start);
-				if (likely((unsigned)ni < (unsigned)nr_pages))
-					prefetchw(&new_pages[ni]->flags);
-			}
-
-
-			pte_t old = READ_ONCE(*p);
-			
-			if (likely(pte_present(old))){
-				old = ptep_get_and_clear(mm, a, p);  // 여기선 flush 안 함
-
-				struct page *old_page = pte_page(old);
-				struct folio *old_f = page_folio(old_page);
-				// rmap & RSS 감소
-				rss_delta[mm_counter(old_f)]--;
-				folio_remove_rmap_ptes(old_f, old_page, 1, vma);
-
-				if (ctx->old_nr_pages >= ctx->nr_pages) {
-					pr_info("[batch_remap_pages] old_nr_pages overflow: %d > %d\n",
-							ctx->old_nr_pages, ctx->nr_pages);
-				} else {
-					if (unlikely(!zc_rx_page_is_pp(old_page))){
-//						pr_info("[batch_remap_pages] old_page is not pp page: %px, ref count: %d\n", old_page, page_ref_count(old_page));
-						put_page(old_page);
-					}
-					else {
-						ctx->old_pages[ctx->old_nr_pages++] = old_page;
-					}
-				}
-			}	
-			if (pte_none(old) || pte_present(old)){
-				struct page *new_page = new_pages[k-start];
-				struct folio *new_f   = page_folio(new_page);
-				pte_t np = mk_pte(new_page, vma->vm_page_prot);
-				if (vma->vm_flags & VM_WRITE){
-					np = pte_mkwrite(np, vma);
-					np = pte_mkdirty(np);
-				}
-				np = pte_mkyoung(np);
-
-				bool is_anon = (vma->vm_file == NULL && !(vma->vm_flags & VM_PFNMAP));
-				set_pte_at(mm, a, p, np);
-				if (is_anon){
-					folio_add_anon_rmap_ptes(new_f, new_page, 1, vma, a, RMAP_NONE);
-				}
-				else{
-					folio_add_file_rmap_ptes(new_f, new_page, 1, vma);
-				}
-				rss_delta[mm_counter(new_f)]++;
-			}
-			else {
-				pr_info("pte_none(old) or pte_present(old) is not true\n");
-			}
-		
-			//ctx->user_addr[k] = 0;
+		if (unlikely(!addr || !PAGE_ALIGNED(addr)))
+			break;
+		if (!vma || addr < vma->vm_start || addr >= vma->vm_end) {
+			vma = vma_lookup(mm, addr);
+			/* private anonymous memory only, e.g. a malloc()ed buffer */
+			if (!vma || vma->vm_file || !vma->anon_vma ||
+			    (vma->vm_flags & (VM_SHARED | VM_PFNMAP | VM_MIXEDMAP | VM_IO)))
+				break;
 		}
 
-	
-		pte_unmap_unlock(ptep0, ptl);
+		/* a run of contiguous addresses within this VMA and one PMD */
+		end = pmd_addr_end(addr, vma->vm_end);
+		for (run = 1; done + run < nr_pages; run++) {
+			unsigned long a = addr + run * PAGE_SIZE;
 
-		if (run_start < mm_flush_min) mm_flush_min = run_start;
-		if (run_end   > mm_flush_max) mm_flush_max = run_end;
-		success_count += (j - i);
-		i = j;
+			if (a >= end || ctx->user_addr[start_idx + done + run] != a)
+				break;
+		}
+
+		pmd = zc_find_pmd(mm, addr);
+		if (!pmd)
+			break;
+		if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd))
+			split_huge_pmd(vma, pmd, addr);
+		start_pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+		if (!start_pte)
+			break;
+
+		for (k = 0, pte = start_pte; k < run; k++, pte++) {
+			unsigned long a = addr + k * PAGE_SIZE;
+			struct page *new = new_pages[done + k];
+			struct folio *nf = page_folio(new);
+			pte_t old = ptep_get(pte);
+			pte_t entry;
+
+			if (pte_present(old)) {
+				struct page *op = vm_normal_page(vma, a, old);
+
+				/* the shared zero page has no rmap or RSS to undo */
+				if (!op && !is_zero_pfn(pte_pfn(old)))
+					break;
+				ptep_get_and_clear(mm, a, pte);
+				if (op) {
+					ctx->zc_rss_delta[mm_counter(page_folio(op))]--;
+					folio_remove_rmap_ptes(page_folio(op), op, 1, vma);
+					zc_ctx_put_old_page(ctx, op);
+				}
+			} else if (!pte_none(old)) {
+				break;	/* swap or migration entry: copy instead */
+			}
+
+			entry = pte_mkyoung(mk_pte(new, vma->vm_page_prot));
+			if (vma->vm_flags & VM_WRITE)
+				entry = pte_mkdirty(pte_mkwrite(entry, vma));
+			folio_add_anon_rmap_ptes(nf, new, 1, vma, a, RMAP_NONE);
+			set_pte_at(mm, a, pte, entry);
+			ctx->zc_rss_delta[mm_counter(nf)]++;
+		}
+		pte_unmap_unlock(start_pte, ptl);
+
+		if (k) {
+			ctx->zc_flush_min = min(ctx->zc_flush_min, addr);
+			ctx->zc_flush_max = max(ctx->zc_flush_max, addr + k * PAGE_SIZE);
+			ctx->zc_staged = true;
+		}
+		done += k;
+		if (k < run)
+			break;
 	}
 
-
-	// === 배치 종료: 여기서 단 한 번 TLBI & free & RSS 적용 === 
-	if (mm_flush_min < mm_flush_max) {
-		flush_tlb_mm_range(mm, mm_flush_min, mm_flush_max, PAGE_SHIFT, false);
-	}
-
-	apply_rss_delta_vec(mm, rss_delta);
-
-	up_read(&mm->mmap_lock);
-	//pr_info("batch remap end : page count = %d ]]]\n", success_count);
-	return success_count;
+	mmap_read_unlock(mm);
+	mmput_async(mm);
+	return done;
 }
 
 static inline void zc_unwind_pages(struct page **pages, int nr)
@@ -1284,6 +1101,24 @@ static inline void zc_unwind_pages(struct page **pages, int nr)
     }
 }
 
+
+/* Remap one staged chunk; on a partial remap drop the refs of the rest. */
+static int zc_map_chunk(struct nvme_tcp_request *req, struct my_ctx *ctx,
+			size_t base, struct page **pages, int nr)
+{
+	int rc = zc_remap_pages(ctx, base, pages, nr);
+
+	if (nvme_tcp_rx_zc_batch_flush)
+		req->zc_staged_pages += rc;	/* flushed before completion */
+	else
+		zc_flush_ctx(ctx);
+
+	if (rc != nr) {
+		zc_unwind_pages(pages + rc, nr - rc);
+		return -1;
+	}
+	return 0;
+}
 
 static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb, struct nvme_tcp_request *req,
                               int recv_len, unsigned int offset)
@@ -1372,43 +1207,17 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
         page_idx++;
 		cur_off += PAGE_SIZE;
 
-		if (chunk_cnt == ZC_MAX_STAGE_PAGES){
-			int rc = 0;
-			if (nvme_tcp_rx_zc_batch_flush){
-				rc = stage_remap_pages(req->curr_bio, chunk_base, new_pages, chunk_cnt);
-			}
-			else {
-				rc = batch_remap_pages(req->curr_bio, chunk_base, new_pages, chunk_cnt);
-			}
-
-			if (rc != chunk_cnt){
-				zc_unwind_pages(new_pages, chunk_cnt);
-				pr_info("batch_remap_pages failed: rc:%d != chunk_cnt:%d\n", rc, chunk_cnt);
+		if (chunk_cnt == ZC_MAX_STAGE_PAGES) {
+			if (zc_map_chunk(req, ctx, chunk_base, new_pages, chunk_cnt))
 				return -1;
-			}
-			req->zc_staged_pages += chunk_cnt;
 			chunk_cnt = 0;
 			chunk_base = page_idx;
 		}
     }
 
 
-	if (chunk_cnt > 0){
-		int rc = 0;
-		if (nvme_tcp_rx_zc_batch_flush){
-			rc = stage_remap_pages(req->curr_bio, chunk_base, new_pages, chunk_cnt);
-		}
-		else {
-			rc = batch_remap_pages(req->curr_bio, chunk_base, new_pages, chunk_cnt);
-		}
-		if (rc != chunk_cnt){
-			zc_unwind_pages(new_pages, chunk_cnt);
-			pr_info("batch_remap_pages failed: rc:%d != chunk_cnt:%d\n", rc, chunk_cnt);
-			return -1;
-		}
-		req->zc_staged_pages += chunk_cnt;
-		chunk_cnt = 0;
-	}
+	if (chunk_cnt > 0 && zc_map_chunk(req, ctx, chunk_base, new_pages, chunk_cnt))
+		return -1;
 
     /* 여기 오면 아직 flush 타이밍이 아니라는 뜻: 성공적으로 stage 됐다고 보고 0 */
     return 0;
@@ -1421,138 +1230,110 @@ error:
     return -1;
 }
 
-#define ZC_FLUSH_CHUNK 256
-#define ZC_CTX_MAX     2048   /* batch 내 ctx 최대치 가드 */
+#define ZC_FLUSH_CHUNK	64	/* requests completed per worker pass */
+#define ZC_FLUSH_MMS	8	/* distinct mms merged per pass */
+
 struct mm_range {
-    struct mm_struct *mm;
-    unsigned long min, max;
+	struct mm_struct *mm;
+	unsigned long min, max;
 };
 
-static inline bool zc_ctx_flushable(struct my_ctx *ctx)
+/* Add the staged range of each ctx of @rq to @mrs, merged per mm. */
+static void zc_collect_ranges(struct request *rq, struct mm_range *mrs,
+			      u32 *mcnt)
 {
-    return ctx && ctx->zc_staged &&
-           ctx->mm &&
-           (ctx->zc_flush_min < ctx->zc_flush_max);
+	struct bio *bio;
+
+	for (bio = rq->bio; bio; bio = bio->bi_next) {
+		struct my_ctx *ctx = zc_bio_ctx(bio);
+		u32 j;
+
+		if (!ctx || !ctx->zc_staged ||
+		    ctx->zc_flush_min >= ctx->zc_flush_max)
+			continue;
+		for (j = 0; j < *mcnt; j++)
+			if (mrs[j].mm == ctx->mm)
+				break;
+		if (j == *mcnt) {
+			if (*mcnt == ZC_FLUSH_MMS) {
+				zc_flush_ctx(ctx);	/* no slot left */
+				continue;
+			}
+			mrs[j].mm = ctx->mm;
+			mrs[j].min = ULONG_MAX;
+			mrs[j].max = 0;
+			(*mcnt)++;
+		}
+		mrs[j].min = min(mrs[j].min, ctx->zc_flush_min);
+		mrs[j].max = max(mrs[j].max, ctx->zc_flush_max);
+	}
 }
 
-static inline bool zc_ctx_seen(struct my_ctx **arr, u32 n, struct my_ctx *ctx)
+/* Account the ctxs of @rq once their ranges were flushed. */
+static void zc_account_rq(struct request *rq)
 {
-    for (u32 i = 0; i < n; i++)
-        if (arr[i] == ctx)
-            return true;
-    return false;
-}
+	struct bio *bio;
 
-/* (1) rq의 bio 체인에서 ctx들을 모으고, (2) mm_range를 merge, (3) cleanup 대상 ctx list에 담기 */
-static void zc_collect_ctx_and_ranges(struct request *rq,
-                                     struct mm_range *mrs, u32 *mcnt)
-{
-    struct bio *bio;
+	for (bio = rq->bio; bio; bio = bio->bi_next) {
+		struct my_ctx *ctx = zc_bio_ctx(bio);
 
-    for (bio = rq->bio; bio; bio = bio->bi_next) {
-        struct my_bio_private *priv;
-        struct my_ctx *ctx;
-
-        priv = bio->bi_private;
-        if (!priv || priv->magic != MY_BIO_PRIVATE_MAGIC)
-            continue;
-
-        ctx = priv->ctx;
-        if (!zc_ctx_flushable(ctx))
-            continue;
-
-        /* mm range merge */
-        {
-            struct mm_struct *mm = ctx->mm;
-            bool merged = false;
-
-            for (u32 j = 0; j < *mcnt; j++) {
-                if (mrs[j].mm == mm) {
-                    if (ctx->zc_flush_min < mrs[j].min) mrs[j].min = ctx->zc_flush_min;
-                    if (ctx->zc_flush_max > mrs[j].max) mrs[j].max = ctx->zc_flush_max;
-                    merged = true;
-                    break;
-                }
-            }
-
-            if (!merged && *mcnt < ZC_FLUSH_CHUNK) {
-                mrs[*mcnt].mm  = mm;
-                mrs[*mcnt].min = ctx->zc_flush_min;
-                mrs[*mcnt].max = ctx->zc_flush_max;
-                (*mcnt)++;
-            }
-        }
-    }
+		if (ctx && ctx->zc_staged)
+			zc_account_ctx(ctx);
+	}
 }
 
 static void nvme_tcp_zc_flush_workfn(struct work_struct *work)
 {
-    struct nvme_tcp_queue *q = container_of(work, struct nvme_tcp_queue, zc_flush_work);
-    unsigned long flags;
-    u32 depth = q->zc_queue_depth;
-
-    u16 cids[ZC_FLUSH_CHUNK];
-    u32 cid_cnt = 0;
+	struct nvme_tcp_queue *q = container_of(work, struct nvme_tcp_queue, zc_flush_work);
 	struct request *rqs[ZC_FLUSH_CHUNK];
-	u32 rq_cnt = 0;
-	
+	struct mm_range mrs[ZC_FLUSH_MMS];
+	u16 cids[ZC_FLUSH_CHUNK];
+	u32 depth = q->zc_queue_depth;
+	u32 cid_cnt = 0, rq_cnt = 0, mcnt = 0, done_pages = 0, i;
+	unsigned long flags;
+	bool more;
+
 	if (unlikely(!depth || !q->zc_pend_cids))
-	{
-		pr_info("[nvme_tcp_zc_flush_workfn] depth or q->zc_pend_cids is null\n");
-    	return;
+		return;
+
+	spin_lock_irqsave(&q->zc_lock, flags);
+	while (q->zc_cnt && cid_cnt < ZC_FLUSH_CHUNK) {
+		cids[cid_cnt++] = q->zc_pend_cids[q->zc_head];
+		q->zc_head = (q->zc_head + 1) % depth;
+		q->zc_cnt--;
 	}
+	spin_unlock_irqrestore(&q->zc_lock, flags);
 
-	// 1) pop chunk 
-    spin_lock_irqsave(&q->zc_lock, flags);
-    while (q->zc_cnt && cid_cnt < ARRAY_SIZE(cids)) {
-        cids[cid_cnt++] = q->zc_pend_cids[q->zc_head];
-        q->zc_head = (q->zc_head + 1) % depth;
-        q->zc_cnt--;
-    }
-
-
-    spin_unlock_irqrestore(&q->zc_lock, flags);
-
-	if (!cid_cnt) return;
-
-	struct mm_range mrs[ZC_FLUSH_CHUNK];
-    u32 mcnt = 0;
-
-	u32 miss = 0;
-
-    for (u32 i = 0; i < cid_cnt; i++) {
+	for (i = 0; i < cid_cnt; i++) {
 		struct request *rq = nvme_find_rq(nvme_tcp_tagset(q), cids[i]);
-		if (!rq) {
-			miss++;
+
+		if (!rq)
 			continue;
-		}
 		rqs[rq_cnt++] = rq;
-		zc_collect_ctx_and_ranges(rq, mrs, &mcnt);
+		zc_collect_ranges(rq, mrs, &mcnt);
 	}
 
-    for (u32 i = 0; i < mcnt; i++) {
-        flush_tlb_mm_range(mrs[i].mm, mrs[i].min, mrs[i].max, PAGE_SHIFT, false);
-    }
+	for (i = 0; i < mcnt; i++)
+		flush_tlb_mm_range(mrs[i].mm, mrs[i].min, mrs[i].max,
+				   PAGE_SHIFT, false);
 
-	int done_pages = 0;
-    for (u32 i = 0; i < rq_cnt; i++) {
-        done_pages += zc_finish_cleanup_ctx(rqs[i]);
+	for (i = 0; i < rq_cnt; i++) {
 		struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rqs[i]);
-		nvme_tcp_end_request(rqs[i], le16_to_cpu(req->status));
-    }
-    q->nr_cqe += rq_cnt;
-    q->zc_pending_pages -= done_pages;
 
-    spin_lock_irqsave(&q->zc_lock, flags);
-    bool more = (q->zc_cnt != 0);
-    spin_unlock_irqrestore(&q->zc_lock, flags);
-    
-	if (more){
+		zc_account_rq(rqs[i]);
+		done_pages += req->zc_staged_pages;
+		req->zc_staged_pages = 0;
+		nvme_tcp_end_request(rqs[i], le16_to_cpu(req->status));
+	}
+	q->nr_cqe += rq_cnt;
+
+	spin_lock_irqsave(&q->zc_lock, flags);
+	q->zc_pending_pages -= done_pages;
+	more = q->zc_cnt != 0;
+	spin_unlock_irqrestore(&q->zc_lock, flags);
+
+	if (more)
 		queue_work(q->zc_wq, &q->zc_flush_work);
-	}
-	if (unlikely(miss)){
-        pr_info("[zc_flush] miss rq=%u (cid_cnt=%u rq_cnt=%u)\n", miss, cid_cnt, rq_cnt);
-	}
 }
 
 static enum hrtimer_restart nvme_tcp_zc_idle_timer_fn(struct hrtimer *t)
@@ -3653,6 +3434,7 @@ static blk_status_t nvme_tcp_queue_rq(struct blk_mq_hw_ctx *hctx,
 	nvme_start_request(rq);
 
 	req->zc_policy = ZC_UNDECIDED;
+	req->zc_staged_pages = 0;
 
 	nvme_tcp_queue_request(req, true, bd->last);
 
@@ -3707,10 +3489,22 @@ done:
 	return len;
 }
 
+/*
+ * Completions that bypass nvme_tcp_end_request() (timeout, cancel).
+ * flush_tlb_mm_range() must not run in a bottom half; those are only
+ * remote completions of the normal path, which flushed already.
+ */
+static void nvme_tcp_complete_rq(struct request *rq)
+{
+	if (!in_interrupt())
+		nvme_tcp_zc_flush_rq(rq);
+	nvme_complete_rq(rq);
+}
+
 static const struct blk_mq_ops nvme_tcp_mq_ops = {
 	.queue_rq	= nvme_tcp_queue_rq,
 	.commit_rqs	= nvme_tcp_commit_rqs,
-	.complete	= nvme_complete_rq,
+	.complete	= nvme_tcp_complete_rq,
 	.init_request	= nvme_tcp_init_request,
 	.exit_request	= nvme_tcp_exit_request,
 	.init_hctx	= nvme_tcp_init_hctx,

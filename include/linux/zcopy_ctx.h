@@ -39,7 +39,6 @@ struct my_ctx {
   unsigned long zc_flush_min;
   unsigned long zc_flush_max;
   long zc_rss_delta[NR_MM_COUNTERS];
-  int zc_staged_pages;
 
   int error; 
 };
