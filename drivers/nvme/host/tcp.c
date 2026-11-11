@@ -28,6 +28,7 @@
 /* rx-zcopy */
 #include <linux/rmap.h>
 #include <net/page_pool/helpers.h>
+#include <net/zc_rx.h>
 #include <linux/hugetlb.h>
 #include <linux/zcopy_ctx.h>
 #include <linux/mm.h>
@@ -186,16 +187,6 @@ enum nvme_tcp_recv_state {
 };
 
 
-struct zc_skb_cursor {
-	struct sk_buff *root;   /* 커서가 유효한 “root skb” */
-	struct sk_buff *skb;    /* 현재 스캔 중인 skb: root 또는 frag_list 요소 */
-	struct sk_buff *fskb;   /* frag_list 체인에서 현재 skb (root이면 NULL) */
-
-	unsigned int base;      /* 현재 skb의 stream base (root 기준 offset) */
-	unsigned int pos;       /* 현재 frag의 start offset (root 기준) */
-	int frag;               /* 현재 skb에서 다음으로 볼 frag index */
-};
-
 struct nvme_tcp_zc_pend_ent {
 	struct request *rq;
 	u32 pages;  /* staged pages 힌트 */
@@ -253,7 +244,7 @@ struct nvme_tcp_queue {
     u64 zc_last_defer_ns;   /* last enqueue timestamp */
 	bool zc_shutting_down;
 	atomic_t zc_idle_armed;
-	struct zc_skb_cursor zc_cur;
+	struct zc_rx_cursor zc_cur;
 
 
 	void (*state_change)(struct sock *);
@@ -887,12 +878,6 @@ static inline void nvme_tcp_end_request(struct request *rq, u16 status)
 		nvme_complete_rq(rq);
 }
 
-/* rx-zcopy */
-static inline bool is_pp_page(struct page *page)
-{
-	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
-}
-
 static inline void apply_rss_delta_vec(struct mm_struct *mm, long *rss)
 {
 	int c;
@@ -1007,7 +992,7 @@ static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 
 				// old page 관리: pp만 모으고, normal은 여기서 put 
 				if (likely(ctx->old_nr_pages < ctx->nr_pages)) {
-					if (unlikely(!is_pp_page(old_page))) {
+					if (unlikely(!zc_rx_page_is_pp(old_page))) {
 						//pr_info("[stage_remap_pages] old_page: %px, ref count: %d\n", old_page, page_ref_count(old_page), atomic_long_read(&old_page->pp_ref_count));
 						put_page(old_page);
 					} else {
@@ -1017,7 +1002,7 @@ static int stage_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 				} else {
 					// overflow면 안전하게 normal 처리 
 					pr_info("[overflow] old_page: %px\n", old_page);
-					//if (unlikely(!is_pp_page(old_page)))
+					//if (unlikely(!zc_rx_page_is_pp(old_page)))
 						//put_page(old_page);
 				}
 			}
@@ -1230,7 +1215,7 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 					pr_info("[batch_remap_pages] old_nr_pages overflow: %d > %d\n",
 							ctx->old_nr_pages, ctx->nr_pages);
 				} else {
-					if (unlikely(!is_pp_page(old_page))){
+					if (unlikely(!zc_rx_page_is_pp(old_page))){
 //						pr_info("[batch_remap_pages] old_page is not pp page: %px, ref count: %d\n", old_page, page_ref_count(old_page));
 						put_page(old_page);
 					}
@@ -1286,131 +1271,6 @@ static int batch_remap_pages(struct bio *bio, size_t start_idx, struct page **ne
 	up_read(&mm->mmap_lock);
 	//pr_info("batch remap end : page count = %d ]]]\n", success_count);
 	return success_count;
-}
-
-static inline bool zc_is_full_4k_page_frag(const skb_frag_t *f)
-{
-	return skb_frag_size(f) == PAGE_SIZE && skb_frag_off(f) == 0;
-}
-
-static __always_inline void zc_cursor_reset(struct nvme_tcp_queue *q,
-					    struct sk_buff *root)
-{
-	struct zc_skb_cursor *c = &q->zc_cur;
-
-	c->root = root;
-	c->skb  = root;
-	c->fskb = NULL;
-
-	c->base = 0;
-	c->pos  = skb_headlen(root);  /* linear 끝 */
-	c->frag = 0;
-}
-
-static __always_inline bool zc_cursor_next_skb(struct zc_skb_cursor *c)
-{
-	struct sk_buff *next;
-
-	if (!c->fskb) {
-		next = skb_shinfo(c->root)->frag_list;
-		if (!next)
-			return false;
-
-		/* nested frag_list면 여기선 fastpath 포기(원하면 slowpath로) */
-		if (unlikely(skb_shinfo(next)->frag_list))
-			return false;
-
-		/* root의 frags 끝(pos)이 frag_list의 시작 base */
-		c->base = c->pos;
-		c->skb  = next;
-		c->fskb = next;
-	} else {
-		next = c->fskb->next;
-		if (!next)
-			return false;
-
-		if (unlikely(skb_shinfo(next)->frag_list))
-			return false;
-
-		/* 재귀 코드의 pos += fskb->len 과 동일한 의미 */
-		c->base += c->fskb->len;
-		c->skb  = next;
-		c->fskb = next;
-	}
-
-	c->pos  = c->base + skb_headlen(c->skb);
-	c->frag = 0;
-	return true;
-}
-
-
-/* copy fallback 등으로 “커서 신뢰 불가”가 되면 무조건 invalidate */
-static __always_inline void zc_cursor_invalidate(struct nvme_tcp_queue *q)
-{
-	q->zc_cur.root = NULL;
-}
-
-/* return 0 on found, else -ENOENT */
-static int zc_find_next_4k_stateful(struct nvme_tcp_queue *q,
-				   struct sk_buff *root,
-				   unsigned int cur_off,
-				   struct sk_buff **owner,
-				   int *frag_idx,
-				   unsigned int *page_off)
-{
-	struct zc_skb_cursor *c = &q->zc_cur;
-
-	/* 새 skb면 커서 reset */
-	if (unlikely(c->root != root))
-		zc_cursor_reset(q, root);
-
-	/*
-	 * caller가 offset을 “뒤로” 되돌려서 요청하는 경우(재시도/에러 경로 등),
-	 * 이미 커서가 앞으로 전진해 버렸을 수 있으니 reset.
-	 * (정상 경로면 offset은 단조 증가)
-	 */
-	if (unlikely(cur_off < c->base || cur_off < c->pos))
-		zc_cursor_reset(q, root);
-
-	for (;;) {
-		struct skb_shared_info *si = skb_shinfo(c->skb);
-		unsigned int head_end = c->base + skb_headlen(c->skb);
-
-		/* linear 안이면 linear 끝으로 */
-		if (cur_off < head_end)
-			cur_off = head_end;
-
-		/* frags[] 스캔: 커서 위치부터 앞으로만 */
-		while (c->frag < si->nr_frags) {
-			skb_frag_t *f = &si->frags[c->frag];
-			unsigned int start = c->pos;
-			unsigned int end   = start + skb_frag_size(f);
-
-			if (cur_off < end) {
-				/* 경계 정확히 일치 + full 4K page frag면 성공 */
-				if (cur_off == start && likely(zc_is_full_4k_page_frag(f))) {
-					*owner   = c->skb;
-					*frag_idx = c->frag;
-					*page_off = start;
-
-					/* 다음 호출을 위해 커서 advance */
-					c->pos = end;
-					c->frag++;
-					return 0;
-				}
-
-				/* 아니면 이 frag는 통째로 skip */
-				cur_off = end;
-			}
-
-			c->pos = end;
-			c->frag++;
-		}
-
-		/* 이 skb에서 못 찾았으면 frag_list의 다음 skb로 */
-		if (!zc_cursor_next_skb(c))
-			return -ENOENT;
-	}
 }
 
 static inline void zc_unwind_pages(struct page **pages, int nr)
@@ -1492,29 +1352,11 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			trace_printk("ZC BAD: uaddr not aligned: uaddr=%lx\n", uaddr);
 		}
 
-        /* (중요) cur_off에서 '정확히 시작하는' 4K page frag만 remap */
-        struct sk_buff *owner = NULL;
-        int frag_index = -1;
-		unsigned int page_off = 0;
-		if (zc_find_next_4k_stateful(queue, skb, cur_off, &owner, &frag_index, &page_off))
-			goto error;
-		if (unlikely(page_off != cur_off))
-			goto error;
+        /* only a whole page-pool page frag starting exactly at cur_off */
+        struct page *fp = zc_rx_skb_page_at(&queue->zc_cur, skb, cur_off);
 
-        skb_frag_t *frag = &skb_shinfo(owner)->frags[frag_index];
-        /* 이중 체크 */
-        if (unlikely(skb_frag_size(frag) != PAGE_SIZE || skb_frag_off(frag) != 0)) {
-            pr_debug("found frag not remappable? size=%u off=%u\n",
-                    skb_frag_size(frag), skb_frag_off(frag));
+        if (!fp)
             goto error;
-        }
-
-        struct page *fp = skb_frag_page(frag);
-
-        if (unlikely(!is_pp_page(fp))) {
-            pr_debug("not pp page: %px\n", fp);
-            goto error;
-        }
 
         if (!get_page_unless_zero(fp)) {
             pr_info("failed to get_page: %px\n", fp);
@@ -1574,7 +1416,6 @@ static inline int do_zerocopy(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 error:
     pr_debug("[ctx:%px] error - consumed:%zu total:%zu iter_left:%zu\n",
             ctx, consumed, ctx->total_bytes, iov_iter_count(&req->iter));
-	zc_cursor_invalidate(queue);
 	zc_unwind_pages(new_pages, chunk_cnt);
 
     return -1;
@@ -2062,7 +1903,10 @@ static int nvme_tcp_recv_skb(read_descriptor_t *desc, struct sk_buff *skb,
 
 	if (unlikely(!queue->rd_enabled))
 		return -EFAULT;
-	
+
+	/* the ZC cursor caches pointers into this skb: reset per actor call */
+	zc_rx_cursor_init(&queue->zc_cur);
+
 	while (len) {
 		switch (nvme_tcp_recv_state(queue)) {
 		case NVME_TCP_RECV_PDU:

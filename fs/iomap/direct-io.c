@@ -20,13 +20,10 @@
 #include <linux/zcopy_ctx.h>
 #include <net/page_pool/helpers.h>
 #include <linux/zcopy_mem.h>
+#include <net/zc_rx.h>
 
 
 /* rx-zcopy: Page pool 관련 함수들 */
-static inline bool is_pp_page(struct page *page)
-{
-	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
-}
 
 /*
  * Private flags for iomap_dio, must not overlap with the public ones in
@@ -192,7 +189,7 @@ void iomap_my_dio_bio_end_io(struct bio *bio)
 			if (unlikely(!page)){
 				continue;
 			}
-			if (unlikely(!is_pp_page(page))){
+			if (unlikely(!zc_rx_page_is_pp(page))){
 				pr_info("[bio_end_io] [page: %px], is not pp page\n", page);
 				//put_page(page);
 			}

@@ -23,6 +23,7 @@
 #include <net/page_pool/helpers.h>
 #include <linux/zcopy_ctx.h>
 #include <linux/zcopy_mem.h>
+#include <net/zc_rx.h>
 
 
 static inline struct inode *bdev_file_inode(struct file *file)
@@ -280,10 +281,6 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 }
 
 /* rx-zcopy: Page pool 관련 함수들 */
-static inline bool is_pp_page(struct page *page)
-{
-	return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
-}
 
 static void blkdev_my_bio_end_io_async(struct bio *bio)
 {
@@ -305,7 +302,7 @@ static void blkdev_my_bio_end_io_async(struct bio *bio)
 		for (int i = 0; i < ctx->old_nr_pages; i++) {
 			struct page *page = ctx->old_pages[i];
 			if (!page) continue;
-			if (unlikely(!is_pp_page(page))) {
+			if (unlikely(!zc_rx_page_is_pp(page))) {
 				pr_info("page is not pp page: %px\n", page);
 				//put_page(page);
 			}

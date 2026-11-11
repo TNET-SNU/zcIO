@@ -1,15 +1,13 @@
 #include <linux/zcopy_mem.h>
 #include <net/page_pool/helpers.h>
 #include <linux/rmap.h>
+#include <net/zc_rx.h>
 
 DEFINE_HASHTABLE(zcopy_ctx_hash, 8);
 DEFINE_SPINLOCK(zcopy_ctx_lock);
 
 extern int nvme_host_rx_zc;
 
-static bool is_pp_page(struct page *page){
-  return (page->pp_magic & ~0x3UL) == PP_SIGNATURE;
-}
 
 static inline bool batch_contains_page(struct zcopy_inv_batch *b, struct page *page)
 {
@@ -30,7 +28,7 @@ static void zcopy_free_inv_range(struct zcopy_inv_range *ir, struct zcopy_ctx *c
       if (!page) {
         continue;
       }
-      if (unlikely(!is_pp_page(page))) {
+      if (unlikely(!zc_rx_page_is_pp(page))) {
         continue;
       }
 //      int cur_ref = page_ref_dec_return(page);
@@ -226,7 +224,7 @@ static struct page *zcopy_peek_pp_page_get(struct mm_struct *mm, unsigned long a
 
   if (pte_present(*pte)) {
     page = pte_page(*pte);
-    if (page && is_pp_page(page)) {
+    if (page && zc_rx_page_is_pp(page)) {
       if (get_page_unless_zero(page)) {
         pr_debug("[peek_pp_page_get] [page: %px] [ref count: %d] [pp_ref count: %ld]\n", page, page_ref_count(page), atomic_long_read(&page->pp_ref_count));
         ret_page = page;
