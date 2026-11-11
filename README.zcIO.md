@@ -148,12 +148,12 @@ python3 tools/net/ynl/cli.py --spec Documentation/netlink/specs/netdev.yaml \
 ```
 
 Reference numbers (creek1 / creek2, ConnectX, 8x Samsung 9100 PRO, one CPU core
-on the receiving node):
+on the receiving node, fio 8 devices x 4 jobs x iodepth 32):
 
 | Workload | copy (switches off) | zcIO |
 |---|---|---|
-| host: 1MB random read, libaio O_DIRECT | ~34 Gbps | ~75 Gbps |
-| target: 128k write | ~21 Gbps | ~83 Gbps |
+| host: 1MB sequential read, libaio O_DIRECT | ~34 Gbps | ~75 Gbps |
+| target: 1MB sequential write, libaio O_DIRECT | ~21 Gbps | ~83 Gbps |
 
 Both nodes run with `init_on_alloc` on (the Ubuntu default), which zeroes
 every page allocation.
