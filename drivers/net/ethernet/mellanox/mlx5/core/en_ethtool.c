@@ -2322,7 +2322,6 @@ static int set_pflag_tx_port_ts(struct net_device *netdev, bool enable)
 static int set_pflag_rx_zc_stride(struct net_device *netdev, bool enable)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
-	struct mlx5_core_dev *mdev = priv->mdev;
 	struct mlx5e_params new_params;
 
 	/* 4K stride only applies to the striding (MPWQE) RQ path. */

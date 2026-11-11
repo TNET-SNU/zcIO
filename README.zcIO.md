@@ -151,9 +151,12 @@ sudo ethtool --set-priv-flags <dev> rx_zc_stride off
 * The two software toggles are **separate symbols** (`int nvme_host_rx_zc`
   vs `bool nvmet_rx_zc`) so host and target can be enabled independently and
   there is no symbol collision.
-* `rx_zcopy_head_size` (mlx5, default 90) is the SHAMPO split-header size the
-  sender produces for PDU-aligned ZC; it is a separate `nvme_tcp`/mlx5
-  module param and normally does not need changing.
+* The sender marks each doff-inflated data-PDU segment with IP ToS / IPv6
+  TClass bit `0x04` (DSCP LSB, clear of the ECN bits). The receiver matches it
+  with the mlx5 module param `rx_zc_tos_mask` (default `0x04`, `0` disables;
+  `/sys/module/mlx5_core/parameters/rx_zc_tos_mask`), hands the 24-byte PDU
+  header back to the payload and clears the mark. Sender and receiver must
+  agree on the bit.
 * This is research code: there are still debug `pr_info`/`trace_printk`
   statements and commented blocks on the ZC paths. They are inert when the
   toggles are off but should be cleaned before any upstreaming.

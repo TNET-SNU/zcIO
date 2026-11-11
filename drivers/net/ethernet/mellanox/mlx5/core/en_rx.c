@@ -38,6 +38,7 @@
 #include <net/ip6_checksum.h>
 #include <net/page_pool/helpers.h>
 #include <net/inet_ecn.h>
+#include <net/dsfield.h>
 #include <net/gro.h>
 #include <net/udp.h>
 #include <net/tcp.h>
@@ -60,10 +61,91 @@
 #include "devlink.h"
 #include "en/devlink.h"
 
-/*rx-zcopy*/
-static int rx_zcopy_head_size = 90;
-module_param(rx_zcopy_head_size, int, 0644);
-MODULE_PARM_DESC(rx_zcopy_head_size, "RX Zcopy head size");
+/*
+ * zcIO RX zero-copy.
+ *
+ * The NVMe/TCP sender marks the first segment of each data PDU with an IP
+ * ToS / IPv6 Traffic Class bit and inflates its TCP doff by
+ * MLX5E_ZC_PDU_HDR_LEN, so that SHAMPO header-data split puts the 24-byte
+ * data PDU header in the header buffer and the PDU data starts at offset 0
+ * of a stride page.  On RX we hand those 24 bytes back to the payload
+ * (doff -= 6 words) and clear the mark, so the rest of the stack (GRO
+ * compares ToS, TCP ECN reads the DS field) sees an ordinary segment.
+ */
+#define MLX5E_ZC_PDU_HDR_LEN	24	/* sizeof(struct nvme_tcp_data_pdu) */
+
+static unsigned int rx_zc_tos_mask = 0x04;	/* DSCP LSB; avoid the ECN bits (0x03) */
+module_param(rx_zc_tos_mask, uint, 0644);
+MODULE_PARM_DESC(rx_zc_tos_mask,
+		 "zcIO: IP ToS/TClass bit(s) marking a doff-inflated NVMe/TCP data PDU segment (0 = disabled)");
+
+/*
+ * @skb->data points at the L2 header of a SHAMPO header buffer of
+ * @head_size bytes.  Returns the number of header bytes handed back to the
+ * payload: MLX5E_ZC_PDU_HDR_LEN for a marked segment, 0 otherwise (the
+ * packet is then left untouched).
+ */
+static unsigned int mlx5e_zc_unmark_pdu_hdr(struct sk_buff *skb, u16 head_size)
+{
+	u8 mask = READ_ONCE(rx_zc_tos_mask);
+	unsigned int off = ETH_HLEN;
+	struct iphdr *iph = NULL;
+	struct ipv6hdr *ip6h = NULL;
+	struct tcphdr *th;
+	unsigned int thlen;
+	__be16 proto;
+
+	if (!mask || head_size < ETH_HLEN)
+		return 0;
+
+	proto = ((struct ethhdr *)skb->data)->h_proto;
+	if (eth_type_vlan(proto)) {
+		if (head_size < off + VLAN_HLEN)
+			return 0;
+		proto = ((struct vlan_hdr *)(skb->data + off))->h_vlan_encapsulated_proto;
+		off += VLAN_HLEN;
+	}
+
+	if (proto == htons(ETH_P_IP)) {
+		if (head_size < off + sizeof(*iph))
+			return 0;
+		iph = (struct iphdr *)(skb->data + off);
+		if (!(ipv4_get_dsfield(iph) & mask) ||
+		    iph->protocol != IPPROTO_TCP || iph->ihl < 5 ||
+		    ip_is_fragment(iph))
+			return 0;
+		off += iph->ihl * 4;
+	} else if (proto == htons(ETH_P_IPV6)) {
+		if (head_size < off + sizeof(*ip6h))
+			return 0;
+		ip6h = (struct ipv6hdr *)(skb->data + off);
+		if (!(ipv6_get_dsfield(ip6h) & mask) ||
+		    ip6h->nexthdr != IPPROTO_TCP)
+			return 0;
+		off += sizeof(*ip6h);
+	} else {
+		return 0;
+	}
+
+	if (head_size < off + sizeof(*th))
+		return 0;
+	th = (struct tcphdr *)(skb->data + off);
+	thlen = th->doff * 4;
+	/*
+	 * The HW split must end exactly at the (inflated) TCP header, and the
+	 * inflation must leave a valid TCP header behind.
+	 */
+	if (thlen < sizeof(*th) + MLX5E_ZC_PDU_HDR_LEN || off + thlen != head_size)
+		return 0;
+
+	th->doff -= MLX5E_ZC_PDU_HDR_LEN / 4;
+	if (iph)
+		ipv4_change_dsfield(iph, (u8)~mask, 0);	/* also fixes iph->check */
+	else
+		ipv6_change_dsfield(ip6h, (u8)~mask, 0);
+
+	return MLX5E_ZC_PDU_HDR_LEN;
+}
 
 static struct sk_buff *
 mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
@@ -302,11 +384,9 @@ static void mlx5e_page_release_fragmented(struct mlx5e_rq *rq,
 {
 	u16 drain_count = MLX5E_PAGECNT_BIAS_MAX - frag_page->frags;
 	struct page *page = frag_page->page;
-	//trace_printk("[release] page: %px, drain_count: %d, pp_ref_count: %ld\n", page, drain_count, atomic_long_read(&page->pp_ref_count));
-	if (page_pool_unref_page(page, drain_count) == 0){
-		//trace_printk("[release] page_pool_put_unrefed_page: %px, drain_count: %d, pp_ref_count: %ld\n", page, drain_count, atomic_long_read(&page->pp_ref_count));
+
+	if (page_pool_unref_page(page, drain_count) == 0)
 		page_pool_put_unrefed_page(rq->page_pool, page, -1, true);
-	}
 }
 
 static inline int mlx5e_get_rx_frag(struct mlx5e_rq *rq,
@@ -1329,11 +1409,14 @@ static void mlx5e_shampo_update_hdr(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
 
 	if (is_ipv4) {
 		int nhoff = rq->hw_gro_data->fk.control.thoff - sizeof(struct iphdr);
-	/*------------------------------------------------------------*/
 		struct iphdr *ipv4 = (struct iphdr *)(skb->data + nhoff);
-		// __be16 newlen = htons(skb->len - nhoff);
-		__be16 newlen = ((skb->len - nhoff) > 0xFFFF) ? 0 : htons(skb->len - nhoff);
-	/*------------------------------------------------------------*/
+		/*
+		 * hw-GRO can aggregate past 64KB; htons() would truncate the
+		 * length and the stack would trim the payload to it. Use 0
+		 * instead: iph_totlen() then takes the length from skb->len
+		 * (as for IPv4 BIG TCP).
+		 */
+		__be16 newlen = (skb->len - nhoff > 0xFFFF) ? 0 : htons(skb->len - nhoff);
 
 		csum_replace2(&ipv4->check, ipv4->tot_len, newlen);
 		ipv4->tot_len = newlen;
@@ -1624,7 +1707,6 @@ static void mlx5e_shampo_complete_rx_cqe(struct mlx5e_rq *rq,
 	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
 	skb_reset_network_header(skb);
 	if (!skb_flow_dissect_flow_keys(skb, &rq->hw_gro_data->fk, 0)) {
-		pr_info("flow keys failed to be obtained : %px\n", skb);
 		napi_gro_receive(rq->cq.napi, skb);
 		rq->hw_gro_data->skb = NULL;
 	}
@@ -1974,14 +2056,15 @@ mlx5e_shampo_fill_skb_data(struct sk_buff *skb, struct mlx5e_rq *rq,
 			   u32 data_bcnt, u32 data_offset)
 {
 	net_prefetchw(skb->data);
-	//pr_info("data_bcnt : %d, data_offset : %d\n", data_bcnt, data_offset);
+
 	do {
 		/* Non-linear mode, hence non-XSK, which always uses PAGE_SIZE. */
 		u32 pg_consumed_bytes = min_t(u32, PAGE_SIZE - data_offset, data_bcnt);
-	    //pr_info("-- data_bcnt : %d, data_offset : %d\n", data_bcnt, data_offset);
 		unsigned int truesize = pg_consumed_bytes;
+
 		mlx5e_add_skb_frag(rq, skb, frag_page, data_offset,
 				   pg_consumed_bytes, truesize);
+
 		data_bcnt -= pg_consumed_bytes;
 		data_offset = 0;
 		frag_page++;
@@ -2033,7 +2116,7 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
 		va = skb->head;
 		net_prefetchw(va); /* xdp_frame data area */
 		net_prefetchw(skb->data);
-		// 1. set headlen - packet header + 24bytes(if nvme )
+
 		frag_offset += headlen;
 		byte_cnt -= headlen;
 		linear_hr = skb_headroom(skb);
@@ -2208,7 +2291,6 @@ mlx5e_skb_from_cqe_shampo(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 	frag_size	= MLX5_SKB_FRAG_SZ(rx_headroom + head_size);
 
 	if (likely(frag_size <= BIT(MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE))) {
-		//pr_info("[mlx5e_skb_from_cqe_shampo] frag_size=%u\n", frag_size);
 		/* build SKB around header */
 		dma_sync_single_range_for_cpu(rq->pdev, head->addr, 0, frag_size, rq->buff.map_dir);
 		net_prefetchw(hdr);
@@ -2222,7 +2304,6 @@ mlx5e_skb_from_cqe_shampo(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 	} else {
 		/* allocate SKB and copy header for large header */
 		rq->stats->gro_large_hds++;
-		pr_info("alloc skb for large header\n");
 		skb = napi_alloc_skb(rq->cq.napi,
 				     ALIGN(head_size, sizeof(long)));
 		if (unlikely(!skb)) {
@@ -2263,9 +2344,8 @@ mlx5e_shampo_flush_skb(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe, bool match)
 	struct mlx5e_rq_stats *stats = rq->stats;
 	u16 gro_count = NAPI_GRO_CB(skb)->count;
 
-	if (likely(skb_shinfo(skb)->nr_frags)){
+	if (likely(skb_shinfo(skb)->nr_frags))
 		mlx5e_shampo_align_fragment(skb, rq->mpwqe.log_stride_sz);
-	}
 	if (gro_count > 1) {
 		stats->gro_skbs++;
 		stats->gro_packets += gro_count;
@@ -2275,7 +2355,6 @@ mlx5e_shampo_flush_skb(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe, bool match)
 	} else {
 		skb_shinfo(skb)->gso_size = 0;
 	}
-
 	napi_gro_receive(rq->cq.napi, skb);
 	rq->hw_gro_data->skb = NULL;
 }
@@ -2285,80 +2364,7 @@ mlx5e_hw_gro_skb_has_enough_space(struct sk_buff *skb, u16 data_bcnt)
 {
 	int nr_frags = skb_shinfo(skb)->nr_frags;
 
-	//return PAGE_SIZE * nr_frags + data_bcnt <= GRO_LEGACY_MAX_SIZE;
-	if (PAGE_SIZE * nr_frags + data_bcnt <= GRO_LEGACY_MAX_SIZE){
-		return true;
-	} else {
-		//pr_info("skb has not enough space\n");
-		return false;
-	}
-}
-
-static bool mlx5e_flow_keys_equal(const struct flow_keys *a,
-                                  const struct flow_keys *b)
-{
-    if (a->basic.n_proto != b->basic.n_proto)
-        return false;
-    if (a->basic.ip_proto != b->basic.ip_proto)
-        return false;
-    if (a->addrs.v4addrs.src != b->addrs.v4addrs.src ||
-        a->addrs.v4addrs.dst != b->addrs.v4addrs.dst)
-        return false;
-    if (a->ports.src != b->ports.src ||
-        a->ports.dst != b->ports.dst)
-        return false;
-    return true;
-}
-
-// syeon
-#define TCP_DOFF_WORDS_DELTA   (24 / 4)   /* 24 bytes -> 6 words */
-#define TCP_DOFF_MIN_WORDS     5          /* 20B */
-
-static __always_inline bool zc_rollback_tcp_doff_24B(struct sk_buff *skb)
-{
-    unsigned int off = 0;    /* running offset from skb->data */
-    __be16 proto;
-
-    /* L2 */
-    proto = ((struct ethhdr *)(skb->data))->h_proto;
-    off += sizeof(struct ethhdr);
-
-    /* Optional VLAN (환경에 맞게 0~2개 처리) */
-    if (proto == htons(ETH_P_8021Q) || proto == htons(ETH_P_8021AD)) {
-        struct vlan_hdr *vh = (struct vlan_hdr *)(skb->data + off);
-        proto = vh->h_vlan_encapsulated_proto;
-        off += sizeof(struct vlan_hdr);
-    }
-
-    if (proto != htons(ETH_P_IP))
-        return false;
-
-    /* L3 (IPv4 + options) */
-    {
-        struct iphdr *iph = (struct iphdr *)(skb->data + off);
-        unsigned int ihl = iph->ihl * 4;
-
-        if (unlikely(ihl < sizeof(*iph)))
-            return false;
-
-        off += ihl; /* now at TCP header start */
-    }
-
-    /* TCP: byte 12 holds doff in high nibble */
-    {
-        u8 *doff_byte = (u8 *)(skb->data + off + 12);
-        u8 old_doff   = (*doff_byte >> 4) & 0x0F;
-        u8 new_doff;
-
-        if (unlikely(old_doff < TCP_DOFF_MIN_WORDS + TCP_DOFF_WORDS_DELTA))
-            return false; /* underflow 방지 */
-
-        new_doff = old_doff - TCP_DOFF_WORDS_DELTA;
-
-        *doff_byte = (*doff_byte & 0x0F) | (new_doff << 4);
-    }
-
-    return true;
+	return PAGE_SIZE * nr_frags + data_bcnt <= GRO_LEGACY_MAX_SIZE;
 }
 
 static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
@@ -2374,7 +2380,8 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 	u16 head_size		= cqe->shampo.header_size;
 	struct sk_buff **skb	= &rq->hw_gro_data->skb;
 	bool flush		= cqe->shampo.flush;
-	bool match		= cqe->shampo.match; // 다 false로 들어옴
+	bool match		= cqe->shampo.match;
+	unsigned int zc_hdr_len;
 	struct mlx5e_rq_stats *stats = rq->stats;
 	struct mlx5e_rx_wqe_ll *wqe;
 	struct mlx5e_mpw_info *wi;
@@ -2383,18 +2390,6 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 	wi = mlx5e_get_mpw_info(rq, wqe_id);
 	wi->consumed_strides += cstrides;
 
-
-//pr_info("---------------[packet : %d-----------------\n", wqe_offset);
-/*pr_info("HDS: head_size=%u cqe_bcnt=%u, data_bcnt=%u, data_offset=%u,cstrides=%u,stride_size=%u, match=%u flush=%u\n",
-        cqe->shampo.header_size,
-        mpwrq_get_cqe_byte_cnt(cqe),
-        data_bcnt,
-        data_offset,
-        cstrides,
-        rq->mpwqe.log_stride_sz,
-        cqe->shampo.match,
-        cqe->shampo.flush);
-*/
 	if (unlikely(MLX5E_RX_ERR_CQE(cqe))) {
 		mlx5e_handle_rx_err_cqe(rq, cqe);
 		goto mpwrq_cqe_out;
@@ -2406,23 +2401,11 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 		goto mpwrq_cqe_out;
 	}
 
-
-	/*if (*skb) {
-	struct flow_keys fk_new;
-	skb_flow_dissect_flow_keys(*skb, &fk_new, 0);
-	if (!mlx5e_flow_keys_equal(&rq->hw_gro_data->fk, &fk_new)) {
-		pr_info("flow keys are not equal : %px\n", skb);
-	}
-	}
-	*/
-
-
 	if (*skb && (!match || !(mlx5e_hw_gro_skb_has_enough_space(*skb, data_bcnt)))) {
-		//pr_info("match is false : %px\n", skb);
 		match = false;
 		mlx5e_shampo_flush_skb(rq, cqe, match);
 	}
-	
+
 	if (!*skb) {
 		if (likely(head_size))
 			*skb = mlx5e_skb_from_cqe_shampo(rq, wi, cqe, header_index);
@@ -2431,26 +2414,19 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 								  data_offset, page_idx);
 		if (unlikely(!*skb))
 			goto free_hd_entry;
-		/* zcIO: with RX zero-copy stride active, the sender prepends a 24B
-		 * (6-word) PDU-alignment TCP option and the NIC reports a 90B split
-		 * header. Rewrite the TCP data-offset nibble back to 8 words and
-		 * inflate gso_size by 24 so the GRO/stack path stays consistent.
-		 * Gated by rq->mpwqe.zc_stride: with zero-copy OFF this block is
-		 * skipped and behaviour is byte-for-byte vanilla.
-		 */
-		NAPI_GRO_CB(*skb)->count = 1;
-		if (rq->mpwqe.zc_stride && head_size == rx_zcopy_head_size) {
-			u8 *th_off = (*skb)->data + 14 + 20 + 12;
 
-			*th_off = (*th_off & 0x0F) | (8 << 4);
-			skb_shinfo(*skb)->gso_size = cqe_bcnt - head_size + 24;
-		} else {
-			skb_shinfo(*skb)->gso_size = cqe_bcnt - head_size;
-		}
+		/*
+		 * zcIO: a ToS-marked segment carries the PDU header in its TCP
+		 * header. Only on RQs with the rx_zc_stride pflag, so with it off
+		 * this path is vanilla.
+		 */
+		zc_hdr_len = (head_size && rq->mpwqe.zc_stride) ?
+			     mlx5e_zc_unmark_pdu_hdr(*skb, head_size) : 0;
+
+		NAPI_GRO_CB(*skb)->count = 1;
+		skb_shinfo(*skb)->gso_size = cqe_bcnt - head_size + zc_hdr_len;
 	} else {
 		NAPI_GRO_CB(*skb)->count++;
-		//pr_info("NAPI_GRO_CB(*skb)->count: %d\n", NAPI_GRO_CB(*skb)->count);
-		
 		if (NAPI_GRO_CB(*skb)->count == 2 &&
 		    rq->hw_gro_data->fk.basic.n_proto == htons(ETH_P_IP)) {
 			void *hd_addr = mlx5e_shampo_get_packet_hd(rq, header_index);
@@ -2465,6 +2441,7 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 	if (likely(head_size)) {
 		if (data_bcnt) {
 			struct mlx5e_frag_page *frag_page;
+
 			frag_page = &wi->alloc_units.frag_pages[page_idx];
 			mlx5e_shampo_fill_skb_data(*skb, rq, frag_page, data_bcnt, data_offset);
 		} else {
@@ -2472,34 +2449,10 @@ static void mlx5e_handle_rx_cqe_mpwrq_shampo(struct mlx5e_rq *rq, struct mlx5_cq
 			stats->hds_nodata_bytes += head_size;
 		}
 	}
-	// dump skb if first frag page starts with "07 04 18 18"
-/*	
-	if (skb_shinfo(*skb)->nr_frags > 0) {
-		skb_frag_t *f = &skb_shinfo(*skb)->frags[0];
-
-		if (skb_frag_size(f) >= 4) {
-			struct page *page = skb_frag_page(f);
-			unsigned int off  = skb_frag_off(f);
-			void *va          = kmap_local_page(page);
-			const u8 *p       = (const u8 *)va + off;
-
-			if (p[0] == 0x07 && p[1] == 0x04 && p[2] == 0x18 && p[3] == 0x18) {
-				kunmap_local(va);
-				pr_info("[ohmycamisama]] skb: %px\n", *skb);
-				skb_dump(KERN_INFO, *skb, true);
-			} else {
-				kunmap_local(va);
-			}
-		}
-	}
-*/	
 
 	mlx5e_shampo_complete_rx_cqe(rq, cqe, cqe_bcnt, *skb);
-	// skb_dump(KERN_INFO, *skb, false);
-	if (flush && rq->hw_gro_data->skb){
-		//pr_info("flush and skb is not NULL\n");
+	if (flush && rq->hw_gro_data->skb)
 		mlx5e_shampo_flush_skb(rq, cqe, match);
-	}
 free_hd_entry:
 	if (likely(head_size))
 		mlx5e_free_rx_shampo_hd_entry(rq, header_index);

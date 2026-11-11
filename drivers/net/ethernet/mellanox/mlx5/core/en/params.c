@@ -367,7 +367,6 @@ bool mlx5e_rx_mpwqe_is_linear_skb(struct mlx5_core_dev *mdev,
 		return false;
 
 	log_stride_sz = order_base_2(mlx5e_rx_get_linear_stride_sz(mdev, params, xsk, true));
-	//r_info("[mlx5e_rx_mpwqe_is_linear_skb] log_stride_sz=%u\n", log_stride_sz);
 	log_wqe_sz = mlx5e_mpwrq_log_wqe_sz(mdev, page_shift, umr_mode);
 
 	if (log_wqe_sz < log_stride_sz)
