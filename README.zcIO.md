@@ -6,8 +6,8 @@ shared NIC-side mechanism:
 | Feature | What it does | Software toggle |
 |---|---|---|
 | **Initiator (host)** RX zero-copy | NVMe-oF *host* delivers received data straight into the I/O / user buffer (no `skb_copy_datagram_iter`) | `nvme_host_rx_zc` (int, nvme-tcp) |
-| **Target (nvmet)** RX zero-copy | NVMe-oF *target* swaps received NIC pages into the command SGL (no copy in `recvmsg`) | `nvmet_rx_zc` (bool, built-in) |
-| **NIC stride** (shared substrate) | Forces 4K (PAGE_SIZE) mlx5 MPWQE RX stride + SHAMPO TCP-doff/gso fixup that *both* features depend on | `rx_zc_stride` (mlx5 ethtool priv-flag) |
+| **Target (nvmet)** RX zero-copy | NVMe-oF *target* places received NIC pages in the command SGL (`read_sock()` actor, no copy) | `nvmet_rx_zc` (bool, nvmet-tcp) |
+| **NIC stride** (shared substrate) | Forces 4K (PAGE_SIZE) mlx5 MPWQE RX stride + SHAMPO doff/gso fixup of ToS-marked PDU-header segments that *both* features depend on | `rx_zc_stride` (mlx5 ethtool priv-flag) |
 
 > **Key idea:** the two software toggles are fully independent, but **both
 > require the shared `rx_zc_stride` NIC flag to be ON** to actually do
@@ -83,6 +83,16 @@ nvme_tcp.nvme_host_rx_zc=1
 
 **Full host zero-copy =** `rx_zc_stride on` (§1) **AND** `nvme_host_rx_zc=1`.
 
+Covered I/O: async raw block `O_DIRECT` (aio / io_uring) and filesystem
+DIO (iomap), into private anonymous memory (e.g. a `malloc()`ed buffer).
+Other reads are copied. Received pages are remapped into the reader's
+buffer. The TLB is flushed before the request completes, either right
+away or in batches with `rx_zc_batch_flush=1`. The flush happens on the
+CQE path as well, so `--disable-sqflow` is only needed for the batched
+`DATA_SUCCESS` completion. The pages go back to the NIC page pool when
+they are unmapped (munmap, `madvise(MADV_DONTNEED)`, exit), or when the
+same buffer is read again.
+
 ---
 
 ## 3. Target (nvmet) RX zero-copy
@@ -151,9 +161,7 @@ sudo ethtool --set-priv-flags <dev> rx_zc_stride off
   `/sys/module/mlx5_core/parameters/rx_zc_tos_mask`), hands the 24-byte PDU
   header back to the payload and clears the mark. Sender and receiver must
   agree on the bit.
-* This is research code: there are still debug `pr_info`/`trace_printk`
-  statements and commented blocks on the ZC paths. They are inert when the
-  toggles are off but should be cleaned before any upstreaming.
+* Debug output on the ZC paths is `pr_debug` (enable with dynamic debug).
 
 ## 6. Source map (what changed vs vanilla v6.11)
 
