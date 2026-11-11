@@ -3729,6 +3729,8 @@ static void __exit nvme_tcp_cleanup_module(void)
 	flush_workqueue(nvme_delete_wq);
 
 	destroy_workqueue(nvme_tcp_wq);
+	/* zcopy_mem.c notifiers are freed asynchronously */
+	mmu_notifier_synchronize();
 }
 
 module_init(nvme_tcp_init_module);
