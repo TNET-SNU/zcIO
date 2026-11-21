@@ -74,6 +74,17 @@ int sysctl_nvme_pdu_align __read_mostly;
 /* bytes of a data PDU header moved into the TCP header with mode 2 */
 #define NVME_PDU_HDR_IN_TCP	sizeof(struct nvme_tcp_data_pdu)
 
+/*
+ * Data PDUs go out as NVME_PDU_SEG-sized TSO segments, so the socket must be
+ * able to use TSO or GSO, and each of those segments, and the first one with
+ * the PDU header too, must fit the MSS (e.g. an MTU of 9000).  Otherwise the
+ * socket sends as usual.
+ */
+static bool nvme_pdu_align_possible(const struct sock *sk, unsigned int mss_now)
+{
+	return sk_can_gso(sk) && mss_now >= NVME_PDU_SEG + NVME_PDU_HDR_IN_TCP;
+}
+
 static bool is_nvme(const struct sock *sk)
 {
 	u16 sport = ntohs(inet_sk(sk)->inet_sport);
@@ -3059,7 +3070,8 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		int missing_bytes;
 
 #ifdef CONFIG_NVME_TCP_PDU_ALIGN
-		if (sysctl_nvme_pdu_align && is_nvme(sk)) {
+		if (sysctl_nvme_pdu_align && is_nvme(sk) &&
+		    nvme_pdu_align_possible(sk, mss_now)) {
 			l5f = tp->nvme_flow;
 			if (!l5f) {
 				l5f = kzalloc(sizeof(*l5f), GFP_ATOMIC);

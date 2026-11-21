@@ -142,7 +142,17 @@ sudo sysctl -w net.ipv4.nvme_pdu_align=2     # on the node that sends the data
 | 2 | 1, plus each data PDU (C2H `0x07`, H2C `0x06`) starts a segment whose TCP header also carries the 24-byte PDU header (doff +6 words), marked with ToS `0x04` (`NVME_PDU_TOS_MARK`) |
 
 It applies to TCP sockets with a local or remote port in 4420-4430, which
-covers both NVMe/TCP hosts and targets. Its state is kept per socket
+covers both NVMe/TCP hosts and targets, that can actually send that way:
+
+* **TSO or GSO** must be on for the route (`ethtool -k <dev>`:
+  `tcp-segmentation-offload` or `generic-segmentation-offload`), because data
+  PDUs go out as 8K TSO segments;
+* the **MSS must hold 8K plus the 24-byte PDU header**, i.e. a jumbo MTU such
+  as 9000 (not 1500).
+
+Other sockets, and all sockets when these do not hold, send as usual. Set the
+MTU and offloads before connecting: a socket that started PDU-aligned send keeps
+it. Its state is kept per socket
 (`tcp_sock->nvme_flow`, allocated on the first send after it is enabled; a
 socket keeps its PDU-aligned segmentation once it has one). The ToS mark is set
 and cleared through `inet->tos` of those sockets only, so only IPv4 is marked
