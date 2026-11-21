@@ -1,18 +1,23 @@
 # zcIO: NVMe/TCP RX zero-copy (host and target)
 
 This kernel (v6.11 + zcIO, `EXTRAVERSION = -zcio`) adds receive-side zero-copy
-to both ends of NVMe/TCP, on top of a shared mlx5 mechanism:
+to both ends of NVMe/TCP, on top of a shared mlx5 mechanism, and the PDU-aligned
+send that the other end needs for it:
 
 | Feature | What it does | Switch |
 |---|---|---|
 | **Host (initiator) RX zero-copy** | Read data arriving from the target is remapped into the reader's buffer instead of copied | `nvme_tcp.rx_zc` (bool) |
 | **Target (nvmet) RX zero-copy** | Write data arriving from the host is put into the I/O scatterlist instead of copied | `nvmet_tcp.rx_zc` (bool) |
+| **PDU-aligned send** | The sending side segments NVMe/TCP at PDU boundaries and (mode 2) puts each data PDU header in a ToS-marked TCP header | `net.ipv4.nvme_pdu_align` (0/1/2) |
 | **NIC: 4K stride + PDU-header fixup** | mlx5 receives payload into whole 4K page-pool pages and hands a ToS-marked PDU header back to the payload | `rx_zc_stride` (mlx5 ethtool priv-flag), `mlx5_core.rx_zc_tos_mask` |
 
 Both modules name their switch `rx_zc`; the other host parameters are
 `rx_zc_batch_*` / `rx_zc_idle_us` next to it. (Builds before 2026-11-11 called
-them `nvme_host_rx_zc` and `nvmet_rx_zc`.) All switches default to off. With them off, the receive paths behave as in
-vanilla v6.11; only a few "is zero-copy on?" checks are left in them.
+them `nvme_host_rx_zc` and `nvmet_rx_zc`.) The zero-copy switches default to
+off; with them off, the receive paths behave as in vanilla v6.11, with only a
+few "is zero-copy on?" checks left in them. `net.ipv4.nvme_pdu_align`
+defaults to **1**, which changes how NVMe/TCP sockets send (section 4); set it
+to 0 for a vanilla send path.
 
 How it works: the **sender** puts the 24-byte header of each NVMe/TCP data PDU
 into the TCP header (doff +6 words) of the PDU's first segment and marks that
@@ -34,11 +39,10 @@ usual.
 * Install kernel and modules **from the same build** (`make install` and
   `make modules_install`): with `CONFIG_MODVERSIONS` a module from a newer build
   fails to load with `Invalid argument`.
-* A **sender that marks PDU-header segments**: a kernel with PDU-aligned send
-  (branch `pdu_align_only`, or the `5.15.189-pduwin` kernel) and
-  `sysctl -w net.ipv4.nvme_pdu_align=2`. Its mark bit must equal the receiver's
-  `rx_zc_tos_mask` (both `0x04`). Without it nothing breaks, but every byte is
-  copied.
+* A **sender that marks PDU-header segments**: this kernel (or the
+  `5.15.189-pduwin` kernel) with `sysctl -w net.ipv4.nvme_pdu_align=2`
+  (section 4). Its mark bit must equal the receiver's `rx_zc_tos_mask` (both
+  `0x04`). Without it nothing breaks, but every byte is copied.
 
 | Zero-copy on | receives | sender that must mark |
 |---|---|---|
@@ -127,7 +131,28 @@ vanilla path.
 
 ---
 
-## 4. Checking it
+## 4. Sender: PDU-aligned send
+
+```bash
+sudo sysctl -w net.ipv4.nvme_pdu_align=2     # on the node that sends the data
+```
+
+| Value | Effect |
+|---|---|
+| 0 | vanilla TCP send |
+| 1 (default) | TCP segments are cut at NVMe/TCP PDU boundaries |
+| 2 | 1, plus each data PDU (C2H `0x07`, H2C `0x06`) starts a segment whose TCP header also carries the 24-byte PDU header (doff +6 words), marked with ToS `0x04` (`NVME_PDU_TOS_MARK`) |
+
+It applies to TCP sockets with a local or remote port in 4420-4430, which
+covers both NVMe/TCP hosts and targets. Its state is kept per socket
+(`tcp_sock->nvme_flow`, allocated on first send). The ToS mark is set
+through `inet->tos`, so only IPv4 is marked today; the receiver side handles
+IPv6 too. Use 2 on the target to feed host zero-copy, and on the host to feed
+target zero-copy.
+
+---
+
+## 5. Checking it
 
 Lab scripts live outside the tree, in `~/nvme-tcp-scripts` on creek1/creek2:
 
@@ -160,7 +185,7 @@ every page allocation.
 
 ---
 
-## 5. Notes
+## 6. Notes
 
 * With the switches off the paths match vanilla, but `rx_zc_stride` also
   changes the RX stride for all traffic on that NIC.
@@ -174,15 +199,16 @@ every page allocation.
 
 ---
 
-## 6. Source map (vs. vanilla v6.11)
+## 7. Source map (vs. vanilla v6.11)
 
 | Area | Files |
 |---|---|
 | mlx5 | `drivers/net/ethernet/mellanox/mlx5/core/en_rx.c` (PDU-header fixup, `tot_len = 0` above 64KB), `en/params.c`, `en.h`, `en_main.c`, `en_ethtool.c` (`rx_zc_stride`) |
 | shared | `net/core/zc_rx.c`, `include/net/zc_rx.h` (page lookup in an skb, held-reference flag), `include/linux/ip.h` (`ip_transport_len()` with `tot_len == 0`) |
 | target | `drivers/nvme/target/tcp.c` |
+| sender | `net/ipv4/tcp_output.c` (PDU-aligned segmentation, header-in-TCP-header and ToS mark), `net/ipv4/sysctl_net_ipv4.c` (`nvme_pdu_align`), `include/linux/tcp.h`, `include/net/tcp.h` |
 | host driver | `drivers/nvme/host/tcp.c` (remap, TLB flush, batched completion), `drivers/nvme/host/zcopy_mem.c` (mmu notifier) |
 | host block / fs | `block/zcopy_ctx.c`, `include/linux/zcopy_ctx.h`, `include/linux/zcopy_mem.h`, `block/bio.c`, `block/fops.c`, `fs/iomap/direct-io.c`, `lib/iov_iter.c` |
 
-The TCP core (`net/ipv4`), `net/core/{gro,page_pool,skbuff}.c` and `mm/` are
-unchanged.
+The TCP receive path, `net/core/{gro,page_pool,skbuff}.c` and `mm/` are
+unchanged; in `net/ipv4` only the send side (above) is.
