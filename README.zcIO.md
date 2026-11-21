@@ -150,9 +150,12 @@ covers both NVMe/TCP hosts and targets, that can actually send that way:
 * the **MSS must hold 8K plus the 24-byte PDU header**, i.e. a jumbo MTU such
   as 9000 (not 1500).
 
-Other sockets, and all sockets when these do not hold, send as usual. Set the
-MTU and offloads before connecting: a socket that started PDU-aligned send keeps
-it. Its state is kept per socket
+Other sockets, and all sockets when these do not hold, send as usual.
+
+> **Warning:** set the MTU and TSO/GSO **before** NVMe/TCP connects, and do not
+> lower the MTU or turn TSO/GSO off while connected. A socket that started
+> PDU-aligned send keeps building 8K segments, which then exceed the MTU or
+> cannot be sent. Disconnect, change the setting, and reconnect instead. Its state is kept per socket
 (`tcp_sock->nvme_flow`, allocated on the first send after it is enabled; a
 socket keeps its PDU-aligned segmentation once it has one). The ToS mark is set
 and cleared through `inet->tos` of those sockets only, so only IPv4 is marked

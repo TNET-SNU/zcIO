@@ -62,6 +62,11 @@
  *      PDU's first segment (doff + NVME_PDU_HDR_IN_TCP / 4) and mark that
  *      segment with NVME_PDU_TOS_MARK, so the receiver's NIC splits the
  *      PDU header off and the data lands page aligned (zcIO RX zero-copy)
+ *
+ * A socket starts it only with TSO/GSO and an MSS for NVME_PDU_SEG plus the
+ * PDU header (nvme_pdu_align_possible()), and keeps it from then on: lowering
+ * the MTU or disabling TSO/GSO under a live NVMe/TCP connection is not
+ * supported.
  */
 int sysctl_nvme_pdu_align __read_mostly;
 

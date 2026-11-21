@@ -767,6 +767,12 @@ config NVME_TCP_PDU_ALIGN
 	  in the TCP header of its first segment, marked with ToS 0x04, so
 	  that zcIO receive zero-copy on the peer gets the data page aligned.
 
+	  It needs TSO or GSO on the outgoing route and an MTU that holds an
+	  8K segment plus the PDU header (e.g. 9000); sockets without them
+	  send as usual. Set MTU and offloads before NVMe/TCP connects: do not
+	  lower the MTU or turn TSO/GSO off while a connection that already
+	  sends PDU-aligned is up, it keeps building 8K segments.
+
 config TCP_MD5SIG
 	bool "TCP: MD5 Signature Option support (RFC2385)"
 	select CRYPTO
