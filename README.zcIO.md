@@ -13,11 +13,9 @@ send that the other end needs for it:
 
 Both modules name their switch `rx_zc`; the other host parameters are
 `rx_zc_batch_*` / `rx_zc_idle_us` next to it. (Builds before 2026-11-11 called
-them `nvme_host_rx_zc` and `nvmet_rx_zc`.) The zero-copy switches default to
-off; with them off, the receive paths behave as in vanilla v6.11, with only a
-few "is zero-copy on?" checks left in them. `net.ipv4.nvme_pdu_align`
-defaults to **1**, which changes how NVMe/TCP sockets send (section 4); set it
-to 0 for a vanilla send path.
+them `nvme_host_rx_zc` and `nvmet_rx_zc`.) Every switch, `nvme_pdu_align`
+included, defaults to off; with them off, the send and receive paths behave as
+in vanilla v6.11, with only a few "is it on?" checks left in them.
 
 How it works: the **sender** puts the 24-byte header of each NVMe/TCP data PDU
 into the TCP header (doff +6 words) of the PDU's first segment and marks that
@@ -139,16 +137,21 @@ sudo sysctl -w net.ipv4.nvme_pdu_align=2     # on the node that sends the data
 
 | Value | Effect |
 |---|---|
-| 0 | vanilla TCP send |
-| 1 (default) | TCP segments are cut at NVMe/TCP PDU boundaries |
+| 0 (default) | vanilla TCP send |
+| 1 | TCP segments are cut at NVMe/TCP PDU boundaries |
 | 2 | 1, plus each data PDU (C2H `0x07`, H2C `0x06`) starts a segment whose TCP header also carries the 24-byte PDU header (doff +6 words), marked with ToS `0x04` (`NVME_PDU_TOS_MARK`) |
 
 It applies to TCP sockets with a local or remote port in 4420-4430, which
 covers both NVMe/TCP hosts and targets. Its state is kept per socket
-(`tcp_sock->nvme_flow`, allocated on first send). The ToS mark is set
-through `inet->tos`, so only IPv4 is marked today; the receiver side handles
-IPv6 too. Use 2 on the target to feed host zero-copy, and on the host to feed
-target zero-copy.
+(`tcp_sock->nvme_flow`, allocated on the first send after it is enabled; a
+socket keeps its PDU-aligned segmentation once it has one). The ToS mark is set
+and cleared through `inet->tos` of those sockets only, so only IPv4 is marked
+today; the receiver side handles IPv6 too. Use 2 on the target to feed host
+zero-copy, and on the host to feed target zero-copy.
+
+The sender code is built with `CONFIG_NVME_TCP_PDU_ALIGN` (default `y`, in
+`net/ipv4/Kconfig`); every change it makes to the TCP send path is inside
+`#ifdef CONFIG_NVME_TCP_PDU_ALIGN`.
 
 ---
 
@@ -206,7 +209,7 @@ every page allocation.
 | mlx5 | `drivers/net/ethernet/mellanox/mlx5/core/en_rx.c` (PDU-header fixup, `tot_len = 0` above 64KB), `en/params.c`, `en.h`, `en_main.c`, `en_ethtool.c` (`rx_zc_stride`) |
 | shared | `net/core/zc_rx.c`, `include/net/zc_rx.h` (page lookup in an skb, held-reference flag), `include/linux/ip.h` (`ip_transport_len()` with `tot_len == 0`) |
 | target | `drivers/nvme/target/tcp.c` |
-| sender | `net/ipv4/tcp_output.c` (PDU-aligned segmentation, header-in-TCP-header and ToS mark), `net/ipv4/sysctl_net_ipv4.c` (`nvme_pdu_align`), `include/linux/tcp.h`, `include/net/tcp.h` |
+| sender (`CONFIG_NVME_TCP_PDU_ALIGN`) | `net/ipv4/tcp_output.c` (PDU-aligned segmentation, header-in-TCP-header and ToS mark), `net/ipv4/sysctl_net_ipv4.c` (`nvme_pdu_align`), `net/ipv4/Kconfig`, `include/linux/tcp.h` (`tcp_sock->nvme_flow`), `include/net/tcp.h` (`tcp_skb_cb` bits, `NVME_PDU_TOS_MARK`) |
 | host driver | `drivers/nvme/host/tcp.c` (remap, TLB flush, batched completion), `drivers/nvme/host/zcopy_mem.c` (mmu notifier) |
 | host block / fs | `block/zcopy_ctx.c`, `include/linux/zcopy_ctx.h`, `include/linux/zcopy_mem.h`, `block/bio.c`, `block/fops.c`, `fs/iomap/direct-io.c`, `lib/iov_iter.c` |
 

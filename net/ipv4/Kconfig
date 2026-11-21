@@ -757,6 +757,16 @@ config TCP_AO
 
 	  If unsure, say N.
 
+config NVME_TCP_PDU_ALIGN
+	bool "zcIO: PDU-aligned NVMe/TCP send"
+	default y
+	help
+	  Adds the net.ipv4.nvme_pdu_align sysctl (default 0, off). With 1,
+	  TCP sockets on the NVMe/TCP ports 4420-4430 cut their segments at
+	  NVMe/TCP PDU boundaries; with 2, each data PDU header also travels
+	  in the TCP header of its first segment, marked with ToS 0x04, so
+	  that zcIO receive zero-copy on the peer gets the data page aligned.
+
 config TCP_MD5SIG
 	bool "TCP: MD5 Signature Option support (RFC2385)"
 	select CRYPTO

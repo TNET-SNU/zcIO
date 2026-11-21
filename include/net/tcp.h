@@ -47,11 +47,16 @@
 #include <linux/bpf-cgroup.h>
 #include <linux/siphash.h>
 
-/*----------------------------------------------------------------------------*/
-#if NVME_PDU_ALIGN
+#ifdef CONFIG_NVME_TCP_PDU_ALIGN
+/* zcIO PDU-aligned NVMe/TCP send, see net/ipv4/tcp_output.c */
 extern int sysctl_nvme_pdu_align;
+/*
+ * IP ToS bit on a segment that carries a data PDU header in its TCP header
+ * (DSCP LSB, clear of the ECN bits).  Must match the receiver's
+ * mlx5_core rx_zc_tos_mask.
+ */
+#define NVME_PDU_TOS_MARK	0x04
 #endif
-/*----------------------------------------------------------------------------*/
 
 extern struct inet_hashinfo tcp_hashinfo;
 
@@ -967,15 +972,13 @@ struct tcp_skb_cb {
 	__u8		txstamp_ack:1,	/* Record TX timestamp for ack? */
 			eor:1,		/* Is skb MSG_EOR marked? */
 			has_rxtstamp:1,	/* SKB has a RX timestamp	*/
-/*----------------------------------------------------------------------------*/
-#if NVME_PDU_ALIGN
-			has_l5_hdr:1,
-			is_l5_data_pdu:1,
+#ifdef CONFIG_NVME_TCP_PDU_ALIGN
+			has_l5_hdr:1,	/* starts with an NVMe/TCP PDU header */
+			is_l5_data_pdu:1, /* part of an NVMe/TCP data PDU */
 			unused:3;
 #else
 			unused:5;
 #endif
-/*----------------------------------------------------------------------------*/
 	__u32		ack_seq;	/* Sequence number ACK'd	*/
 	union {
 		struct {
