@@ -47,6 +47,12 @@
 #include <linux/bpf-cgroup.h>
 #include <linux/siphash.h>
 
+/*----------------------------------------------------------------------------*/
+#if NVME_PDU_ALIGN
+extern int sysctl_nvme_pdu_align;
+#endif
+/*----------------------------------------------------------------------------*/
+
 extern struct inet_hashinfo tcp_hashinfo;
 
 DECLARE_PER_CPU(unsigned int, tcp_orphan_count);
@@ -961,7 +967,15 @@ struct tcp_skb_cb {
 	__u8		txstamp_ack:1,	/* Record TX timestamp for ack? */
 			eor:1,		/* Is skb MSG_EOR marked? */
 			has_rxtstamp:1,	/* SKB has a RX timestamp	*/
+/*----------------------------------------------------------------------------*/
+#if NVME_PDU_ALIGN
+			has_l5_hdr:1,
+			is_l5_data_pdu:1,
+			unused:3;
+#else
 			unused:5;
+#endif
+/*----------------------------------------------------------------------------*/
 	__u32		ack_seq;	/* Sequence number ACK'd	*/
 	union {
 		struct {
